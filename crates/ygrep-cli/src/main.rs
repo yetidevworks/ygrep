@@ -92,6 +92,23 @@ pub enum Commands {
     /// Uninstall ygrep from a specific tool/client
     #[command(subcommand)]
     Uninstall(InstallTarget),
+
+    /// Manage indexes
+    #[command(subcommand)]
+    Indexes(IndexesCommand),
+}
+
+#[derive(Subcommand, Clone)]
+pub enum IndexesCommand {
+    /// List all indexes
+    List,
+    /// Remove orphaned indexes (workspaces that no longer exist)
+    Clean,
+    /// Remove a specific index by hash or workspace path
+    Remove {
+        /// Index hash or workspace path
+        identifier: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -166,6 +183,13 @@ fn main() -> Result<()> {
                 InstallTarget::Opencode => commands::install::uninstall_opencode()?,
                 InstallTarget::Codex => commands::install::uninstall_codex()?,
                 InstallTarget::Droid => commands::install::uninstall_droid()?,
+            }
+        }
+        Some(Commands::Indexes(cmd)) => {
+            match cmd {
+                IndexesCommand::List => commands::indexes::list()?,
+                IndexesCommand::Clean => commands::indexes::clean()?,
+                IndexesCommand::Remove { identifier } => commands::indexes::remove(&identifier)?,
             }
         }
         None => {

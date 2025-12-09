@@ -212,6 +212,17 @@ impl Workspace {
 
         let stats = walker.stats();
 
+        // Save workspace metadata for index management
+        let metadata = serde_json::json!({
+            "workspace": self.root.to_string_lossy(),
+            "indexed_at": chrono::Utc::now().to_rfc3339(),
+            "files_indexed": indexed,
+        });
+        let metadata_path = self.index_path.join("workspace.json");
+        if let Err(e) = std::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata).unwrap_or_default()) {
+            tracing::warn!("Failed to save workspace metadata: {}", e);
+        }
+
         Ok(IndexStats {
             indexed,
             skipped,

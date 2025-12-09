@@ -36,3 +36,4 @@ parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
 dirs = { workspace = true }
 walkdir = { workspace = true }
+chrono = { workspace = true }

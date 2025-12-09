@@ -14,8 +14,16 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
 ```bash
-# From source
+brew install yetidevworks/ygrep/ygrep
+```
+
+### From Source
+
+```bash
+# Using cargo
 cargo install --path crates/ygrep-cli
 
 # Or build release
@@ -94,6 +102,32 @@ ygrep status                       # Show index status
 ygrep status --detailed            # Detailed statistics
 ```
 
+### Index Management
+
+```bash
+ygrep indexes list                 # List all indexes with sizes
+ygrep indexes clean                # Remove orphaned indexes (freed disk space)
+ygrep indexes remove <hash>        # Remove specific index by hash
+ygrep indexes remove /path/to/dir  # Remove index by workspace path
+```
+
+### Semantic Search (Optional)
+
+Enable semantic/vector search for better results on natural language queries:
+
+```bash
+# Index with embeddings (one-time, slower)
+ygrep index --embeddings
+
+# Search automatically uses hybrid mode when embeddings exist
+ygrep "authentication flow"        # Uses BM25 + vector search
+
+# Force text-only search
+ygrep search "auth" --text-only
+```
+
+Semantic search uses the `bge-small-en-v1.5` model (~50MB, downloaded on first use).
+
 ## AI Tool Integration
 
 ygrep integrates with popular AI coding assistants:
@@ -164,9 +198,11 @@ Index data stored in:
 
 ## Upgrading
 
-After updating ygrep, rebuild your indexes to use the latest tokenizer:
-
 ```bash
+# Via Homebrew
+brew upgrade ygrep
+
+# Then rebuild indexes to use latest tokenizer
 ygrep index --rebuild
 ```
 
