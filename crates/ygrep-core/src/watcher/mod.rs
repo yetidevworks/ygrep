@@ -66,17 +66,37 @@ impl FileWatcher {
             Duration::from_millis(500),
             None,
             move |result: DebounceEventResult| {
+                use std::collections::HashSet;
+
                 let tx = event_tx.lock();
                 match result {
                     Ok(events) => {
+                        // Deduplicate events by path to avoid processing same file twice
+                        let mut seen_changed: HashSet<PathBuf> = HashSet::new();
+                        let mut seen_deleted: HashSet<PathBuf> = HashSet::new();
+
                         for event in events {
-                            let events = process_notify_event(
+                            let watch_events = process_notify_event(
                                 &event,
                                 &watched_paths_for_closure,
                                 &config_clone,
                             );
-                            for e in events {
-                                let _ = tx.send(e);
+                            for e in watch_events {
+                                match &e {
+                                    WatchEvent::Changed(p) => {
+                                        if seen_changed.insert(p.clone()) {
+                                            let _ = tx.send(e);
+                                        }
+                                    }
+                                    WatchEvent::Deleted(p) => {
+                                        if seen_deleted.insert(p.clone()) {
+                                            let _ = tx.send(e);
+                                        }
+                                    }
+                                    _ => {
+                                        let _ = tx.send(e);
+                                    }
+                                }
                             }
                         }
                     }
