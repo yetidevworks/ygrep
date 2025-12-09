@@ -1,4 +1,4 @@
-name: Release binary tap (mac arm64 + linux)
+name: Release binaries (all platforms)
 
 on:
   release:
@@ -24,6 +24,18 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             target_name: linux-x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            target_name: linux-aarch64
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            target_name: linux-armv7
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            target_name: linux-x86_64-musl
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            target_name: linux-aarch64-musl
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,11 +59,51 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake
 
+      - name: Install cross-compilation tools (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cross-compilation tools (armv7)
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        run: |
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get install -y musl-tools
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            # For aarch64-musl we need cross compiler
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
       - name: macOS build deps
         if: startsWith(matrix.os, 'macos')
         run: |
           brew update
           brew install pkg-config
+
+      - name: Set linker for cross-compilation
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Set linker for armv7 cross-compilation
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        run: |
+          mkdir -p .cargo
+          echo '[target.armv7-unknown-linux-gnueabihf]' >> .cargo/config.toml
+          echo 'linker = "arm-linux-gnueabihf-gcc"' >> .cargo/config.toml
+
+      - name: Set linker for aarch64-musl cross-compilation
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build
         run: |
@@ -68,6 +120,14 @@ jobs:
               BIN="target/aarch64-apple-darwin/release/ygrep"; OUT="ygrep-${VER}-darwin-arm64.tar.gz";;
             x86_64-unknown-linux-gnu)
               BIN="target/x86_64-unknown-linux-gnu/release/ygrep"; OUT="ygrep-${VER}-linux-x86_64.tar.gz";;
+            aarch64-unknown-linux-gnu)
+              BIN="target/aarch64-unknown-linux-gnu/release/ygrep"; OUT="ygrep-${VER}-linux-aarch64.tar.gz";;
+            armv7-unknown-linux-gnueabihf)
+              BIN="target/armv7-unknown-linux-gnueabihf/release/ygrep"; OUT="ygrep-${VER}-linux-armv7.tar.gz";;
+            x86_64-unknown-linux-musl)
+              BIN="target/x86_64-unknown-linux-musl/release/ygrep"; OUT="ygrep-${VER}-linux-x86_64-musl.tar.gz";;
+            aarch64-unknown-linux-musl)
+              BIN="target/aarch64-unknown-linux-musl/release/ygrep"; OUT="ygrep-${VER}-linux-aarch64-musl.tar.gz";;
           esac
           mkdir -p package
           cp "$BIN" package/ygrep
@@ -122,6 +182,9 @@ jobs:
           f=$(find /tmp/artifacts -name '*linux-x86_64.tar.gz' -print -quit)
           [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
+          f=$(find /tmp/artifacts -name '*linux-aarch64.tar.gz' ! -name '*musl*' -print -quit)
+          [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
       - name: Read version from Cargo.toml
         id: cargo
         run: |
@@ -161,8 +224,9 @@ jobs:
           TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
           DARWIN_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
           LINUX_X86_64_SHA='${{ steps.shas.outputs.linux_x86_64_sha }}'
+          LINUX_AARCH64_SHA='${{ steps.shas.outputs.linux_aarch64_sha }}'
 
-          if [[ -z "${DARWIN_SHA}" || -z "${LINUX_X86_64_SHA}" ]]; then
+          if [[ -z "${DARWIN_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
             echo "Missing required SHAs for Homebrew formula." >&2
             exit 1
           fi
@@ -173,6 +237,12 @@ jobs:
           cd tap
           mkdir -p "$(dirname "${FORMULA_PATH}")"
           cat <<'FORMULA' > "${FORMULA_PATH}"
+          # Additional binaries available for direct download:
+          # - Linux ARMv7 (32-bit ARM): ygrep-REPLACE_VERSION-linux-armv7.tar.gz
+          # - Linux x86_64 musl (Alpine/static): ygrep-REPLACE_VERSION-linux-x86_64-musl.tar.gz
+          # - Linux ARM64 musl (Alpine/static): ygrep-REPLACE_VERSION-linux-aarch64-musl.tar.gz
+          # Download from: https://github.com/yetidevworks/ygrep/releases/download/REPLACE_VERSION/
+
           class Ygrep < Formula
             desc "Fast, local, indexed code search for AI coding assistants"
             homepage "https://github.com/yetidevworks/ygrep"
@@ -189,8 +259,12 @@ jobs:
 
             on_linux do
               on_intel do
-                url "REPLACE_LINUX_URL"
-                sha256 "REPLACE_LINUX_SHA"
+                url "REPLACE_LINUX_X86_64_URL"
+                sha256 "REPLACE_LINUX_X86_64_SHA"
+              end
+              on_arm do
+                url "REPLACE_LINUX_AARCH64_URL"
+                sha256 "REPLACE_LINUX_AARCH64_SHA"
               end
             end
 
@@ -208,8 +282,10 @@ jobs:
           sed -i "s|REPLACE_VERSION|${VER}|g" "${FORMULA_PATH}"
           sed -i "s|REPLACE_DARWIN_URL|${TAP_URL}/ygrep-${VER}-darwin-arm64.tar.gz|g" "${FORMULA_PATH}"
           sed -i "s|REPLACE_DARWIN_SHA|${DARWIN_SHA}|g" "${FORMULA_PATH}"
-          sed -i "s|REPLACE_LINUX_URL|${TAP_URL}/ygrep-${VER}-linux-x86_64.tar.gz|g" "${FORMULA_PATH}"
-          sed -i "s|REPLACE_LINUX_SHA|${LINUX_X86_64_SHA}|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_LINUX_X86_64_URL|${TAP_URL}/ygrep-${VER}-linux-x86_64.tar.gz|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_LINUX_X86_64_SHA|${LINUX_X86_64_SHA}|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_LINUX_AARCH64_URL|${TAP_URL}/ygrep-${VER}-linux-aarch64.tar.gz|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_LINUX_AARCH64_SHA|${LINUX_AARCH64_SHA}|g" "${FORMULA_PATH}"
 
           # Remove leading whitespace from formula
           sed -i 's/^          //' "${FORMULA_PATH}"
