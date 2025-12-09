@@ -71,6 +71,9 @@ impl Workspace {
             Index::create_in_dir(&index_path, schema)?
         };
 
+        // Register our custom code tokenizer
+        index::register_tokenizers(index.tokenizers());
+
         // Create vector index path
         let vector_path = index_path.join("vectors");
 

@@ -177,7 +177,7 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 let query = cli.query.join(" ");
-                commands::search::run(&workspace, &query, 10, vec![], vec![], false, false, cli.format)?;
+                commands::search::run(&workspace, &query, 100, vec![], vec![], false, false, cli.format)?;
             }
         }
     }

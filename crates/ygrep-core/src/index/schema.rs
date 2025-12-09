@@ -1,4 +1,99 @@
 use tantivy::schema::{Schema, STORED, STRING, FAST, TextFieldIndexing, TextOptions, IndexRecordOption};
+use tantivy::tokenizer::{TokenizerManager, TextAnalyzer, SimpleTokenizer, LowerCaser, RemoveLongFilter};
+
+/// Name of our custom code tokenizer
+pub const CODE_TOKENIZER: &str = "code";
+
+/// Register the code-aware tokenizer with an index
+pub fn register_tokenizers(tokenizer_manager: &TokenizerManager) {
+    // Code tokenizer: keeps $, @, # as part of tokens
+    // Uses SimpleTokenizer which splits on whitespace, then we just lowercase
+    let code_tokenizer = TextAnalyzer::builder(CodeTokenizer)
+        .filter(LowerCaser)
+        .filter(RemoveLongFilter::limit(100))
+        .build();
+
+    tokenizer_manager.register(CODE_TOKENIZER, code_tokenizer);
+}
+
+/// Custom tokenizer for code that preserves $, @, #, etc.
+#[derive(Clone)]
+struct CodeTokenizer;
+
+impl tantivy::tokenizer::Tokenizer for CodeTokenizer {
+    type TokenStream<'a> = CodeTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        CodeTokenStream {
+            text,
+            chars: text.char_indices().peekable(),
+            token: tantivy::tokenizer::Token::default(),
+        }
+    }
+}
+
+struct CodeTokenStream<'a> {
+    text: &'a str,
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+    token: tantivy::tokenizer::Token,
+}
+
+impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
+    fn advance(&mut self) -> bool {
+        self.token.text.clear();
+        self.token.position = self.token.position.wrapping_add(1);
+
+        // Skip whitespace
+        while let Some(&(_, c)) = self.chars.peek() {
+            if !c.is_whitespace() {
+                break;
+            }
+            self.chars.next();
+        }
+
+        let start = match self.chars.peek() {
+            Some(&(pos, _)) => pos,
+            None => return false,
+        };
+
+        // Collect token: alphanumeric + code chars ($, @, #, _, -)
+        let mut end = start;
+        while let Some(&(pos, c)) = self.chars.peek() {
+            if c.is_alphanumeric() || c == '_' || c == '$' || c == '@' || c == '#' || c == '-' {
+                end = pos + c.len_utf8();
+                self.chars.next();
+            } else if c.is_whitespace() {
+                break;
+            } else {
+                // Other punctuation - emit as separate token or skip
+                // For now, skip punctuation that's not part of identifiers
+                self.chars.next();
+                if start == pos {
+                    // Started with punctuation, skip and try again
+                    return self.advance();
+                }
+                break;
+            }
+        }
+
+        if end > start {
+            self.token.offset_from = start;
+            self.token.offset_to = end;
+            self.token.text.push_str(&self.text[start..end]);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        &self.token
+    }
+
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        &mut self.token
+    }
+}
 
 /// Field names for the document index
 pub mod fields {
@@ -20,10 +115,11 @@ pub fn build_document_schema() -> Schema {
     let mut schema_builder = Schema::builder();
 
     // Content field with positions for phrase queries
+    // Uses our custom "code" tokenizer that preserves $, @, #, etc.
     let text_options = TextOptions::default()
         .set_indexing_options(
             TextFieldIndexing::default()
-                .set_tokenizer("default")
+                .set_tokenizer(CODE_TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
         .set_stored();
