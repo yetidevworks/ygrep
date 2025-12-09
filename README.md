@@ -25,16 +25,29 @@ cp target/release/ygrep ~/.cargo/bin/
 
 ## Quick Start
 
+### 1. Install for your AI tool
+
 ```bash
-# Index current directory
-ygrep index
-
-# Search (shorthand)
-ygrep "search query"
-
-# Search (explicit)
-ygrep search "search query"
+ygrep install claude-code    # Claude Code
+ygrep install opencode       # OpenCode
+ygrep install codex          # Codex
+ygrep install droid          # Factory Droid
 ```
+
+### 2. Index your project
+
+```bash
+ygrep index
+```
+
+### 3. Search
+
+```bash
+ygrep "search query"         # Shorthand
+ygrep search "search query"  # Explicit
+```
+
+That's it! The AI tool will now use ygrep for code searches.
 
 ## Usage
 
