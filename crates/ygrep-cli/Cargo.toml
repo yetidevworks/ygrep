@@ -1,0 +1,33 @@
+[package]
+name = "ygrep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ygrep"
+path = "src/main.rs"
+
+[dependencies]
+ygrep-core = { workspace = true }
+ygrep-daemon = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Utils
+dirs = { workspace = true }

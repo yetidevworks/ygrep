@@ -1,0 +1,9 @@
+{
+  "name": "ygrep",
+  "description": "Local semantic code search for Claude Code",
+  "version": "0.1.0",
+  "author": {
+    "name": "YetiDevWorks"
+  },
+  "hooks": "../hooks/hook.json"
+}
