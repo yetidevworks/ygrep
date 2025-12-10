@@ -5,9 +5,11 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::IndexerConfig;
+#[cfg(feature = "embeddings")]
 use crate::embeddings::{EmbeddingModel, EmbeddingCache};
 use crate::error::{Result, YgrepError};
 use super::schema::SchemaFields;
+#[cfg(feature = "embeddings")]
 use super::VectorIndex;
 
 /// Handles indexing of files and content
@@ -18,10 +20,13 @@ pub struct Indexer {
     fields: SchemaFields,
     workspace_root: String,
     /// Optional vector index for semantic search
+    #[cfg(feature = "embeddings")]
     vector_index: Option<Arc<VectorIndex>>,
     /// Optional embedding model
+    #[cfg(feature = "embeddings")]
     embedding_model: Option<Arc<EmbeddingModel>>,
     /// Optional embedding cache
+    #[cfg(feature = "embeddings")]
     embedding_cache: Option<Arc<EmbeddingCache>>,
 }
 
@@ -42,13 +47,17 @@ impl Indexer {
             writer: Arc::new(RwLock::new(writer)),
             fields,
             workspace_root: workspace_root.to_string_lossy().to_string(),
+            #[cfg(feature = "embeddings")]
             vector_index: None,
+            #[cfg(feature = "embeddings")]
             embedding_model: None,
+            #[cfg(feature = "embeddings")]
             embedding_cache: None,
         })
     }
 
     /// Create a new indexer with semantic search support
+    #[cfg(feature = "embeddings")]
     pub fn with_semantic(
         config: IndexerConfig,
         index: Index,
@@ -138,12 +147,16 @@ impl Indexer {
         writer.add_document(doc)?;
 
         // Also create chunks for the file
+        #[cfg(feature = "embeddings")]
         let chunk_ids = self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?;
+        #[cfg(not(feature = "embeddings"))]
+        let _ = self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?;
 
         // Release the writer lock before embedding generation
         drop(writer);
 
         // Generate embeddings if semantic search is enabled
+        #[cfg(feature = "embeddings")]
         if let (Some(vector_index), Some(model), Some(cache)) =
             (&self.vector_index, &self.embedding_model, &self.embedding_cache)
         {
@@ -239,6 +252,7 @@ impl Indexer {
         writer.commit()?;
 
         // Also save the vector index if present
+        #[cfg(feature = "embeddings")]
         if let Some(vector_index) = &self.vector_index {
             vector_index.save()?;
         }

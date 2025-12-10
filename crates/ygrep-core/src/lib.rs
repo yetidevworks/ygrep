@@ -3,11 +3,12 @@
 //! This crate provides the core functionality for indexing and searching code:
 //! - Tantivy-based full-text indexing
 //! - File system walking with symlink handling
-//! - BM25 text search + semantic vector search
+//! - BM25 text search + semantic vector search (with `embeddings` feature)
 //! - Hybrid search with Reciprocal Rank Fusion
 //! - Configuration management
 
 pub mod config;
+#[cfg(feature = "embeddings")]
 pub mod embeddings;
 pub mod error;
 pub mod fs;
@@ -20,13 +21,17 @@ pub use error::{Result, YgrepError};
 pub use watcher::{FileWatcher, WatchEvent};
 
 use std::path::Path;
-use std::sync::Arc;
 use tantivy::Index;
 
+#[cfg(feature = "embeddings")]
+use std::sync::Arc;
+#[cfg(feature = "embeddings")]
 use embeddings::{EmbeddingModel, EmbeddingCache};
+#[cfg(feature = "embeddings")]
 use index::VectorIndex;
 
 /// Embedding dimension for bge-small-en-v1.5
+#[cfg(feature = "embeddings")]
 const EMBEDDING_DIM: usize = 384;
 
 /// High-level workspace for indexing and searching
@@ -40,10 +45,13 @@ pub struct Workspace {
     /// Index directory path
     index_path: std::path::PathBuf,
     /// Vector index for semantic search
+    #[cfg(feature = "embeddings")]
     vector_index: Arc<VectorIndex>,
     /// Embedding model
+    #[cfg(feature = "embeddings")]
     embedding_model: Arc<EmbeddingModel>,
     /// Embedding cache
+    #[cfg(feature = "embeddings")]
     embedding_cache: Arc<EmbeddingCache>,
 }
 
@@ -74,29 +82,37 @@ impl Workspace {
         // Register our custom code tokenizer
         index::register_tokenizers(index.tokenizers());
 
-        // Create vector index path
-        let vector_path = index_path.join("vectors");
+        #[cfg(feature = "embeddings")]
+        let (vector_index, embedding_model, embedding_cache) = {
+            // Create vector index path
+            let vector_path = index_path.join("vectors");
 
-        // Load or create vector index
-        let vector_index = if VectorIndex::exists(&vector_path) {
-            Arc::new(VectorIndex::load(vector_path)?)
-        } else {
-            Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
+            // Load or create vector index
+            let vector_index = if VectorIndex::exists(&vector_path) {
+                Arc::new(VectorIndex::load(vector_path)?)
+            } else {
+                Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
+            };
+
+            // Create embedding model (lazy-loaded on first use)
+            let embedding_model = Arc::new(EmbeddingModel::default()); // Uses bge-small-en-v1.5
+
+            // Create embedding cache (100MB cache, 384 dimensions)
+            let embedding_cache = Arc::new(EmbeddingCache::new(100, EMBEDDING_DIM));
+
+            (vector_index, embedding_model, embedding_cache)
         };
-
-        // Create embedding model (lazy-loaded on first use)
-        let embedding_model = Arc::new(EmbeddingModel::default()); // Uses bge-small-en-v1.5
-
-        // Create embedding cache (100MB cache, 384 dimensions)
-        let embedding_cache = Arc::new(EmbeddingCache::new(100, EMBEDDING_DIM));
 
         Ok(Self {
             root,
             config,
             index,
             index_path,
+            #[cfg(feature = "embeddings")]
             vector_index,
+            #[cfg(feature = "embeddings")]
             embedding_model,
+            #[cfg(feature = "embeddings")]
             embedding_cache,
         })
     }
@@ -107,8 +123,10 @@ impl Workspace {
     }
 
     /// Index all files with options
+    #[allow(unused_variables)]
     pub fn index_all_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
         // Clear vector index for fresh re-index
+        #[cfg(feature = "embeddings")]
         self.vector_index.clear();
 
         // Phase 1: Index all files with BM25 (fast)
@@ -125,7 +143,9 @@ impl Workspace {
         let mut errors = 0;
 
         // Collect content for batch embedding
+        #[cfg(feature = "embeddings")]
         let mut embedding_batch: Vec<(String, String)> = Vec::new(); // (doc_id, content)
+        #[cfg(feature = "embeddings")]
         const BATCH_SIZE: usize = 32;
 
         for entry in walker.walk() {
@@ -137,11 +157,14 @@ impl Workspace {
                     }
 
                     // Collect for embedding if enabled
+                    #[cfg(feature = "embeddings")]
                     if with_embeddings {
                         if let Ok(content) = std::fs::read_to_string(&entry.path) {
                             embedding_batch.push((doc_id, content));
                         }
                     }
+                    #[cfg(not(feature = "embeddings"))]
+                    let _ = doc_id;
                 }
                 Err(YgrepError::FileTooLarge { .. }) => {
                     skipped += 1;
@@ -157,6 +180,7 @@ impl Workspace {
         indexer.commit()?;
 
         // Phase 2: Generate embeddings in batches (if enabled)
+        #[cfg(feature = "embeddings")]
         if with_embeddings && !embedding_batch.is_empty() {
             // Filter out very short content (< 50 chars) and very long content (> 50KB)
             // These don't embed well or are too slow
@@ -210,6 +234,11 @@ impl Workspace {
             }
         }
 
+        #[cfg(not(feature = "embeddings"))]
+        if with_embeddings {
+            eprintln!("Warning: Embeddings feature not available in this build.");
+        }
+
         let stats = walker.stats();
 
         // Save workspace metadata for index management
@@ -251,6 +280,7 @@ impl Workspace {
     }
 
     /// Hybrid search combining BM25 and vector search
+    #[cfg(feature = "embeddings")]
     pub fn search_hybrid(&self, query: &str, limit: Option<usize>) -> Result<search::SearchResult> {
         let searcher = search::HybridSearcher::new(
             self.config.search.clone(),
@@ -263,8 +293,15 @@ impl Workspace {
     }
 
     /// Check if semantic search is available (vector index has data)
+    #[cfg(feature = "embeddings")]
     pub fn has_semantic_index(&self) -> bool {
         !self.vector_index.is_empty()
+    }
+
+    /// Check if semantic search is available (always false without embeddings feature)
+    #[cfg(not(feature = "embeddings"))]
+    pub fn has_semantic_index(&self) -> bool {
+        false
     }
 
     /// Get the workspace root

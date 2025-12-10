@@ -30,12 +30,21 @@ pub fn run(
     }
 
     // Search: use hybrid search by default if semantic index is available
+    #[cfg(feature = "embeddings")]
     let use_hybrid = !text_only && workspace.has_semantic_index();
+    #[cfg(not(feature = "embeddings"))]
+    let use_hybrid = false;
+    let _ = text_only; // Suppress unused warning when embeddings disabled
 
     let result = if use_hybrid {
         // Hybrid search (BM25 + vector with RRF)
-        workspace.search_hybrid(query, Some(limit))
-            .context("Hybrid search failed")?
+        #[cfg(feature = "embeddings")]
+        {
+            workspace.search_hybrid(query, Some(limit))
+                .context("Hybrid search failed")?
+        }
+        #[cfg(not(feature = "embeddings"))]
+        unreachable!()
     } else {
         // Build filters for text-only search
         let ext_filter = if extensions.is_empty() { None } else { Some(extensions) };

@@ -128,6 +128,13 @@ ygrep search "auth" --text-only
 
 Semantic search uses the `bge-small-en-v1.5` model (~50MB, downloaded on first use).
 
+**Note:** Semantic search requires ONNX Runtime and is only available on certain platforms:
+- ✅ macOS ARM64 (Apple Silicon)
+- ✅ Linux x86_64
+- ❌ Linux ARM64/ARMv7/musl (text search only)
+
+On unsupported platforms, ygrep works normally with BM25 text search - the `--embeddings` flag will print a warning.
+
 ## AI Tool Integration
 
 ygrep integrates with popular AI coding assistants:

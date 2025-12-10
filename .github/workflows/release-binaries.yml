@@ -18,30 +18,38 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Platforms with full ONNX support (semantic search enabled)
           - os: macos-14
             target: aarch64-apple-darwin
             target_name: macos-arm64
             use_cross: false
+            features: ""
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             target_name: linux-x86_64
             use_cross: false
+            features: ""
+          # Platforms without ONNX binaries (text search only)
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             target_name: linux-aarch64
             use_cross: true
+            features: "--no-default-features"
           - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             target_name: linux-armv7
             use_cross: true
+            features: "--no-default-features"
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             target_name: linux-x86_64-musl
             use_cross: true
+            features: "--no-default-features"
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-musl
             target_name: linux-aarch64-musl
             use_cross: true
+            features: "--no-default-features"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -79,13 +87,13 @@ jobs:
         if: "!matrix.use_cross"
         run: |
           set -euo pipefail
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Build (cross)
         if: matrix.use_cross
         run: |
           set -euo pipefail
-          cross build --release --target ${{ matrix.target }}
+          cross build --release --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Package
         id: pkg

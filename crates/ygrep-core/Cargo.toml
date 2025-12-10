@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+embeddings = ["dep:fastembed", "dep:hnsw_rs"]
+
 [dependencies]
 # Async
 tokio = { workspace = true }
@@ -21,8 +25,8 @@ tracing = { workspace = true }
 
 # Search & Indexing
 tantivy = { workspace = true }
-fastembed = { workspace = true }
-hnsw_rs = { workspace = true }
+fastembed = { workspace = true, optional = true }
+hnsw_rs = { workspace = true, optional = true }
 lru = { workspace = true }
 bincode = { workspace = true }
 

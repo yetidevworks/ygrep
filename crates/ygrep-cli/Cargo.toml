@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["embeddings"]
+embeddings = ["ygrep-core/embeddings"]
+
 [[bin]]
 name = "ygrep"
 path = "src/main.rs"
