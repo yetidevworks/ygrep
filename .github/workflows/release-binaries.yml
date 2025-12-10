@@ -21,21 +21,27 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             target_name: macos-arm64
+            use_cross: false
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             target_name: linux-x86_64
+            use_cross: false
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             target_name: linux-aarch64
+            use_cross: true
           - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             target_name: linux-armv7
+            use_cross: true
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             target_name: linux-x86_64-musl
+            use_cross: true
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-musl
             target_name: linux-aarch64-musl
+            use_cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -53,30 +59,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Linux build deps
-        if: startsWith(matrix.os, 'ubuntu')
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Linux build deps (native)
+        if: startsWith(matrix.os, 'ubuntu') && !matrix.use_cross
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake
-
-      - name: Install cross-compilation tools (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install cross-compilation tools (armv7)
-        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
-        run: |
-          sudo apt-get install -y gcc-arm-linux-gnueabihf
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: |
-          sudo apt-get install -y musl-tools
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            # For aarch64-musl we need cross compiler
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
 
       - name: macOS build deps
         if: startsWith(matrix.os, 'macos')
@@ -84,31 +75,17 @@ jobs:
           brew update
           brew install pkg-config
 
-      - name: Set linker for cross-compilation
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p .cargo
-          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
-
-      - name: Set linker for armv7 cross-compilation
-        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
-        run: |
-          mkdir -p .cargo
-          echo '[target.armv7-unknown-linux-gnueabihf]' >> .cargo/config.toml
-          echo 'linker = "arm-linux-gnueabihf-gcc"' >> .cargo/config.toml
-
-      - name: Set linker for aarch64-musl cross-compilation
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          mkdir -p .cargo
-          echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
-
-      - name: Build
+      - name: Build (native)
+        if: "!matrix.use_cross"
         run: |
           set -euo pipefail
           cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: |
+          set -euo pipefail
+          cross build --release --target ${{ matrix.target }}
 
       - name: Package
         id: pkg
