@@ -105,7 +105,6 @@ impl HybridSearcher {
             let doc_id = extract_text(&doc, self.fields.doc_id).unwrap_or_default();
             let content = extract_text(&doc, self.fields.content).unwrap_or_default();
             let line_start = extract_u64(&doc, self.fields.line_start).unwrap_or(1);
-            let line_end = extract_u64(&doc, self.fields.line_end).unwrap_or(1);
             let chunk_id = extract_text(&doc, self.fields.chunk_id).unwrap_or_default();
 
             results.push(RankedResult {
@@ -113,7 +112,6 @@ impl HybridSearcher {
                 path,
                 content,
                 line_start,
-                line_end,
                 is_chunk: !chunk_id.is_empty(),
                 rank: rank + 1,
                 score: *score,
@@ -152,7 +150,6 @@ impl HybridSearcher {
                     path: hit.path,
                     content: hit.content,
                     line_start: hit.line_start,
-                    line_end: hit.line_end,
                     is_chunk: hit.is_chunk,
                     rank: rank + 1,
                     score: 1.0 / (1.0 + distance), // Convert distance to similarity
@@ -181,7 +178,6 @@ impl HybridSearcher {
                 path: extract_text(&doc, self.fields.path).unwrap_or_default(),
                 content: extract_text(&doc, self.fields.content).unwrap_or_default(),
                 line_start: extract_u64(&doc, self.fields.line_start).unwrap_or(1),
-                line_end: extract_u64(&doc, self.fields.line_end).unwrap_or(1),
                 is_chunk: !extract_text(&doc, self.fields.chunk_id).unwrap_or_default().is_empty(),
             }))
         } else {
@@ -232,12 +228,16 @@ impl HybridSearcher {
             .into_values()
             .map(|fused| {
                 let total_score = fused.bm25_rrf + fused.vector_rrf;
-                let snippet = create_relevant_snippet(&fused.result.content, "", 10);
+                let (snippet, match_offset, line_count) = create_relevant_snippet(&fused.result.content, 10);
+
+                // Adjust line numbers to reflect the snippet position
+                let actual_line_start = fused.result.line_start + match_offset as u64;
+                let actual_line_end = actual_line_start + line_count.saturating_sub(1) as u64;
 
                 SearchHit {
                     path: fused.result.path,
-                    line_start: fused.result.line_start,
-                    line_end: fused.result.line_end,
+                    line_start: actual_line_start,
+                    line_end: actual_line_end,
                     snippet,
                     score: total_score,
                     is_chunk: fused.result.is_chunk,
@@ -260,7 +260,6 @@ struct RankedResult {
     path: String,
     content: String,
     line_start: u64,
-    line_end: u64,
     is_chunk: bool,
     rank: usize,
     #[allow(dead_code)]
@@ -272,7 +271,6 @@ struct DocInfo {
     path: String,
     content: String,
     line_start: u64,
-    line_end: u64,
     is_chunk: bool,
 }
 
@@ -306,10 +304,9 @@ fn extract_u64(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) ->
 }
 
 /// Create a snippet showing relevant lines
-fn create_relevant_snippet(content: &str, _query: &str, max_lines: usize) -> String {
-    content
-        .lines()
-        .take(max_lines)
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Returns (snippet, line_offset, line_count)
+fn create_relevant_snippet(content: &str, max_lines: usize) -> (String, usize, usize) {
+    let lines: Vec<&str> = content.lines().take(max_lines).collect();
+    let line_count = lines.len();
+    (lines.join("\n"), 0, line_count)
 }

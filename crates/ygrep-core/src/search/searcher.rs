@@ -82,7 +82,6 @@ impl Searcher {
             let doc_id = extract_text(&doc, self.fields.doc_id).unwrap_or_default();
             let content = extract_text(&doc, self.fields.content).unwrap_or_default();
             let line_start = extract_u64(&doc, self.fields.line_start).unwrap_or(1);
-            let line_end = extract_u64(&doc, self.fields.line_end).unwrap_or(1);
             let chunk_id = extract_text(&doc, self.fields.chunk_id).unwrap_or_default();
 
             // LITERAL GREP-LIKE FILTER: Only include if content contains exact query string
@@ -94,12 +93,16 @@ impl Searcher {
             let normalized_score = if max_score > 0.0 { score / max_score } else { 0.0 };
 
             // Create snippet showing lines that match the query
-            let snippet = create_relevant_snippet(&content, query, 10);
+            let (snippet, match_line_offset, snippet_line_count) = create_relevant_snippet(&content, query, 10);
+
+            // Adjust line numbers to reflect where the match actually is
+            let actual_line_start = line_start + match_line_offset as u64;
+            let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
 
             hits.push(SearchHit {
                 path,
-                line_start,
-                line_end,
+                line_start: actual_line_start,
+                line_end: actual_line_end,
                 snippet,
                 score: normalized_score,
                 is_chunk: !chunk_id.is_empty(),
@@ -185,7 +188,8 @@ fn extract_u64(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) ->
 }
 
 /// Create a snippet showing lines relevant to the query
-fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> String {
+/// Returns (snippet, line_offset_from_start, line_count)
+fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (String, usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
     let query_lower = query.to_lowercase();
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -201,7 +205,9 @@ fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> Stri
 
     if matching_indices.is_empty() {
         // No direct matches, return first lines
-        return lines.iter().take(max_lines).copied().collect::<Vec<_>>().join("\n");
+        let snippet = lines.iter().take(max_lines).copied().collect::<Vec<_>>().join("\n");
+        let line_count = snippet.lines().count();
+        return (snippet, 0, line_count);
     }
 
     // Get context around the first match
@@ -212,7 +218,9 @@ fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> Stri
     let start = first_match.saturating_sub(context_before);
     let end = (first_match + context_after + 1).min(lines.len());
 
-    lines[start..end].join("\n")
+    let snippet = lines[start..end].join("\n");
+    let line_count = end - start;
+    (snippet, start, line_count)
 }
 
 #[cfg(test)]
