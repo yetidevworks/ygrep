@@ -42,7 +42,7 @@ impl ModelType {
 
 impl Default for ModelType {
     fn default() -> Self {
-        ModelType::BgeSmall
+        ModelType::AllMiniLmL6
     }
 }
 
@@ -89,7 +89,7 @@ impl EmbeddingModel {
             return Ok(Arc::clone(model));
         }
 
-        eprintln!("Loading embedding model... (this may take 30-60 seconds on first run)");
+        eprint!("Loading embedding model...");
 
         let model = TextEmbedding::try_new(
             InitOptions::new(self.model_type.to_fastembed())
@@ -99,7 +99,7 @@ impl EmbeddingModel {
         let model = Arc::new(model);
         *guard = Some(Arc::clone(&model));
 
-        eprintln!("Embedding model loaded successfully");
+        eprintln!(" done");
 
         Ok(model)
     }

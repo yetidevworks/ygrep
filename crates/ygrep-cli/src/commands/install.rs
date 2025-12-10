@@ -46,8 +46,8 @@ const HOOK_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "ygrep index 2>/dev/null || true",
-            "timeout": 60
+            "command": "ygrep index >> /tmp/ygrep-hook.log 2>&1 || true",
+            "timeout": 120
           }
         ]
       }
@@ -60,7 +60,7 @@ const HOOK_JSON: &str = r#"{
 const PLUGIN_JSON: &str = r#"{
   "name": "ygrep",
   "description": "Fast indexed code search for Claude Code",
-  "version": "0.1.0",
+  "version": "0.2.4",
   "author": {
     "name": "YetiDevWorks"
   },
@@ -80,7 +80,7 @@ const MARKETPLACE_JSON: &str = r#"{
       "name": "ygrep",
       "source": "./plugins/ygrep",
       "description": "Fast indexed code search for Claude Code",
-      "version": "0.1.0",
+      "version": "0.2.4",
       "author": {
         "name": "YetiDevWorks"
       },
@@ -149,7 +149,7 @@ pub fn install_claude_code() -> Result<()> {
     };
 
     installed["plugins"]["ygrep@ygrep-local"] = serde_json::json!({
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "installedAt": chrono::Utc::now().to_rfc3339(),
         "lastUpdated": chrono::Utc::now().to_rfc3339(),
         "installPath": plugin_dir.to_string_lossy(),

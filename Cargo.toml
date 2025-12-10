@@ -2,12 +2,11 @@
 resolver = "2"
 members = [
     "crates/ygrep-core",
-    "crates/ygrep-daemon",
     "crates/ygrep-cli",
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yetidevworks/ygrep"
@@ -16,7 +15,6 @@ authors = ["YetiDevWorks"]
 [workspace.dependencies]
 # Internal crates
 ygrep-core = { path = "crates/ygrep-core" }
-ygrep-daemon = { path = "crates/ygrep-daemon" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

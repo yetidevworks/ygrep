@@ -30,7 +30,7 @@ use embeddings::{EmbeddingModel, EmbeddingCache};
 #[cfg(feature = "embeddings")]
 use index::VectorIndex;
 
-/// Embedding dimension for bge-small-en-v1.5
+/// Embedding dimension for all-MiniLM-L6-v2
 #[cfg(feature = "embeddings")]
 const EMBEDDING_DIM: usize = 384;
 
@@ -95,7 +95,7 @@ impl Workspace {
             };
 
             // Create embedding model (lazy-loaded on first use)
-            let embedding_model = Arc::new(EmbeddingModel::default()); // Uses bge-small-en-v1.5
+            let embedding_model = Arc::new(EmbeddingModel::default()); // Uses all-MiniLM-L6-v2
 
             // Create embedding cache (100MB cache, 384 dimensions)
             let embedding_cache = Arc::new(EmbeddingCache::new(100, EMBEDDING_DIM));
@@ -145,8 +145,9 @@ impl Workspace {
         // Collect content for batch embedding
         #[cfg(feature = "embeddings")]
         let mut embedding_batch: Vec<(String, String)> = Vec::new(); // (doc_id, content)
+        // Larger batch size = more efficient SIMD/vectorization in ONNX Runtime
         #[cfg(feature = "embeddings")]
-        const BATCH_SIZE: usize = 32;
+        const BATCH_SIZE: usize = 64;
 
         for entry in walker.walk() {
             match indexer.index_file(&entry.path) {
@@ -179,6 +180,9 @@ impl Workspace {
         eprintln!("\r  Indexed {} files.              ", indexed);
         indexer.commit()?;
 
+        // Track embedded count
+        let mut total_embedded = 0usize;
+
         // Phase 2: Generate embeddings in batches (if enabled)
         #[cfg(feature = "embeddings")]
         if with_embeddings && !embedding_batch.is_empty() {
@@ -199,14 +203,16 @@ impl Workspace {
                     filtered_batch.len(), indexed);
 
                 let total_docs = filtered_batch.len();
-                let mut embedded = 0;
 
                 for chunk in filtered_batch.chunks(BATCH_SIZE) {
-                    // Truncate very long content to first 8KB for embedding
+                    // Truncate to ~4KB for embedding - sufficient context for code, faster tokenization
+                    // Use floor_char_boundary to avoid slicing in the middle of multi-byte UTF-8 characters
+                    const EMBED_TRUNCATE: usize = 4096;
                     let texts: Vec<&str> = chunk.iter()
                         .map(|(_, content)| {
-                            if content.len() > 8192 {
-                                &content[..8192]
+                            if content.len() > EMBED_TRUNCATE {
+                                let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
+                                &content[..boundary]
                             } else {
                                 content.as_str()
                             }
@@ -220,8 +226,8 @@ impl Workspace {
                                     tracing::debug!("Failed to insert embedding for {}: {}", doc_id, e);
                                 }
                             }
-                            embedded += chunk.len();
-                            eprint!("\r  Embedded {}/{} documents...    ", embedded, total_docs);
+                            total_embedded += chunk.len();
+                            eprint!("\r  Embedded {}/{} documents...    ", total_embedded, total_docs);
                         }
                         Err(e) => {
                             tracing::warn!("Batch embedding failed: {}", e);
@@ -229,7 +235,7 @@ impl Workspace {
                     }
                 }
 
-                eprintln!("\r  Embedded {} documents.              ", embedded);
+                eprintln!("\r  Embedded {} documents.              ", total_embedded);
                 self.vector_index.save()?;
             }
         }
@@ -254,6 +260,7 @@ impl Workspace {
 
         Ok(IndexStats {
             indexed,
+            embedded: total_embedded,
             skipped,
             errors,
             unique_paths: stats.visited_paths,
@@ -383,6 +390,7 @@ impl Workspace {
 #[derive(Debug, Clone, Default)]
 pub struct IndexStats {
     pub indexed: usize,
+    pub embedded: usize,
     pub skipped: usize,
     pub errors: usize,
     pub unique_paths: usize,

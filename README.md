@@ -8,7 +8,7 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 - **Code-aware tokenizer** - Preserves `$`, `@`, `#` as part of tokens (essential for PHP, Shell, Python, etc.)
 - **Fast indexed search** - Tantivy-powered BM25 ranking, instant results
 - **File watching** - Incremental index updates on file changes
-- **Optional semantic search** - HNSW vector index with local embeddings (bge-small-en-v1.5)
+- **Optional semantic search** - HNSW vector index with local embeddings (all-MiniLM-L6-v2)
 - **Symlink handling** - Follows symlinks with cycle detection
 - **AI-optimized output** - Clean, minimal output with file paths and line numbers
 
@@ -126,7 +126,7 @@ ygrep "authentication flow"        # Uses BM25 + vector search
 ygrep search "auth" --text-only
 ```
 
-Semantic search uses the `bge-small-en-v1.5` model (~50MB, downloaded on first use).
+Semantic search uses the `all-MiniLM-L6-v2` model (~25MB, downloaded on first use).
 
 **Note:** Semantic search requires ONNX Runtime and is only available on certain platforms:
 - ✅ macOS ARM64 (Apple Silicon)
