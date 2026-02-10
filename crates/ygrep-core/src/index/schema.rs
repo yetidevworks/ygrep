@@ -200,6 +200,21 @@ impl SchemaFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tantivy::tokenizer::TokenStream;
+
+    /// Helper: tokenize text with the code tokenizer and return token strings
+    fn tokenize(text: &str) -> Vec<String> {
+        let mut tokenizer = TextAnalyzer::builder(CodeTokenizer)
+            .filter(LowerCaser)
+            .filter(RemoveLongFilter::limit(100))
+            .build();
+        let mut stream = tokenizer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        tokens
+    }
 
     #[test]
     fn test_schema_creation() {
@@ -214,5 +229,43 @@ mod tests {
         // Verify field handles work
         let _ = fields.doc_id;
         let _ = fields.content;
+    }
+
+    #[test]
+    fn test_tokenizer_preserves_code_chars() {
+        // $variable, @decorator, #include should be preserved as tokens
+        let tokens = tokenize("$variable @decorator #include");
+        assert!(tokens.contains(&"$variable".to_string()));
+        assert!(tokens.contains(&"@decorator".to_string()));
+        assert!(tokens.contains(&"#include".to_string()));
+
+        // Hyphen is kept (e.g., CSS class names like "my-class")
+        let tokens = tokenize("my-class foo-bar");
+        assert!(tokens.contains(&"my-class".to_string()));
+        assert!(tokens.contains(&"foo-bar".to_string()));
+
+        // Underscore is kept (identifiers like "hello_world")
+        let tokens = tokenize("hello_world some_func");
+        assert!(tokens.contains(&"hello_world".to_string()));
+        assert!(tokens.contains(&"some_func".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_lowercases() {
+        let tokens = tokenize("FnMain HelloWorld UPPER");
+        assert!(tokens.contains(&"fnmain".to_string()));
+        assert!(tokens.contains(&"helloworld".to_string()));
+        assert!(tokens.contains(&"upper".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_removes_long_tokens() {
+        let long_token = "a".repeat(101);
+        let text = format!("short {} end", long_token);
+        let tokens = tokenize(&text);
+        assert!(tokens.contains(&"short".to_string()));
+        assert!(tokens.contains(&"end".to_string()));
+        // The 101-char token should be removed by RemoveLongFilter
+        assert!(!tokens.iter().any(|t| t.len() > 100));
     }
 }

@@ -79,7 +79,8 @@ impl Indexer {
     }
 
     /// Index a single file
-    pub fn index_file(&self, path: &Path) -> Result<String> {
+    /// Returns (doc_id, content) so callers can reuse the content without re-reading.
+    pub fn index_file(&self, path: &Path) -> Result<(String, String)> {
         // Read file content
         let content = std::fs::read_to_string(path)?;
         let metadata = std::fs::metadata(path)?;
@@ -175,7 +176,7 @@ impl Indexer {
             }
         }
 
-        Ok(doc_id)
+        Ok((doc_id, content))
     }
 
     /// Index chunks of a file for more granular search
@@ -272,28 +273,151 @@ mod tests {
     use crate::index::schema::build_document_schema;
     use tempfile::tempdir;
 
+    /// Helper: create an index in a temp directory
+    fn create_test_indexer(temp_dir: &std::path::Path) -> (Indexer, std::path::PathBuf) {
+        let index_path = temp_dir.join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let config = IndexerConfig::default();
+        let indexer = Indexer::new(config, index, temp_dir).unwrap();
+        (indexer, index_path)
+    }
+
     #[test]
     fn test_index_file() -> Result<()> {
         let temp_dir = tempdir().unwrap();
-        let index_path = temp_dir.path().join("index");
-        std::fs::create_dir_all(&index_path).unwrap();
+        let (indexer, _) = create_test_indexer(temp_dir.path());
 
         // Create test file
         let test_file = temp_dir.path().join("test.rs");
         std::fs::write(&test_file, "fn main() {\n    println!(\"hello\");\n}").unwrap();
 
-        // Create index
-        let schema = build_document_schema();
-        let index = Index::create_in_dir(&index_path, schema)?;
-
-        let config = IndexerConfig::default();
-        let indexer = Indexer::new(config, index, temp_dir.path())?;
-
         // Index the file
-        let doc_id = indexer.index_file(&test_file)?;
+        let (doc_id, content) = indexer.index_file(&test_file)?;
         indexer.commit()?;
 
         assert!(!doc_id.is_empty());
+        assert!(content.contains("hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_hash_deduplication() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (indexer, _) = create_test_indexer(temp_dir.path());
+
+        let content = "fn duplicate() {}";
+        let file1 = temp_dir.path().join("file1.rs");
+        let file2 = temp_dir.path().join("file2.rs");
+        std::fs::write(&file1, content).unwrap();
+        std::fs::write(&file2, content).unwrap();
+
+        let (doc_id1, _) = indexer.index_file(&file1)?;
+        let (doc_id2, _) = indexer.index_file(&file2)?;
+
+        // Same content should produce the same doc_id (content hash)
+        assert_eq!(doc_id1, doc_id2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_too_large() {
+        let temp_dir = tempdir().unwrap();
+
+        let index_path = temp_dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let mut config = IndexerConfig::default();
+        config.max_file_size = 10; // 10 bytes max
+
+        let indexer = Indexer::new(config, index, temp_dir.path()).unwrap();
+
+        // Create a file larger than the limit
+        let large_file = temp_dir.path().join("large.rs");
+        std::fs::write(
+            &large_file,
+            "this content is definitely longer than 10 bytes",
+        )
+        .unwrap();
+
+        let result = indexer.index_file(&large_file);
+        assert!(matches!(
+            result,
+            Err(crate::error::YgrepError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_chunking_large_file() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+
+        let index_path = temp_dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let mut config = IndexerConfig::default();
+        config.chunk_size = 5; // 5 lines per chunk
+        config.chunk_overlap = 1;
+
+        let indexer = Indexer::new(config, index.clone(), temp_dir.path()).unwrap();
+
+        // Create a file with 15 lines (should produce chunks)
+        let lines: Vec<String> = (1..=15).map(|i| format!("line {} content", i)).collect();
+        let content = lines.join("\n");
+        let test_file = temp_dir.path().join("big.rs");
+        std::fs::write(&test_file, &content).unwrap();
+
+        indexer.index_file(&test_file)?;
+        indexer.commit()?;
+
+        // Verify chunks were created by searching the index
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let all_query = tantivy::query::AllQuery;
+        let top_docs =
+            searcher.search(&all_query, &tantivy::collector::TopDocs::with_limit(100))?;
+
+        // Should have 1 parent doc + multiple chunks
+        assert!(
+            top_docs.len() > 1,
+            "Expected chunks, got {} docs",
+            top_docs.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_by_path() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (indexer, _) = create_test_indexer(temp_dir.path());
+
+        let test_file = temp_dir.path().join("deleteme.rs");
+        std::fs::write(&test_file, "fn to_delete() {}").unwrap();
+
+        indexer.index_file(&test_file)?;
+        indexer.commit()?;
+
+        // Delete by relative path
+        indexer.delete_by_path("deleteme.rs")?;
+        indexer.commit()?;
+
+        // Verify deletion by searching
+        let reader = indexer.index().reader()?;
+        let searcher = reader.searcher();
+        let all_query = tantivy::query::AllQuery;
+        let top_docs =
+            searcher.search(&all_query, &tantivy::collector::TopDocs::with_limit(100))?;
+
+        assert_eq!(top_docs.len(), 0, "Document should have been deleted");
         Ok(())
     }
 }

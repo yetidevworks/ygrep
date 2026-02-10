@@ -280,6 +280,30 @@ src/main.rs:12-28
 4. **Search**: BM25-ranked literal search (default) or regex matching with `-r` flag, plus optional semantic search
 5. **Results**: Returns matching files with line numbers and context
 
+## Development
+
+### Running Tests
+
+```bash
+cargo test --workspace              # Run all tests
+cargo test -p ygrep-core            # Run core library tests only
+cargo test -p ygrep-core -- search  # Run tests matching "search"
+```
+
+### Code Quality
+
+```bash
+cargo fmt --all -- --check          # Check formatting
+cargo clippy --workspace --all-targets  # Lint
+```
+
+### Building
+
+```bash
+cargo build --release               # Build release binary
+cargo install --path crates/ygrep-cli   # Install to ~/.cargo/bin/
+```
+
 ## Configuration
 
 Index data stored in:

@@ -320,32 +320,57 @@ pub fn remove(identifier: &str) -> Result<()> {
     // Try to find by workspace path (exact match or substring)
     let target_path = std::fs::canonicalize(identifier).ok();
 
+    let mut matched: Vec<(PathBuf, IndexInfo)> = Vec::new();
+
     for entry in fs::read_dir(&indexes_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
             if let Some(hash) = path.file_name().and_then(|n| n.to_str()) {
                 if let Ok(info) = read_index_info(hash, &path) {
-                    let matches = match (&info.workspace, &target_path) {
+                    let is_match = match (&info.workspace, &target_path) {
                         (Some(ws), Some(target)) => PathBuf::from(ws) == *target,
                         (Some(ws), None) => ws.contains(identifier),
                         _ => false,
                     };
 
-                    if matches {
-                        fs::remove_dir_all(&path)?;
-                        println!(
-                            "Removed index: {} ({})",
-                            shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
-                            format_size(info.size_bytes)
-                        );
-                        return Ok(());
+                    if is_match {
+                        matched.push((path, info));
                     }
                 }
             }
         }
     }
 
-    println!("Index not found: {}", identifier);
+    match matched.len() {
+        0 => {
+            println!("Index not found: {}", identifier);
+        }
+        1 => {
+            let (path, info) = matched.into_iter().next().unwrap();
+            fs::remove_dir_all(&path)?;
+            println!(
+                "Removed index: {} ({})",
+                shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
+                format_size(info.size_bytes)
+            );
+        }
+        _ => {
+            println!(
+                "Ambiguous identifier '{}' matches {} indexes:",
+                identifier,
+                matched.len()
+            );
+            for (_, info) in &matched {
+                println!(
+                    "  {} ({})",
+                    shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
+                    info.hash
+                );
+            }
+            println!("\nUse the full hash to remove a specific index.");
+        }
+    }
+
     Ok(())
 }

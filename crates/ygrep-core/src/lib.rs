@@ -111,10 +111,7 @@ impl Workspace {
             match Index::open_in_dir(&index_path) {
                 Ok(idx) => idx,
                 Err(e) if create => {
-                    eprintln!(
-                        "Warning: corrupt index, recreating: {}",
-                        e
-                    );
+                    eprintln!("Warning: corrupt index, recreating: {}", e);
                     // Remove corrupted index and create fresh
                     std::fs::remove_dir_all(&index_path)?;
                     std::fs::create_dir_all(&index_path)?;
@@ -141,10 +138,7 @@ impl Workspace {
                 match VectorIndex::load(vector_path.clone()) {
                     Ok(vi) => Arc::new(vi),
                     Err(e) => {
-                        eprintln!(
-                            "Warning: corrupt vector index, recreating: {}",
-                            e
-                        );
+                        eprintln!("Warning: corrupt vector index, recreating: {}", e);
                         // Remove corrupted vector files and create fresh
                         if vector_path.exists() {
                             let _ = std::fs::remove_dir_all(&vector_path);
@@ -210,21 +204,22 @@ impl Workspace {
 
         for entry in walker.walk() {
             match indexer.index_file(&entry.path) {
-                Ok(doc_id) => {
+                Ok((doc_id, content)) => {
                     indexed += 1;
                     if indexed % 500 == 0 {
                         eprint!("\r  Indexed {} files...          ", indexed);
                     }
 
-                    // Collect for embedding if enabled
+                    // Collect for embedding if enabled (reuse content from indexer)
                     #[cfg(feature = "embeddings")]
                     if with_embeddings {
-                        if let Ok(content) = std::fs::read_to_string(&entry.path) {
-                            embedding_batch.push((doc_id, content));
-                        }
+                        embedding_batch.push((doc_id, content));
                     }
                     #[cfg(not(feature = "embeddings"))]
-                    let _ = doc_id;
+                    {
+                        let _ = doc_id;
+                        let _ = content;
+                    }
                 }
                 Err(YgrepError::FileTooLarge { .. }) => {
                     skipped += 1;
@@ -488,7 +483,7 @@ impl Workspace {
             // else: new file, not in map
 
             match indexer.index_file(&entry.path) {
-                Ok(doc_id) => {
+                Ok((doc_id, content)) => {
                     indexed += 1;
                     if indexed % 500 == 0 {
                         eprint!("\r  Indexed {} files...          ", indexed);
@@ -496,12 +491,13 @@ impl Workspace {
 
                     #[cfg(feature = "embeddings")]
                     if with_embeddings {
-                        if let Ok(content) = std::fs::read_to_string(&entry.path) {
-                            embedding_batch.push((doc_id, content));
-                        }
+                        embedding_batch.push((doc_id, content));
                     }
                     #[cfg(not(feature = "embeddings"))]
-                    let _ = doc_id;
+                    {
+                        let _ = doc_id;
+                        let _ = content;
+                    }
                 }
                 Err(YgrepError::FileTooLarge { .. }) => {
                     skipped += 1;
@@ -719,7 +715,7 @@ impl Workspace {
             index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
 
         match indexer.index_file(path) {
-            Ok(_doc_id) => {
+            Ok((_doc_id, _content)) => {
                 indexer.commit()?;
                 tracing::debug!("Indexed: {}", path.display());
                 Ok(())
@@ -743,11 +739,11 @@ impl Workspace {
             .to_string_lossy();
 
         let schema = self.index.schema();
-        let doc_id_field = schema
-            .get_field("doc_id")
-            .map_err(|_| YgrepError::Config("doc_id field not found in schema".to_string()))?;
+        let path_field = schema
+            .get_field("path")
+            .map_err(|_| YgrepError::Config("path field not found in schema".to_string()))?;
 
-        let term = Term::from_field_text(doc_id_field, &relative_path);
+        let term = Term::from_field_text(path_field, &relative_path);
 
         let mut writer = self.index.writer::<tantivy::TantivyDocument>(50_000_000)?;
         writer.delete_term(term);
@@ -802,51 +798,55 @@ impl Workspace {
             index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
 
         match indexer.index_file(path) {
-            Ok(doc_id) => {
+            Ok((doc_id, content)) => {
                 indexer.commit()?;
                 tracing::debug!("Indexed: {}", path.display());
 
-                // Generate embedding if semantic indexing is enabled
+                // Generate embedding if semantic indexing is enabled (reuse content from indexer)
                 #[cfg(feature = "embeddings")]
                 if with_embeddings {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        // Only embed files within size bounds
-                        let len = content.len();
-                        if len >= 50 && len <= 50_000 {
-                            // Truncate for embedding
-                            const EMBED_TRUNCATE: usize = 4096;
-                            let text = if content.len() > EMBED_TRUNCATE {
-                                let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
-                                &content[..boundary]
-                            } else {
-                                content.as_str()
-                            };
+                    // Only embed files within size bounds
+                    let len = content.len();
+                    if len >= 50 && len <= 50_000 {
+                        // Truncate for embedding
+                        const EMBED_TRUNCATE: usize = 4096;
+                        let text = if content.len() > EMBED_TRUNCATE {
+                            let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
+                            &content[..boundary]
+                        } else {
+                            content.as_str()
+                        };
 
-                            match self.embedding_model.embed(text) {
-                                Ok(embedding) => {
-                                    if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
-                                        tracing::debug!(
-                                            "Failed to insert embedding for {}: {}",
-                                            doc_id,
-                                            e
-                                        );
-                                    } else {
-                                        // Save vector index after each file (incremental)
-                                        if let Err(e) = self.vector_index.save() {
-                                            tracing::debug!("Failed to save vector index: {}", e);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
+                        match self.embedding_model.embed(text) {
+                            Ok(embedding) => {
+                                if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
                                     tracing::debug!(
-                                        "Failed to generate embedding for {}: {}",
+                                        "Failed to insert embedding for {}: {}",
                                         doc_id,
                                         e
                                     );
+                                } else {
+                                    // Save vector index after each file (incremental)
+                                    if let Err(e) = self.vector_index.save() {
+                                        tracing::debug!("Failed to save vector index: {}", e);
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed to generate embedding for {}: {}",
+                                    doc_id,
+                                    e
+                                );
                             }
                         }
                     }
+                }
+
+                #[cfg(not(feature = "embeddings"))]
+                {
+                    let _ = doc_id;
+                    let _ = content;
                 }
 
                 Ok(())
@@ -891,7 +891,7 @@ mod tests {
         // Create a test file
         std::fs::write(temp_dir.path().join("test.rs"), "fn main() {}").unwrap();
 
-        let workspace = Workspace::open(temp_dir.path())?;
+        let workspace = Workspace::create(temp_dir.path())?;
         assert!(workspace.root().exists());
 
         Ok(())
@@ -901,26 +901,36 @@ mod tests {
     fn test_workspace_index_and_search() -> Result<()> {
         let temp_dir = tempdir().unwrap();
 
+        // Create a workspace subdirectory to avoid the walker's hardcoded
+        // ignore list (which includes "tmp", "var" — common tempdir components)
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
         // Create test files
         std::fs::write(
-            temp_dir.path().join("hello.rs"),
+            workspace_dir.join("hello.rs"),
             "fn hello_world() { println!(\"Hello!\"); }",
         )
         .unwrap();
         std::fs::write(
-            temp_dir.path().join("goodbye.rs"),
+            workspace_dir.join("goodbye.rs"),
             "fn goodbye_world() { println!(\"Bye!\"); }",
         )
         .unwrap();
 
         let mut config = Config::default();
         config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
 
-        let workspace = Workspace::open_with_config(temp_dir.path(), config)?;
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
 
         // Index
         let stats = workspace.index_all()?;
-        assert!(stats.indexed >= 2);
+        assert!(
+            stats.indexed >= 2,
+            "Expected at least 2 indexed files, got {}",
+            stats.indexed
+        );
 
         // Search
         let result = workspace.search("hello", None)?;

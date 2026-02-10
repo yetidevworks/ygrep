@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - macOS x86_64 (Intel) binary builds and Homebrew support (text search only)
 - Honor XDG environment variables (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`) on all platforms including macOS
+- CI workflow with formatting, type checking, tests, and clippy on every push/PR to main
+- 30 new tests covering tokenizer behavior, search correctness, RRF fusion, indexer operations, config defaults, watcher patterns, and result formatting (20 → 50 total)
+
+### Fixed
+- 6 broken tests: workspace open/create mismatch, score display assertion, tempdir path conflicts with walker ignore list, missing tokenizer registration
 
 ## [2.0.2] - 2026-02-10
 

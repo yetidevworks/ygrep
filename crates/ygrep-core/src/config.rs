@@ -382,3 +382,44 @@ pub enum ConfigError {
     #[error("Failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_sane_values() {
+        let config = Config::default();
+
+        // Indexer defaults
+        assert!(config.indexer.max_file_size > 0);
+        assert!(config.indexer.chunk_size > 0);
+        assert!(config.indexer.chunk_overlap < config.indexer.chunk_size);
+        assert!(config.indexer.threads > 0);
+
+        // Search weights should be between 0 and 1
+        assert!(config.search.bm25_weight >= 0.0 && config.search.bm25_weight <= 1.0);
+        assert!(config.search.vector_weight >= 0.0 && config.search.vector_weight <= 1.0);
+
+        // Limits
+        assert!(config.search.default_limit > 0);
+        assert!(config.search.max_limit >= config.search.default_limit);
+    }
+
+    #[test]
+    fn test_config_load_returns_defaults_when_no_file() {
+        // Config::load() should return defaults when no config file exists
+        // (we're in a test environment, so unlikely to have .ygrep.toml in cwd)
+        let config = Config::load();
+        let default = Config::default();
+
+        assert_eq!(config.indexer.max_file_size, default.indexer.max_file_size);
+        assert_eq!(config.search.default_limit, default.search.default_limit);
+    }
+
+    #[test]
+    fn test_config_load_from_nonexistent_file() {
+        let result = Config::load_from(std::path::Path::new("/nonexistent/config.toml"));
+        assert!(result.is_err());
+    }
+}

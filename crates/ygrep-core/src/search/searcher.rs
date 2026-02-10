@@ -64,7 +64,7 @@ impl Searcher {
         let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
 
         // Fetch more results since we'll filter them down
-        let fetch_limit = limit * 10;
+        let fetch_limit = limit * 50;
         let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
 
         // Build results
@@ -217,13 +217,13 @@ impl Searcher {
             let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
 
             // Fetch many candidates since regex might be selective
-            let fetch_limit = limit * 20;
+            let fetch_limit = limit * 100;
             searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?
         } else {
             // No good search terms - scan all documents
             // This is slow but necessary for patterns like "^#" or ".*"
             let all_query = tantivy::query::AllQuery;
-            let fetch_limit = limit * 50;
+            let fetch_limit = limit * 100;
             searcher.search(&all_query, &TopDocs::with_limit(fetch_limit))?
         };
 
@@ -412,41 +412,251 @@ mod tests {
     use tantivy::doc;
     use tempfile::tempdir;
 
+    /// Helper: create an index with the code tokenizer registered
+    fn create_test_index(path: &std::path::Path) -> (Index, SchemaFields) {
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(path, schema.clone()).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+        let fields = SchemaFields::new(&schema);
+        (index, fields)
+    }
+
+    /// Helper: add a document to an index
+    fn add_doc(
+        index: &Index,
+        fields: &SchemaFields,
+        doc_id: &str,
+        path: &str,
+        content: &str,
+        ext: &str,
+    ) {
+        let mut writer = index.writer(50_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                fields.doc_id => doc_id,
+                fields.path => path,
+                fields.workspace => "/test",
+                fields.content => content,
+                fields.mtime => 0u64,
+                fields.size => content.len() as u64,
+                fields.extension => ext,
+                fields.line_start => 1u64,
+                fields.line_end => content.lines().count() as u64,
+                fields.chunk_id => "",
+                fields.parent_doc => ""
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
     #[test]
     fn test_basic_search() -> Result<()> {
         let temp_dir = tempdir().unwrap();
-        let index_path = temp_dir.path();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn main() { println!(\"Hello, world!\"); }",
+            "rs",
+        );
 
-        // Create index with schema
-        let schema = build_document_schema();
-        let index = Index::create_in_dir(index_path, schema.clone())?;
-
-        let fields = SchemaFields::new(&schema);
-
-        // Add a test document
-        let mut writer = index.writer(50_000_000)?;
-        writer.add_document(doc!(
-            fields.doc_id => "test1",
-            fields.path => "src/main.rs",
-            fields.workspace => "/test",
-            fields.content => "fn main() { println!(\"Hello, world!\"); }",
-            fields.mtime => 0u64,
-            fields.size => 100u64,
-            fields.extension => "rs",
-            fields.line_start => 1u64,
-            fields.line_end => 1u64,
-            fields.chunk_id => "",
-            fields.parent_doc => ""
-        ))?;
-        writer.commit()?;
-
-        // Search
         let config = SearchConfig::default();
         let searcher = Searcher::new(config, index);
         let result = searcher.search("hello", None)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_case_insensitive_search() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/lib.rs",
+            "fn greet() { println!(\"Hello World\"); }",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Uppercase query should find mixed-case content
+        let result = searcher.search("HELLO", None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/lib.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_query_returns_empty() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn main() {}",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Queries with no searchable terms should return empty
+        let result = searcher.search("...", None)?;
+        assert!(result.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_search_basic() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn hello_world() {\n    println!(\"Hello!\");\n}",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search_regex("hello.*world", None)?;
+        assert_eq!(result.hits.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_search_invalid_returns_error() {
+        let temp_dir = tempdir().unwrap();
+        let (index, _fields) = create_test_index(temp_dir.path());
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search_regex("[invalid", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_extension_filter() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn hello() {}",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "src/main.py",
+            "def hello(): pass",
+            "py",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: Some(vec!["rs".to_string()]),
+            paths: None,
+        };
+        let result = searcher.search_filtered("hello", None, filters, false)?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/main.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_path_filter() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn hello() {}",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "lib/utils.rs",
+            "fn hello() {}",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: None,
+            paths: Some(vec!["lib/".to_string()]),
+        };
+        let result = searcher.search_filtered("hello", None, filters, false)?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "lib/utils.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_results_ordered_by_score() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        // Document with more occurrences of "hello" should score higher
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/many.rs",
+            "hello hello hello hello hello",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "src/one.rs",
+            "hello world goodbye",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+        let result = searcher.search("hello", None)?;
+
+        assert!(result.hits.len() >= 2);
+        // Results should be ordered by score descending
+        for pair in result.hits.windows(2) {
+            assert!(pair[0].score >= pair[1].score);
+        }
 
         Ok(())
     }

@@ -204,6 +204,7 @@ mod tests {
             score: 0.8,
             is_chunk: false,
             doc_id: "abc123".to_string(),
+            match_type: MatchType::Text,
         };
         assert_eq!(hit.lines_str(), "10-25");
 
@@ -223,7 +224,7 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn main() {\n    println!(\"hello\");\n}".to_string(),
-                score: 0.9,
+                score: 0.01,
                 is_chunk: false,
                 doc_id: "abc".to_string(),
                 match_type: MatchType::Text,
@@ -237,6 +238,87 @@ mod tests {
         let output = result.format_ai();
         assert!(output.contains("# 1 results"));
         assert!(output.contains("src/main.rs:1"));
-        assert!(output.contains("(90%)"));
+        assert!(output.contains("(30%)"));
+    }
+
+    fn make_hit(path: &str, score: f32, match_type: MatchType) -> SearchHit {
+        SearchHit {
+            path: path.to_string(),
+            line_start: 1,
+            line_end: 5,
+            snippet: "fn example() {\n    // code\n}".to_string(),
+            score,
+            is_chunk: false,
+            doc_id: "test".to_string(),
+            match_type,
+        }
+    }
+
+    fn make_result(hits: Vec<SearchHit>) -> SearchResult {
+        let text_hits = hits
+            .iter()
+            .filter(|h| matches!(h.match_type, MatchType::Text | MatchType::Hybrid))
+            .count();
+        let semantic_hits = hits
+            .iter()
+            .filter(|h| matches!(h.match_type, MatchType::Semantic | MatchType::Hybrid))
+            .count();
+        let total = hits.len();
+        SearchResult {
+            hits,
+            total,
+            query_time_ms: 10,
+            text_hits,
+            semantic_hits,
+        }
+    }
+
+    #[test]
+    fn test_format_json_valid() {
+        let result = make_result(vec![make_hit("src/main.rs", 0.01, MatchType::Text)]);
+        let json = result.format_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("hits").unwrap().is_array());
+        assert_eq!(parsed["total"], 1);
+    }
+
+    #[test]
+    fn test_format_pretty_includes_path_and_line_numbers() {
+        let result = make_result(vec![make_hit("src/lib.rs", 0.01, MatchType::Text)]);
+        let output = result.format_pretty();
+        assert!(output.contains("src/lib.rs:1"));
+        assert!(output.contains("1: fn example()"));
+    }
+
+    #[test]
+    fn test_empty_result_formatting() {
+        let result = SearchResult::empty();
+        assert!(result.is_empty());
+
+        let ai = result.format_ai();
+        assert!(ai.contains("# 0 results"));
+
+        let pretty = result.format_pretty();
+        assert!(pretty.contains("# 0 results"));
+
+        let json = result.format_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["hits"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_format_ai_match_type_indicators() {
+        let result = make_result(vec![
+            make_hit("src/hybrid.rs", 0.02, MatchType::Hybrid),
+            make_hit("src/semantic.rs", 0.01, MatchType::Semantic),
+            make_hit("src/text.rs", 0.01, MatchType::Text),
+        ]);
+        let output = result.format_ai();
+
+        // Hybrid gets " +" indicator
+        assert!(output.contains(" +\n"));
+        // Semantic gets " ~" indicator
+        assert!(output.contains(" ~\n"));
+        // Text gets no indicator — line ends with "%)"\n
     }
 }

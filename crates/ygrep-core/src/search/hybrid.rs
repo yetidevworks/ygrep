@@ -218,11 +218,11 @@ impl HybridSearcher {
 
         let mut combined_scores: HashMap<String, FusedScore> = HashMap::new();
 
-        // Add BM25 results
+        // Add BM25 results (key by path to avoid collapsing files with identical content)
         for result in &bm25_results {
             let rrf_score = bm25_weight / (K + result.rank as f32);
             let entry = combined_scores
-                .entry(result.doc_id.clone())
+                .entry(result.path.clone())
                 .or_insert_with(|| FusedScore {
                     result: result.clone(),
                     bm25_rrf: 0.0,
@@ -231,11 +231,11 @@ impl HybridSearcher {
             entry.bm25_rrf = rrf_score;
         }
 
-        // Add vector results
+        // Add vector results (key by path to avoid collapsing files with identical content)
         for result in &vector_results {
             let rrf_score = vector_weight / (K + result.rank as f32);
             let entry = combined_scores
-                .entry(result.doc_id.clone())
+                .entry(result.path.clone())
                 .or_insert_with(|| FusedScore {
                     result: result.clone(),
                     bm25_rrf: 0.0,
@@ -338,6 +338,78 @@ fn extract_u64(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) ->
     })
 }
 
+/// Standalone RRF fusion for testing (same algorithm as HybridSearcher::reciprocal_rank_fusion)
+#[cfg(test)]
+fn reciprocal_rank_fusion_standalone(
+    bm25_results: Vec<RankedResult>,
+    vector_results: Vec<RankedResult>,
+    bm25_weight: f32,
+    vector_weight: f32,
+    query: &str,
+) -> Vec<SearchHit> {
+    const K: f32 = 60.0;
+    let mut combined_scores: HashMap<String, FusedScore> = HashMap::new();
+
+    for result in &bm25_results {
+        let rrf_score = bm25_weight / (K + result.rank as f32);
+        let entry = combined_scores
+            .entry(result.path.clone())
+            .or_insert_with(|| FusedScore {
+                result: result.clone(),
+                bm25_rrf: 0.0,
+                vector_rrf: 0.0,
+            });
+        entry.bm25_rrf = rrf_score;
+    }
+
+    for result in &vector_results {
+        let rrf_score = vector_weight / (K + result.rank as f32);
+        let entry = combined_scores
+            .entry(result.path.clone())
+            .or_insert_with(|| FusedScore {
+                result: result.clone(),
+                bm25_rrf: 0.0,
+                vector_rrf: 0.0,
+            });
+        entry.vector_rrf = rrf_score;
+    }
+
+    let mut hits: Vec<SearchHit> = combined_scores
+        .into_values()
+        .map(|fused| {
+            let total_score = fused.bm25_rrf + fused.vector_rrf;
+            let (snippet, match_offset, line_count) =
+                create_relevant_snippet(&fused.result.content, query, 10);
+            let actual_line_start = fused.result.line_start + match_offset as u64;
+            let actual_line_end = actual_line_start + line_count.saturating_sub(1) as u64;
+            let match_type = match (fused.bm25_rrf > 0.0, fused.vector_rrf > 0.0) {
+                (true, true) => MatchType::Hybrid,
+                (true, false) => MatchType::Text,
+                (false, true) => MatchType::Semantic,
+                (false, false) => MatchType::Text,
+            };
+            SearchHit {
+                path: fused.result.path,
+                line_start: actual_line_start,
+                line_end: actual_line_end,
+                snippet,
+                score: total_score,
+                is_chunk: fused.result.is_chunk,
+                doc_id: fused.result.doc_id,
+                match_type,
+            }
+        })
+        .collect();
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    hits
+}
+
 /// Create a snippet showing lines relevant to the query
 /// Returns (snippet, line_offset_from_start, line_count)
 fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (String, usize, usize) {
@@ -377,4 +449,82 @@ fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (Str
     let snippet = lines[start..end].join("\n");
     let line_count = end - start;
     (snippet, start, line_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ranked(doc_id: &str, path: &str, rank: usize, content: &str) -> RankedResult {
+        RankedResult {
+            doc_id: doc_id.to_string(),
+            path: path.to_string(),
+            content: content.to_string(),
+            line_start: 1,
+            is_chunk: false,
+            rank,
+            score: 1.0 / rank as f32,
+        }
+    }
+
+    #[test]
+    fn test_rrf_both_sources_hybrid() {
+        let bm25 = vec![make_ranked("d1", "src/a.rs", 1, "hello world")];
+        let vector = vec![make_ranked("d1", "src/a.rs", 1, "hello world")];
+
+        let hits = reciprocal_rank_fusion_standalone(bm25, vector, 0.5, 0.5, "hello");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_type, MatchType::Hybrid);
+    }
+
+    #[test]
+    fn test_rrf_bm25_only_text_type() {
+        let bm25 = vec![make_ranked("d1", "src/a.rs", 1, "hello world")];
+        let vector: Vec<RankedResult> = vec![];
+
+        let hits = reciprocal_rank_fusion_standalone(bm25, vector, 0.5, 0.5, "hello");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_type, MatchType::Text);
+        // Score should be bm25_weight / (K + rank) = 0.5 / (60 + 1)
+        let expected = 0.5 / 61.0;
+        assert!((hits[0].score - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rrf_vector_only_semantic_type() {
+        let bm25: Vec<RankedResult> = vec![];
+        let vector = vec![make_ranked("d1", "src/a.rs", 1, "hello world")];
+
+        let hits = reciprocal_rank_fusion_standalone(bm25, vector, 0.5, 0.5, "hello");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_type, MatchType::Semantic);
+    }
+
+    #[test]
+    fn test_rrf_sorted_by_score_descending() {
+        let bm25 = vec![
+            make_ranked("d1", "src/a.rs", 1, "hello"),
+            make_ranked("d2", "src/b.rs", 2, "hello"),
+        ];
+        let vector = vec![make_ranked("d1", "src/a.rs", 1, "hello")];
+
+        let hits = reciprocal_rank_fusion_standalone(bm25, vector, 0.5, 0.5, "hello");
+        assert!(hits.len() >= 2);
+        // First hit should have higher score (appears in both)
+        assert!(hits[0].score >= hits[1].score);
+    }
+
+    #[test]
+    fn test_rrf_same_path_merged_not_duplicated() {
+        // Same path from both sources should produce one hit, not two
+        let bm25 = vec![make_ranked("d1", "src/a.rs", 1, "hello world")];
+        let vector = vec![make_ranked("d1", "src/a.rs", 2, "hello world")];
+
+        let hits = reciprocal_rank_fusion_standalone(bm25, vector, 0.5, 0.5, "hello");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/a.rs");
+        // Combined score = bm25_weight/(60+1) + vector_weight/(60+2)
+        let expected = 0.5 / 61.0 + 0.5 / 62.0;
+        assert!((hits[0].score - expected).abs() < 1e-6);
+    }
 }

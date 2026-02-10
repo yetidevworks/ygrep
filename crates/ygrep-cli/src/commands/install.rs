@@ -52,7 +52,10 @@ pub fn install_claude_code() -> Result<()> {
     let known_path = plugins_dir.join("known_marketplaces.json");
     let mut known: serde_json::Value = if known_path.exists() {
         let content = fs::read_to_string(&known_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        serde_json::from_str(&content).context(format!(
+            "Malformed JSON in {}. Please fix or delete the file and retry.",
+            known_path.display()
+        ))?
     } else {
         serde_json::json!({})
     };
@@ -71,7 +74,10 @@ pub fn install_claude_code() -> Result<()> {
     let installed_path = plugins_dir.join("installed_plugins.json");
     let mut installed: serde_json::Value = if installed_path.exists() {
         let content = fs::read_to_string(&installed_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({"version": 1, "plugins": {}}))
+        serde_json::from_str(&content).context(format!(
+            "Malformed JSON in {}. Please fix or delete the file and retry.",
+            installed_path.display()
+        ))?
     } else {
         serde_json::json!({"version": 1, "plugins": {}})
     };
@@ -90,7 +96,10 @@ pub fn install_claude_code() -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        serde_json::from_str(&content).context(format!(
+            "Malformed JSON in {}. Please fix or delete the file and retry.",
+            settings_path.display()
+        ))?
     } else {
         serde_json::json!({})
     };
@@ -199,7 +208,10 @@ export default tool({{
     // Update opencode.json for MCP
     let mut config: serde_json::Value = if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        serde_json::from_str(&content).context(format!(
+            "Malformed JSON in {}. Please fix or delete the file and retry.",
+            config_path.display()
+        ))?
     } else {
         serde_json::json!({})
     };
@@ -315,7 +327,10 @@ pub fn install_droid() -> Result<()> {
     // Update settings.json with hooks
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        serde_json::from_str(&content).context(format!(
+            "Malformed JSON in {}. Please fix or delete the file and retry.",
+            settings_path.display()
+        ))?
     } else {
         serde_json::json!({})
     };

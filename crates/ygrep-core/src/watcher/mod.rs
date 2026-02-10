@@ -360,9 +360,61 @@ mod tests {
     }
 
     #[test]
+    fn test_is_hidden_root_not_hidden() {
+        // A path with no hidden components
+        assert!(!is_hidden(Path::new("/usr/local/bin")));
+    }
+
+    #[test]
+    fn test_is_hidden_nested_in_hidden() {
+        // File nested inside a hidden directory
+        assert!(is_hidden(Path::new("/project/.cache/data/file.txt")));
+    }
+
+    #[test]
     fn test_is_ignored_dir() {
         assert!(is_ignored_dir(Path::new("/foo/node_modules/bar")));
         assert!(is_ignored_dir(Path::new("/foo/vendor/package")));
         assert!(!is_ignored_dir(Path::new("/foo/src/main.rs")));
+    }
+
+    #[test]
+    fn test_matches_ignore_pattern_with_config() {
+        let mut config = IndexerConfig::default();
+        config.ignore_patterns = vec!["**/*.log".to_string(), "**/temp/**".to_string()];
+
+        assert!(matches_ignore_pattern(
+            Path::new("/project/debug.log"),
+            &config
+        ));
+        assert!(matches_ignore_pattern(
+            Path::new("/project/temp/cache.txt"),
+            &config
+        ));
+        assert!(!matches_ignore_pattern(
+            Path::new("/project/src/main.rs"),
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_glob_match_patterns() {
+        // **/dir/** patterns
+        assert!(glob_match(
+            "**/node_modules/**",
+            "/project/node_modules/pkg/index.js"
+        ));
+        assert!(!glob_match("**/node_modules/**", "/project/src/main.rs"));
+
+        // **/*.ext patterns
+        assert!(glob_match("**/*.log", "/var/logs/app.log"));
+        assert!(!glob_match("**/*.log", "/var/logs/app.txt"));
+
+        // *.ext patterns
+        assert!(glob_match("*.pyc", "module.pyc"));
+        assert!(!glob_match("*.pyc", "module.py"));
+
+        // Exact/component match
+        assert!(glob_match("Cargo.lock", "/project/Cargo.lock"));
     }
 }

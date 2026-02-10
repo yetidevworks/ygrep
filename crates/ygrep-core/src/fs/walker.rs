@@ -434,17 +434,29 @@ mod tests {
     fn test_walk_directory() {
         let temp_dir = tempdir().unwrap();
 
-        // Create some files
-        std::fs::write(temp_dir.path().join("test.rs"), "fn main() {}").unwrap();
-        std::fs::write(temp_dir.path().join("readme.md"), "# Hello").unwrap();
-        std::fs::create_dir(temp_dir.path().join("src")).unwrap();
-        std::fs::write(temp_dir.path().join("src/lib.rs"), "pub mod lib;").unwrap();
+        // Create a workspace subdirectory with a non-ignored name to avoid
+        // the walker's hardcoded ignore list (which includes "tmp", "var", etc.
+        // that are common tempdir path components).
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
 
-        let config = IndexerConfig::default();
-        let mut walker = FileWalker::new(temp_dir.path().to_path_buf(), config).unwrap();
+        // Create some files
+        std::fs::write(workspace.join("test.rs"), "fn main() {}").unwrap();
+        std::fs::write(workspace.join("readme.md"), "# Hello").unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "pub mod lib;").unwrap();
+
+        let mut config = IndexerConfig::default();
+        config.ignore_patterns = vec![];
+
+        let mut walker = FileWalker::new(workspace.clone(), config).unwrap();
 
         let entries: Vec<_> = walker.walk().collect();
-        assert!(entries.len() >= 3);
+        assert!(
+            entries.len() >= 3,
+            "Expected at least 3 entries, got {}",
+            entries.len()
+        );
     }
 
     #[test]
