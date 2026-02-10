@@ -4,6 +4,10 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload to (e.g. v2.0.1)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,13 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Parse version from tag
         id: v
         shell: bash
         run: |
-          RAW_TAG="${GITHUB_REF_NAME}"
+          RAW_TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
@@ -56,7 +62,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release upload "${{ steps.v.outputs.tag }}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
 
       - name: Publish archive as artifact
         uses: actions/upload-artifact@v4
