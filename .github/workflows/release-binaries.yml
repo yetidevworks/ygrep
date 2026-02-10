@@ -50,6 +50,11 @@ jobs:
             target_name: linux-aarch64-musl
             use_cross: true
             features: "--no-default-features"
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            target_name: windows-x86_64
+            use_cross: false
+            features: "--no-default-features"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +63,7 @@ jobs:
 
       - name: Parse version from tag
         id: v
+        shell: bash
         run: |
           RAW_TAG="${GITHUB_REF_NAME}"
           echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
@@ -85,6 +91,7 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
+        shell: bash
         run: |
           set -euo pipefail
           cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
@@ -97,6 +104,7 @@ jobs:
 
       - name: Package
         id: pkg
+        shell: bash
         run: |
           set -euo pipefail
           VER='${{ steps.v.outputs.version }}'
@@ -113,11 +121,18 @@ jobs:
               BIN="target/x86_64-unknown-linux-musl/release/ygrep"; OUT="ygrep-${VER}-linux-x86_64-musl.tar.gz";;
             aarch64-unknown-linux-musl)
               BIN="target/aarch64-unknown-linux-musl/release/ygrep"; OUT="ygrep-${VER}-linux-aarch64-musl.tar.gz";;
+            x86_64-pc-windows-msvc)
+              BIN="target/x86_64-pc-windows-msvc/release/ygrep.exe"; OUT="ygrep-${VER}-windows-x86_64.zip";;
           esac
           mkdir -p package
-          cp "$BIN" package/ygrep
-          chmod +x package/ygrep
-          tar -C package -czf "$OUT" ygrep
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "$BIN" package/ygrep.exe
+            (cd package && 7z a -tzip "../$OUT" ygrep.exe > /dev/null)
+          else
+            cp "$BIN" package/ygrep
+            chmod +x package/ygrep
+            tar -C package -czf "$OUT" ygrep
+          fi
           if command -v shasum >/dev/null; then
             SHA=$(shasum -a 256 "$OUT" | awk '{print $1}')
           else
@@ -129,6 +144,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           gh release upload "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
