@@ -26,23 +26,9 @@ pub enum WatchEvent {
     Error(String),
 }
 
-// Platform-specific debouncer type
-#[cfg(target_os = "macos")]
-type PlatformDebouncer = notify_debouncer_full::Debouncer<
-    notify_debouncer_full::notify::FsEventWatcher,
-    notify_debouncer_full::FileIdMap,
->;
-
-#[cfg(target_os = "linux")]
-type PlatformDebouncer = notify_debouncer_full::Debouncer<
-    notify_debouncer_full::notify::INotifyWatcher,
-    notify_debouncer_full::NoCache,
->;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 type PlatformDebouncer = notify_debouncer_full::Debouncer<
     notify_debouncer_full::notify::RecommendedWatcher,
-    notify_debouncer_full::NoCache,
+    notify_debouncer_full::RecommendedCache,
 >;
 
 /// File system watcher with debouncing
