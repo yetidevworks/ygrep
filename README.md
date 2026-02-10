@@ -291,6 +291,52 @@ brew upgrade ygrep
 ygrep index
 ```
 
+## Windows Build Prerequisites: C++ SDK & Build Tools
+
+Building this project on Windows requires **MSVC Build Tools** and the **Windows SDK** because several dependencies compile native C/C++ code.
+
+### Install Rust
+
+```bash
+winget install Rustlang.Rustup
+```
+
+### Install MSVC Build Tools
+
+Install **Visual Studio Build Tools 2022** (or latest) with the following workloads:
+- **"Desktop development with C++"** — includes MSVC compiler and Windows SDK
+- Alternatively, install the individual components: **MSVC v143+ C++ build tools** and **Windows 10/11 SDK**
+
+Download: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+
+### Dependencies that require C/C++ compilation
+
+| Crate | Why | Used by |
+|-------|-----|---------|
+| `ort-sys` | ONNX Runtime C++ bindings | `ort` → `fastembed` (ML inference) |
+| `onig_sys` | Oniguruma regex engine (C library) | `onig` |
+| `zstd-sys` | Zstandard compression (C library) | `zstd` |
+| `ring` | Cryptography (C/assembly) | `rustls` (TLS) |
+
+The `cc` crate handles compiling C/C++ code from Rust build scripts, and `find-msvc-tools` (used by `ort-sys`) locates the MSVC installation on your system.
+
+**`fastembed` → `ort` → `ort-sys`** is the primary reason MSVC Build Tools are needed, since ONNX Runtime is a substantial C++ dependency.
+
+### Build
+
+```bash
+cargo build --release
+```
+
+The compiled binary will be at `target\release\ygrep.exe`. To make it available system-wide, either:
+
+- **Copy to a directory already on your PATH:**
+  ```bash
+  copy target\release\ygrep.exe %USERPROFILE%\.cargo\bin\
+  ```
+- **Or add the build output directory to your PATH:**
+  Go to **Settings > System > About > Advanced system settings > Environment Variables**, then add the `target\release` path to your user `Path` variable.
+
 ## License
 
 MIT
