@@ -36,7 +36,7 @@ type PlatformDebouncer = notify_debouncer_full::Debouncer<
 #[cfg(target_os = "linux")]
 type PlatformDebouncer = notify_debouncer_full::Debouncer<
     notify_debouncer_full::notify::INotifyWatcher,
-    notify_debouncer_full::FileIdMap,
+    notify_debouncer_full::NoCache,
 >;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
