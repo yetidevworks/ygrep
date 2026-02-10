@@ -291,6 +291,12 @@ impl Default for OutputConfig {
 }
 
 fn default_data_dir() -> PathBuf {
+    // Honor XDG_DATA_HOME if set (even on macOS)
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        if !xdg_data.is_empty() {
+            return PathBuf::from(xdg_data).join("ygrep");
+        }
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
         .join("ygrep")
@@ -310,7 +316,19 @@ impl Config {
             }
         }
 
-        // Try user-level config
+        // Try XDG_CONFIG_HOME first (even on macOS)
+        if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg_config.is_empty() {
+                let config_path = PathBuf::from(&xdg_config).join("ygrep").join("config.toml");
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    if let Ok(config) = toml::from_str(&content) {
+                        return config;
+                    }
+                }
+            }
+        }
+
+        // Try platform default config dir
         if let Some(config_dir) = dirs::config_dir() {
             let config_path = config_dir.join("ygrep").join("config.toml");
             if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -341,6 +359,12 @@ impl Config {
 }
 
 fn default_socket_path() -> PathBuf {
+    // Honor XDG_RUNTIME_DIR if set (even on macOS)
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg_runtime.is_empty() {
+            return PathBuf::from(xdg_runtime).join("ygrep").join("ygrep.sock");
+        }
+    }
     if let Some(runtime_dir) = dirs::runtime_dir() {
         runtime_dir.join("ygrep").join("ygrep.sock")
     } else if let Some(home) = dirs::home_dir() {

@@ -29,6 +29,11 @@ jobs:
             target_name: linux-x86_64
             use_cross: false
             features: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            target_name: macos-x86_64
+            use_cross: false
+            features: "--no-default-features"
           # Platforms without ONNX binaries (text search only)
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
@@ -111,6 +116,8 @@ jobs:
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
               BIN="target/aarch64-apple-darwin/release/ygrep"; OUT="ygrep-${VER}-darwin-arm64.tar.gz";;
+            x86_64-apple-darwin)
+              BIN="target/x86_64-apple-darwin/release/ygrep"; OUT="ygrep-${VER}-darwin-x86_64.tar.gz";;
             x86_64-unknown-linux-gnu)
               BIN="target/x86_64-unknown-linux-gnu/release/ygrep"; OUT="ygrep-${VER}-linux-x86_64.tar.gz";;
             aarch64-unknown-linux-gnu)
@@ -180,6 +187,9 @@ jobs:
           f=$(find /tmp/artifacts -name '*darwin-arm64.tar.gz' -print -quit)
           [[ -f "$f" ]] && echo "darwin_arm64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
+          f=$(find /tmp/artifacts -name '*darwin-x86_64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "darwin_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
           f=$(find /tmp/artifacts -name '*linux-x86_64.tar.gz' -print -quit)
           [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
@@ -223,11 +233,12 @@ jobs:
           set -euo pipefail
           VER='${{ steps.cargo.outputs.version }}'
           TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
-          DARWIN_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
+          DARWIN_ARM64_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
+          DARWIN_X86_64_SHA='${{ steps.shas.outputs.darwin_x86_64_sha }}'
           LINUX_X86_64_SHA='${{ steps.shas.outputs.linux_x86_64_sha }}'
           LINUX_AARCH64_SHA='${{ steps.shas.outputs.linux_aarch64_sha }}'
 
-          if [[ -z "${DARWIN_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
+          if [[ -z "${DARWIN_ARM64_SHA}" || -z "${DARWIN_X86_64_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
             echo "Missing required SHAs for Homebrew formula." >&2
             exit 1
           fi
@@ -253,8 +264,12 @@ jobs:
 
             on_macos do
               on_arm do
-                url "REPLACE_DARWIN_URL"
-                sha256 "REPLACE_DARWIN_SHA"
+                url "REPLACE_DARWIN_ARM64_URL"
+                sha256 "REPLACE_DARWIN_ARM64_SHA"
+              end
+              on_intel do
+                url "REPLACE_DARWIN_X86_64_URL"
+                sha256 "REPLACE_DARWIN_X86_64_SHA"
               end
             end
 
@@ -281,8 +296,10 @@ jobs:
 
           # Replace placeholders with actual values
           sed -i "s|REPLACE_VERSION|${VER}|g" "${FORMULA_PATH}"
-          sed -i "s|REPLACE_DARWIN_URL|${TAP_URL}/ygrep-${VER}-darwin-arm64.tar.gz|g" "${FORMULA_PATH}"
-          sed -i "s|REPLACE_DARWIN_SHA|${DARWIN_SHA}|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_DARWIN_ARM64_URL|${TAP_URL}/ygrep-${VER}-darwin-arm64.tar.gz|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_DARWIN_ARM64_SHA|${DARWIN_ARM64_SHA}|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_DARWIN_X86_64_URL|${TAP_URL}/ygrep-${VER}-darwin-x86_64.tar.gz|g" "${FORMULA_PATH}"
+          sed -i "s|REPLACE_DARWIN_X86_64_SHA|${DARWIN_X86_64_SHA}|g" "${FORMULA_PATH}"
           sed -i "s|REPLACE_LINUX_X86_64_URL|${TAP_URL}/ygrep-${VER}-linux-x86_64.tar.gz|g" "${FORMULA_PATH}"
           sed -i "s|REPLACE_LINUX_X86_64_SHA|${LINUX_X86_64_SHA}|g" "${FORMULA_PATH}"
           sed -i "s|REPLACE_LINUX_AARCH64_URL|${TAP_URL}/ygrep-${VER}-linux-aarch64.tar.gz|g" "${FORMULA_PATH}"

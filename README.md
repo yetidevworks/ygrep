@@ -26,8 +26,11 @@ brew install yetidevworks/ygrep/ygrep
 ### From Source
 
 ```bash
-# Using cargo
+# Using cargo (full features, requires ONNX Runtime)
 cargo install --path crates/ygrep-cli
+
+# Text search only (no ONNX dependency, faster build)
+cargo install --path crates/ygrep-cli --no-default-features
 
 # Or build release
 cargo build --release
@@ -167,6 +170,8 @@ Semantic search uses the `all-MiniLM-L6-v2` model (~25MB, downloaded on first us
 **Note:** Semantic search requires ONNX Runtime and is only available on certain platforms:
 - ✅ macOS ARM64 (Apple Silicon)
 - ✅ Linux x86_64
+- ❌ macOS x86_64 (Intel) (text search only)
+- ❌ Windows x86_64 (text search only)
 - ❌ Linux ARM64/ARMv7/musl (text search only)
 
 On unsupported platforms, ygrep works normally with BM25 text search - the `--semantic` flag will print a warning.
