@@ -108,16 +108,46 @@ impl Workspace {
         // Open or create Tantivy index
         let schema = index::build_document_schema();
         let index = if tantivy_exists {
-            match Index::open_in_dir(&index_path) {
-                Ok(idx) => idx,
-                Err(e) if create => {
-                    eprintln!("Warning: corrupt index, recreating: {}", e);
-                    // Remove corrupted index and create fresh
-                    std::fs::remove_dir_all(&index_path)?;
-                    std::fs::create_dir_all(&index_path)?;
-                    Index::create_in_dir(&index_path, schema)?
+            // Retry with backoff to handle transient lockfile contention (issue #7)
+            // This can happen when `ygrep watch` is running concurrently
+            let mut last_err = None;
+            let mut opened = None;
+            for attempt in 0..4 {
+                match Index::open_in_dir(&index_path) {
+                    Ok(idx) => {
+                        opened = Some(idx);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("Lockfile") && attempt < 3 {
+                            let wait_ms = 100 * (1 << attempt); // 100, 200, 400ms
+                            tracing::debug!(
+                                "Index locked (attempt {}/3), retrying in {}ms...",
+                                attempt + 1,
+                                wait_ms
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                            last_err = Some(e);
+                        } else if create {
+                            eprintln!("Warning: corrupt index, recreating: {}", e);
+                            std::fs::remove_dir_all(&index_path)?;
+                            std::fs::create_dir_all(&index_path)?;
+                            opened = Some(Index::create_in_dir(&index_path, schema.clone())?);
+                            break;
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
                 }
-                Err(e) => return Err(e.into()),
+            }
+            match opened {
+                Some(idx) => idx,
+                None => {
+                    return Err(last_err
+                        .map(|e| e.into())
+                        .unwrap_or_else(|| YgrepError::Config("Failed to open index".into())))
+                }
             }
         } else {
             // Create directory only when explicitly creating the index
@@ -807,7 +837,17 @@ impl Workspace {
         // Create indexer and index the file
         let indexer =
             index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+        self.index_file_with_indexer(&indexer, path, with_embeddings)
+    }
 
+    /// Index or re-index a single file using an existing Indexer (avoids lock churn)
+    #[allow(unused_variables)]
+    pub fn index_file_with_indexer(
+        &self,
+        indexer: &index::Indexer,
+        path: &Path,
+        with_embeddings: bool,
+    ) -> Result<()> {
         match indexer.index_file(path) {
             Ok((doc_id, content)) => {
                 indexer.commit()?;
@@ -818,7 +858,7 @@ impl Workspace {
                 if with_embeddings {
                     // Only embed files within size bounds
                     let len = content.len();
-                    if len >= 50 && len <= 50_000 {
+                    if (50..=50_000).contains(&len) {
                         // Truncate for embedding
                         const EMBED_TRUNCATE: usize = 4096;
                         let text = if content.len() > EMBED_TRUNCATE {
@@ -868,6 +908,25 @@ impl Workspace {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Create a persistent Indexer for this workspace (holds a single writer lock)
+    pub fn create_indexer(&self) -> Result<index::Indexer> {
+        index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
+    }
+
+    /// Delete a file from the index using an existing Indexer (avoids lock churn)
+    pub fn delete_file_with_indexer(&self, indexer: &index::Indexer, path: &Path) -> Result<()> {
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy();
+
+        indexer.delete_by_path(&relative_path)?;
+        indexer.commit()?;
+
+        tracing::debug!("Deleted from index: {}", path.display());
+        Ok(())
     }
 }
 

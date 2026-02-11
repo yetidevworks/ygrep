@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.0.0] - 2026-02-11
 
+### Fixed
+- `ygrep watch` no longer blocks concurrent `ygrep search` with lockfile errors (#7) - watch now holds a single persistent writer instead of creating/dropping one per file change, and search retries with backoff on transient lock contention
+
 ### Changed
 - OpenCode installer now writes `SKILL.md` to `~/.config/opencode/skills/ygrep/` (replaces `.ts` tool file + `opencode.json` manipulation)
 - Codex installer now writes `SKILL.md` to `~/.agents/skills/ygrep/` (replaces `~/.codex/AGENTS.md` append)

@@ -25,6 +25,13 @@ pub fn run(workspace_path: &Path) -> Result<()> {
     eprintln!("Starting file watcher (mode: {})...", mode);
     eprintln!("Press Ctrl+C to stop.\n");
 
+    // Create a persistent indexer to hold a single writer lock for the entire watch session.
+    // This avoids creating/dropping IndexWriter per file change, which causes lockfile
+    // contention that blocks concurrent `ygrep search` (see issue #7).
+    let indexer = workspace
+        .create_indexer()
+        .context("Failed to create indexer")?;
+
     let mut watcher = workspace
         .create_watcher()
         .context("Failed to create file watcher")?;
@@ -44,7 +51,7 @@ pub fn run(workspace_path: &Path) -> Result<()> {
                 Some(WatchEvent::Changed(path)) => {
                     // Check if it's a text file we should index
                     if is_indexable(&path) {
-                        match workspace.index_file_with_options(&path, use_semantic) {
+                        match workspace.index_file_with_indexer(&indexer, &path, use_semantic) {
                             Ok(()) => {
                                 changed_count += 1;
                                 eprintln!("  [+] {}", path.display());
@@ -57,7 +64,7 @@ pub fn run(workspace_path: &Path) -> Result<()> {
                     }
                 }
                 Some(WatchEvent::Deleted(path)) => {
-                    match workspace.delete_file(&path) {
+                    match workspace.delete_file_with_indexer(&indexer, &path) {
                         Ok(()) => {
                             deleted_count += 1;
                             eprintln!("  [-] {}", path.display());
