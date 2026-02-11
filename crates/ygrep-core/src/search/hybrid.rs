@@ -97,7 +97,7 @@ impl HybridSearcher {
 
     /// BM25 full-text search
     fn bm25_search(&self, query: &str, limit: usize) -> Result<Vec<RankedResult>> {
-        let reader = self.index.reader()?;
+        let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
         let query_parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
@@ -151,7 +151,7 @@ impl HybridSearcher {
         let neighbors = self.vector_index.search(&query_embedding, limit)?;
 
         // Look up full document info from tantivy
-        let reader = self.index.reader()?;
+        let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
         let mut results = Vec::with_capacity(neighbors.len());

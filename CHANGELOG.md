@@ -5,10 +5,12 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] - 2026-02-11
+## [3.0.1] - 2026-02-11
 
 ### Fixed
-- `ygrep watch` no longer blocks concurrent `ygrep search` with lockfile errors (#7) - watch now holds a single persistent writer instead of creating/dropping one per file change, and search retries with backoff on transient lock contention
+- `ygrep watch` no longer blocks concurrent `ygrep search` with lockfile errors on macOS (#7) - stale `.tantivy-meta.lock` files are cleaned up before opening an index for reading, and `index.reader()` retries with exponential backoff on transient META_LOCK contention
+
+## [3.0.0] - 2026-02-11
 
 ### Changed
 - OpenCode installer now writes `SKILL.md` to `~/.config/opencode/skills/ygrep/` (replaces `.ts` tool file + `opencode.json` manipulation)
@@ -182,6 +184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.0.1]: https://github.com/yetidevworks/ygrep/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/yetidevworks/ygrep/compare/v2.0.5...v3.0.0
 [2.0.5]: https://github.com/yetidevworks/ygrep/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/yetidevworks/ygrep/compare/v2.0.3...v2.0.4

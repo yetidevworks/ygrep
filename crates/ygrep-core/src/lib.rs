@@ -107,47 +107,27 @@ impl Workspace {
 
         // Open or create Tantivy index
         let schema = index::build_document_schema();
+
+        // Clean up stale lockfiles that may block readers on macOS (issue #7).
+        // Tantivy's reader acquires META_LOCK via flock(); on macOS Intel this can
+        // fail with EPERM if a stale lockfile inode still has an unreleased flock.
+        // Removing the file forces the next acquire_lock() to create a fresh inode.
+        if !create {
+            let _ = std::fs::remove_file(index_path.join(".tantivy-meta.lock"));
+            let _ = std::fs::remove_file(index_path.join(".tantivy-writer.lock"));
+        }
+
         let index = if tantivy_exists {
-            // Retry with backoff to handle transient lockfile contention (issue #7)
-            // This can happen when `ygrep watch` is running concurrently
-            let mut last_err = None;
-            let mut opened = None;
-            for attempt in 0..4 {
-                match Index::open_in_dir(&index_path) {
-                    Ok(idx) => {
-                        opened = Some(idx);
-                        break;
-                    }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("Lockfile") && attempt < 3 {
-                            let wait_ms = 100 * (1 << attempt); // 100, 200, 400ms
-                            tracing::debug!(
-                                "Index locked (attempt {}/3), retrying in {}ms...",
-                                attempt + 1,
-                                wait_ms
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-                            last_err = Some(e);
-                        } else if create {
-                            eprintln!("Warning: corrupt index, recreating: {}", e);
-                            std::fs::remove_dir_all(&index_path)?;
-                            std::fs::create_dir_all(&index_path)?;
-                            opened = Some(Index::create_in_dir(&index_path, schema.clone())?);
-                            break;
-                        } else {
-                            return Err(e.into());
-                        }
-                    }
+            match Index::open_in_dir(&index_path) {
+                Ok(idx) => idx,
+                Err(e) if create => {
+                    eprintln!("Warning: corrupt index, recreating: {}", e);
+                    // Remove corrupted index and create fresh
+                    std::fs::remove_dir_all(&index_path)?;
+                    std::fs::create_dir_all(&index_path)?;
+                    Index::create_in_dir(&index_path, schema)?
                 }
-            }
-            match opened {
-                Some(idx) => idx,
-                None => {
-                    return Err(last_err
-                        .map(|e| e.into())
-                        .unwrap_or_else(|| YgrepError::Config("Failed to open index".into())))
-                }
+                Err(e) => return Err(e.into()),
             }
         } else {
             // Create directory only when explicitly creating the index

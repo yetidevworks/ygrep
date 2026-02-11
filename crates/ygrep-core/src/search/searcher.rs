@@ -42,8 +42,8 @@ impl Searcher {
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
 
-        // Get a reader
-        let reader = self.index.reader()?;
+        // Get a reader (with retry for META_LOCK contention, issue #7)
+        let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
         // Build query parser for content field
@@ -256,8 +256,8 @@ impl Searcher {
             }
         };
 
-        // Get a reader
-        let reader = self.index.reader()?;
+        // Get a reader (with retry for META_LOCK contention, issue #7)
+        let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
         // Build query parser for content field
