@@ -29,7 +29,14 @@ impl Searcher {
     }
 
     /// Search the index with a query string (literal text matching like grep)
-    pub fn search(&self, query: &str, limit: Option<usize>) -> Result<SearchResult> {
+    pub fn search(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+    ) -> Result<SearchResult> {
         let start = Instant::now();
         let limit = limit
             .unwrap_or(self.config.default_limit)
@@ -73,8 +80,14 @@ impl Searcher {
         let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
         let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
 
-        // Case-insensitive literal matching (like grep -i)
-        let query_lower = query.to_lowercase();
+        // Prepare query for matching
+        let query_normalized = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+        let query_terms: Vec<&str> = query_normalized.split_whitespace().collect();
+        let is_multi_word = query_terms.len() > 1;
 
         for (score, doc_address) in top_docs {
             // Stop if we have enough results
@@ -91,8 +104,19 @@ impl Searcher {
             let line_start = extract_u64(&doc, self.fields.line_start).unwrap_or(1);
             let chunk_id = extract_text(&doc, self.fields.chunk_id).unwrap_or_default();
 
-            // LITERAL GREP-LIKE FILTER: Only include if content contains exact query string
-            if !content.to_lowercase().contains(&query_lower) {
+            let content_normalized = if case_sensitive {
+                content.clone()
+            } else {
+                content.to_lowercase()
+            };
+
+            // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
+            let exact_match = content_normalized.contains(&query_normalized);
+            let and_match = is_multi_word
+                && query_terms
+                    .iter()
+                    .all(|term| content_normalized.contains(term));
+            if !exact_match && !and_match {
                 continue;
             }
 
@@ -104,12 +128,13 @@ impl Searcher {
             };
 
             // Create snippet showing lines that match the query
-            let (snippet, match_line_offset, snippet_line_count) =
-                create_relevant_snippet(&content, query, 10);
+            let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
+                create_relevant_snippet(&content, query, 10, context_before, context_after);
 
-            // Adjust line numbers to reflect where the match actually is
-            let actual_line_start = line_start + match_line_offset as u64;
+            // Adjust line numbers to reflect where the snippet is in the file
+            let actual_line_start = line_start + snippet_offset as u64;
             let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+            let match_line_in_snippet = match_line_offset - snippet_offset;
 
             // Deduplicate: skip if we already have a hit for the same file and line range
             let key = (path.clone(), actual_line_start, actual_line_end);
@@ -126,6 +151,7 @@ impl Searcher {
                 is_chunk: !chunk_id.is_empty(),
                 doc_id,
                 match_type: MatchType::Text,
+                match_line_in_snippet,
             });
         }
 
@@ -148,12 +174,27 @@ impl Searcher {
         limit: Option<usize>,
         filters: SearchFilters,
         use_regex: bool,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
     ) -> Result<SearchResult> {
         // Use regex search if requested
         let mut result = if use_regex {
-            self.search_regex(query, Some(limit.unwrap_or(self.config.max_limit) * 2))?
+            self.search_regex(
+                query,
+                Some(limit.unwrap_or(self.config.max_limit) * 2),
+                case_sensitive,
+                context_before,
+                context_after,
+            )?
         } else {
-            self.search(query, Some(limit.unwrap_or(self.config.max_limit) * 2))?
+            self.search(
+                query,
+                Some(limit.unwrap_or(self.config.max_limit) * 2),
+                case_sensitive,
+                context_before,
+                context_after,
+            )?
         };
 
         // Apply filters
@@ -188,14 +229,24 @@ impl Searcher {
     }
 
     /// Search the index with a regex pattern
-    pub fn search_regex(&self, pattern: &str, limit: Option<usize>) -> Result<SearchResult> {
+    pub fn search_regex(
+        &self,
+        pattern: &str,
+        limit: Option<usize>,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+    ) -> Result<SearchResult> {
         let start = Instant::now();
         let limit = limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
 
-        // Compile regex (case-insensitive by default, like grep -i)
-        let regex = match RegexBuilder::new(pattern).case_insensitive(true).build() {
+        // Compile regex (case-insensitive by default unless --case-sensitive)
+        let regex = match RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+        {
             Ok(r) => r,
             Err(e) => {
                 return Err(crate::error::YgrepError::Search(format!(
@@ -268,12 +319,13 @@ impl Searcher {
             };
 
             // Create snippet showing lines that match the regex
-            let (snippet, match_line_offset, snippet_line_count) =
-                create_regex_snippet(&content, &regex, 10);
+            let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
+                create_regex_snippet(&content, &regex, 10, context_before, context_after);
 
-            // Adjust line numbers to reflect where the match actually is
-            let actual_line_start = line_start + match_line_offset as u64;
+            // Adjust line numbers to reflect where the snippet is in the file
+            let actual_line_start = line_start + snippet_offset as u64;
             let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+            let match_line_in_snippet = match_line_offset - snippet_offset;
 
             // Deduplicate: skip if we already have a hit for the same file and line range
             let key = (path.clone(), actual_line_start, actual_line_end);
@@ -290,6 +342,7 @@ impl Searcher {
                 is_chunk: !chunk_id.is_empty(),
                 doc_id,
                 match_type: MatchType::Text,
+                match_line_in_snippet,
             });
         }
 
@@ -338,8 +391,16 @@ fn extract_u64(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) ->
 }
 
 /// Create a snippet showing lines relevant to the query
-/// Returns (snippet, line_offset_from_start, line_count)
-fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (String, usize, usize) {
+/// Returns (snippet, snippet_offset, line_count, match_line_offset)
+/// - snippet_offset: 0-based line index where snippet starts in the chunk
+/// - match_line_offset: 0-based line index of the actual match in the chunk
+fn create_relevant_snippet(
+    content: &str,
+    query: &str,
+    max_lines: usize,
+    ctx_before: Option<usize>,
+    ctx_after: Option<usize>,
+) -> (String, usize, usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
     let query_lower = query.to_lowercase();
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -362,29 +423,50 @@ fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (Str
             .collect::<Vec<_>>()
             .join("\n");
         let line_count = snippet.lines().count();
-        return (snippet, 0, line_count);
+        return (snippet, 0, line_count, 0);
     }
 
-    // Get context around the first match
-    let first_match = matching_indices[0];
-    let context_before = 2;
-    let context_after = max_lines.saturating_sub(context_before + 1);
+    // For multi-word queries, prefer lines with more matching terms
+    let best_match = if query_terms.len() > 1 {
+        let mut best_line = matching_indices[0];
+        let mut best_count = 0;
+        for &idx in &matching_indices {
+            let line_lower = lines[idx].to_lowercase();
+            let count = query_terms
+                .iter()
+                .filter(|t| line_lower.contains(*t))
+                .count();
+            if count > best_count {
+                best_count = count;
+                best_line = idx;
+            }
+        }
+        best_line
+    } else {
+        matching_indices[0]
+    };
 
-    let start = first_match.saturating_sub(context_before);
-    let end = (first_match + context_after + 1).min(lines.len());
+    // Get context around the best match
+    let context_before = ctx_before.unwrap_or(2);
+    let context_after = ctx_after.unwrap_or_else(|| max_lines.saturating_sub(context_before + 1));
+
+    let start = best_match.saturating_sub(context_before);
+    let end = (best_match + context_after + 1).min(lines.len());
 
     let snippet = lines[start..end].join("\n");
     let line_count = end - start;
-    (snippet, start, line_count)
+    (snippet, start, line_count, best_match)
 }
 
 /// Create a snippet showing lines relevant to a regex match
-/// Returns (snippet, line_offset_from_start, line_count)
+/// Returns (snippet, snippet_offset, line_count, match_line_offset)
 fn create_regex_snippet(
     content: &str,
     regex: &regex::Regex,
     max_lines: usize,
-) -> (String, usize, usize) {
+    ctx_before: Option<usize>,
+    ctx_after: Option<usize>,
+) -> (String, usize, usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
 
     // Find lines that match the regex
@@ -404,20 +486,20 @@ fn create_regex_snippet(
             .collect::<Vec<_>>()
             .join("\n");
         let line_count = snippet.lines().count();
-        return (snippet, 0, line_count);
+        return (snippet, 0, line_count, 0);
     }
 
     // Get context around the first match
     let first_match = matching_indices[0];
-    let context_before = 2;
-    let context_after = max_lines.saturating_sub(context_before + 1);
+    let context_before = ctx_before.unwrap_or(2);
+    let context_after = ctx_after.unwrap_or_else(|| max_lines.saturating_sub(context_before + 1));
 
     let start = first_match.saturating_sub(context_before);
     let end = (first_match + context_after + 1).min(lines.len());
 
     let snippet = lines[start..end].join("\n");
     let line_count = end - start;
-    (snippet, start, line_count)
+    (snippet, start, line_count, first_match)
 }
 
 #[cfg(test)]
@@ -479,7 +561,7 @@ mod tests {
 
         let config = SearchConfig::default();
         let searcher = Searcher::new(config, index);
-        let result = searcher.search("hello", None)?;
+        let result = searcher.search("hello", None, false, None, None)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
@@ -504,7 +586,7 @@ mod tests {
         let searcher = Searcher::new(config, index);
 
         // Uppercase query should find mixed-case content
-        let result = searcher.search("HELLO", None)?;
+        let result = searcher.search("HELLO", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/lib.rs");
 
@@ -528,7 +610,7 @@ mod tests {
         let searcher = Searcher::new(config, index);
 
         // Queries with no searchable terms should return empty
-        let result = searcher.search("...", None)?;
+        let result = searcher.search("...", None, false, None, None)?;
         assert!(result.is_empty());
 
         Ok(())
@@ -550,7 +632,7 @@ mod tests {
         let config = SearchConfig::default();
         let searcher = Searcher::new(config, index);
 
-        let result = searcher.search_regex("hello.*world", None)?;
+        let result = searcher.search_regex("hello.*world", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
 
         Ok(())
@@ -564,7 +646,7 @@ mod tests {
         let config = SearchConfig::default();
         let searcher = Searcher::new(config, index);
 
-        let result = searcher.search_regex("[invalid", None);
+        let result = searcher.search_regex("[invalid", None, false, None, None);
         assert!(result.is_err());
     }
 
@@ -596,7 +678,7 @@ mod tests {
             extensions: Some(vec!["rs".to_string()]),
             paths: None,
         };
-        let result = searcher.search_filtered("hello", None, filters, false)?;
+        let result = searcher.search_filtered("hello", None, filters, false, false, None, None)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
@@ -632,7 +714,7 @@ mod tests {
             extensions: None,
             paths: Some(vec!["lib/".to_string()]),
         };
-        let result = searcher.search_filtered("hello", None, filters, false)?;
+        let result = searcher.search_filtered("hello", None, filters, false, false, None, None)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "lib/utils.rs");
@@ -665,7 +747,7 @@ mod tests {
 
         let config = SearchConfig::default();
         let searcher = Searcher::new(config, index);
-        let result = searcher.search("hello", None)?;
+        let result = searcher.search("hello", None, false, None, None)?;
 
         assert!(result.hits.len() >= 2);
         // Results should be ordered by score descending
@@ -722,12 +804,12 @@ mod tests {
         let searcher = Searcher::new(config, index);
 
         // Text search should return only 1 hit (deduplicated)
-        let result = searcher.search("hello", None)?;
+        let result = searcher.search("hello", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
 
         // Regex search should also return only 1 hit
-        let result = searcher.search_regex("hello", None)?;
+        let result = searcher.search_regex("hello", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
 

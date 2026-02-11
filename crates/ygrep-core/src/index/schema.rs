@@ -1,10 +1,11 @@
+use std::collections::VecDeque;
 use tantivy::schema::{
     IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, STORED, STRING,
 };
 use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerManager};
 
 /// Schema version - increment when schema changes require reindexing
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Name of our custom code tokenizer
 pub const CODE_TOKENIZER: &str = "code";
@@ -33,6 +34,8 @@ impl tantivy::tokenizer::Tokenizer for CodeTokenizer {
             text,
             chars: text.char_indices().peekable(),
             token: tantivy::tokenizer::Token::default(),
+            subtoken_buffer: VecDeque::new(),
+            subtoken_position: 0,
         }
     }
 }
@@ -41,10 +44,62 @@ struct CodeTokenStream<'a> {
     text: &'a str,
     chars: std::iter::Peekable<std::str::CharIndices<'a>>,
     token: tantivy::tokenizer::Token,
+    /// Buffered subtokens to emit at the same position as the parent token
+    subtoken_buffer: VecDeque<String>,
+    /// The position value to use for buffered subtokens
+    subtoken_position: usize,
+}
+
+/// Split a token into subtokens at camelCase and snake_case boundaries.
+/// Returns subtokens only if there are 2+ parts; returns empty vec for simple tokens.
+fn split_subtokens(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    // First handle snake_case: split on underscores
+    let segments: Vec<&str> = text.split('_').filter(|s| !s.is_empty()).collect();
+
+    // If there were underscores and multiple segments, process each for camelCase too
+    for segment in &segments {
+        // Split on camelCase boundaries within each segment
+        let chars: Vec<char> = segment.chars().collect();
+        let mut part_start = 0;
+
+        for i in 1..chars.len() {
+            // camelCase boundary: lowercase followed by uppercase
+            if chars[i - 1].is_lowercase() && chars[i].is_uppercase() {
+                let part: String = chars[part_start..i].iter().collect();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                part_start = i;
+            }
+        }
+        // Push the remaining part
+        let part: String = chars[part_start..].iter().collect();
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    }
+
+    // Only return subtokens if we actually split the token
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+
+    parts
 }
 
 impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
     fn advance(&mut self) -> bool {
+        // First, check if we have buffered subtokens to emit
+        if let Some(subtoken) = self.subtoken_buffer.pop_front() {
+            self.token.text.clear();
+            self.token.text.push_str(&subtoken);
+            // Keep the same position as the parent token
+            self.token.position = self.subtoken_position;
+            return true;
+        }
+
         self.token.text.clear();
         self.token.position = self.token.position.wrapping_add(1);
 
@@ -71,7 +126,6 @@ impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
                 break;
             } else {
                 // Other punctuation - emit as separate token or skip
-                // For now, skip punctuation that's not part of identifiers
                 self.chars.next();
                 if start == pos {
                     // Started with punctuation, skip and try again
@@ -84,7 +138,18 @@ impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
         if end > start {
             self.token.offset_from = start;
             self.token.offset_to = end;
-            self.token.text.push_str(&self.text[start..end]);
+            let token_text = &self.text[start..end];
+            self.token.text.push_str(token_text);
+
+            // Check for camelCase/snake_case subtokens
+            let subtokens = split_subtokens(token_text);
+            if !subtokens.is_empty() {
+                self.subtoken_position = self.token.position;
+                for sub in subtokens {
+                    self.subtoken_buffer.push_back(sub);
+                }
+            }
+
             true
         } else {
             false
@@ -253,9 +318,49 @@ mod tests {
     #[test]
     fn test_tokenizer_lowercases() {
         let tokens = tokenize("FnMain HelloWorld UPPER");
+        // Full tokens are lowercased
         assert!(tokens.contains(&"fnmain".to_string()));
         assert!(tokens.contains(&"helloworld".to_string()));
         assert!(tokens.contains(&"upper".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_camelcase_subtokens() {
+        let tokens = tokenize("sendCampaign");
+        // Full token
+        assert!(tokens.contains(&"sendcampaign".to_string()));
+        // Subtokens from camelCase split
+        assert!(tokens.contains(&"send".to_string()));
+        assert!(tokens.contains(&"campaign".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_snake_case_subtokens() {
+        let tokens = tokenize("send_campaign");
+        // Full token
+        assert!(tokens.contains(&"send_campaign".to_string()));
+        // Subtokens from snake_case split
+        assert!(tokens.contains(&"send".to_string()));
+        assert!(tokens.contains(&"campaign".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_mixed_case_subtokens() {
+        // camelCase within snake_case segments
+        let tokens = tokenize("myQueue_sendCampaign");
+        assert!(tokens.contains(&"myqueue_sendcampaign".to_string()));
+        // snake_case split
+        assert!(tokens.contains(&"my".to_string()));
+        assert!(tokens.contains(&"queue".to_string()));
+        assert!(tokens.contains(&"send".to_string()));
+        assert!(tokens.contains(&"campaign".to_string()));
+    }
+
+    #[test]
+    fn test_tokenizer_no_subtokens_for_simple() {
+        // Single word should not produce subtokens
+        let tokens = tokenize("hello");
+        assert_eq!(tokens, vec!["hello".to_string()]);
     }
 
     #[test]

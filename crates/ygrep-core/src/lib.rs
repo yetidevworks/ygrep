@@ -649,7 +649,7 @@ impl Workspace {
     /// Search the workspace
     pub fn search(&self, query: &str, limit: Option<usize>) -> Result<search::SearchResult> {
         let searcher = search::Searcher::new(self.config.search.clone(), self.index.clone());
-        searcher.search(query, limit)
+        searcher.search(query, limit, false, None, None)
     }
 
     /// Search with filters
@@ -660,10 +660,21 @@ impl Workspace {
         extensions: Option<Vec<String>>,
         paths: Option<Vec<String>>,
         use_regex: bool,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
     ) -> Result<search::SearchResult> {
         let searcher = search::Searcher::new(self.config.search.clone(), self.index.clone());
         let filters = search::SearchFilters { extensions, paths };
-        searcher.search_filtered(query, limit, filters, use_regex)
+        searcher.search_filtered(
+            query,
+            limit,
+            filters,
+            use_regex,
+            case_sensitive,
+            context_before,
+            context_after,
+        )
     }
 
     /// Hybrid search combining BM25 and vector search

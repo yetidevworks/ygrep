@@ -12,7 +12,13 @@ mod output;
     long_about = "ygrep - Fast indexed code search with optional semantic search\n\n\
 Uses literal text matching by default. Special characters work:\n\
   $variable, ->get(, {% block, @decorator\n\n\
-Use -r/--regex for regex patterns: ygrep \"fn\\\\s+main\" -r\n\n\
+Subtoken matching: camelCase and snake_case identifiers are split into\n\
+subtokens, so searching \"send\" also finds sendCampaign, send_email, etc.\n\n\
+Multi-word queries: \"campaign sending\" returns results where ALL terms\n\
+appear in the file (AND logic), not just exact adjacent phrases.\n\n\
+Use -r/--regex for regex patterns: ygrep \"fn\\\\s+main\" -r\n\
+Use -s/--case-sensitive for exact case matching (default: case-insensitive)\n\
+Use -A/-B/-K to control context lines around matches\n\n\
 Output formats:\n\
   (default)  AI-optimized: path:line (score%) with match indicators\n\
   --json     Full JSON with metadata\n\
@@ -30,6 +36,10 @@ Match indicators in default output:\n\
     ygrep \"fn main\" -n 10           Limit to 10 results\n\
     ygrep \"->get(\" -e php           Search PHP files only\n\
     ygrep \"fn\\\\s+main\" -r            Regex search\n\
+    ygrep \"Config\" -s               Case-sensitive search\n\
+    ygrep \"error\" -A 3              Show 3 lines after each match\n\
+    ygrep \"error\" -B 2              Show 2 lines before each match\n\
+    ygrep \"error\" -K 3              Show 3 lines before and after\n\
     ygrep search \"api\" --json       JSON output\n\
     ygrep install claude-code       Install for Claude Code\n\n\
 For more info: https://github.com/yetidevworks/ygrep")]
@@ -75,6 +85,22 @@ pub struct Cli {
     /// Text-only search (disable semantic search)
     #[arg(long)]
     pub text_only: bool,
+
+    /// Case-sensitive search (default is case-insensitive)
+    #[arg(short = 's', long)]
+    pub case_sensitive: bool,
+
+    /// Lines of context after each match
+    #[arg(short = 'A', long)]
+    pub after_context: Option<usize>,
+
+    /// Lines of context before each match
+    #[arg(short = 'B', long)]
+    pub before_context: Option<usize>,
+
+    /// Lines of context before and after each match
+    #[arg(short = 'K', long)]
+    pub context: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +133,22 @@ pub enum Commands {
         /// Text-only search (disable semantic search)
         #[arg(long)]
         text_only: bool,
+
+        /// Case-sensitive search (default is case-insensitive)
+        #[arg(short = 's', long)]
+        case_sensitive: bool,
+
+        /// Lines of context after each match
+        #[arg(short = 'A', long)]
+        after_context: Option<usize>,
+
+        /// Lines of context before each match
+        #[arg(short = 'B', long)]
+        before_context: Option<usize>,
+
+        /// Lines of context before and after each match
+        #[arg(short = 'K', long)]
+        context: Option<usize>,
     },
 
     /// Build search index for a workspace (run before searching)
@@ -170,12 +212,10 @@ pub enum IndexesCommand {
 pub enum InstallTarget {
     /// Claude Code - Installs plugin with skill and auto-index hook
     ClaudeCode,
-    /// OpenCode - Installs tool definition
+    /// OpenCode - Installs skill to ~/.config/opencode/skills/ygrep/
     Opencode,
-    /// Codex - Adds skill to ~/.codex/AGENTS.md
+    /// Codex - Installs skill to ~/.agents/skills/ygrep/
     Codex,
-    /// Factory Droid - Installs hooks and skill
-    Droid,
 }
 
 /// Output format determined by --json or --pretty flags
@@ -236,9 +276,26 @@ fn main() -> Result<()> {
             regex,
             scores,
             text_only,
+            case_sensitive,
+            after_context,
+            before_context,
+            context,
         }) => {
+            let ctx_before = context.or(before_context);
+            let ctx_after = context.or(after_context);
             commands::search::run(
-                &workspace, &query, limit, extensions, paths, regex, scores, text_only, format,
+                &workspace,
+                &query,
+                limit,
+                extensions,
+                paths,
+                regex,
+                scores,
+                text_only,
+                case_sensitive,
+                ctx_before,
+                ctx_after,
+                format,
             )?;
         }
         Some(Commands::Index {
@@ -261,13 +318,11 @@ fn main() -> Result<()> {
             InstallTarget::ClaudeCode => commands::install::install_claude_code()?,
             InstallTarget::Opencode => commands::install::install_opencode()?,
             InstallTarget::Codex => commands::install::install_codex()?,
-            InstallTarget::Droid => commands::install::install_droid()?,
         },
         Some(Commands::Uninstall(target)) => match target {
             InstallTarget::ClaudeCode => commands::install::uninstall_claude_code()?,
             InstallTarget::Opencode => commands::install::uninstall_opencode()?,
             InstallTarget::Codex => commands::install::uninstall_codex()?,
-            InstallTarget::Droid => commands::install::uninstall_droid()?,
         },
         Some(Commands::Indexes(cmd)) => match cmd {
             IndexesCommand::List => commands::indexes::list()?,
@@ -277,6 +332,8 @@ fn main() -> Result<()> {
         None => {
             // Default: treat as search if query provided
             if let Some(query) = cli.query {
+                let ctx_before = cli.context.or(cli.before_context);
+                let ctx_after = cli.context.or(cli.after_context);
                 commands::search::run(
                     &workspace,
                     &query,
@@ -286,6 +343,9 @@ fn main() -> Result<()> {
                     cli.regex,
                     false,
                     cli.text_only,
+                    cli.case_sensitive,
+                    ctx_before,
+                    ctx_after,
                     format,
                 )?;
             } else {

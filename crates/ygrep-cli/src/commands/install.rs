@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
@@ -177,51 +177,14 @@ pub fn install_opencode() -> Result<()> {
     println!("Installing ygrep for OpenCode...");
 
     let home = home_dir()?;
-    let tool_dir = home.join(".config").join("opencode").join("tool");
-    let config_path = home.join(".config").join("opencode").join("opencode.json");
+    let skills_dir = home
+        .join(".config")
+        .join("opencode")
+        .join("skills")
+        .join("ygrep");
 
-    fs::create_dir_all(&tool_dir)?;
-
-    // Write tool definition
-    let tool_content = format!(
-        r#"
-import {{ tool }} from "@opencode-ai/plugin"
-
-const SKILL = `{}`
-
-export default tool({{
-  description: SKILL,
-  args: {{
-    q: tool.schema.string().describe("The search query."),
-    n: tool.schema.number().default(100).describe("Maximum number of results."),
-  }},
-  async execute(args) {{
-    const result = await Bun.$`ygrep search -n ${{args.n}} "${{args.q}}"`.text()
-    return result.trim()
-  }},
-}})"#,
-        SKILL_CONTENT.replace('`', "\\`")
-    );
-
-    fs::write(tool_dir.join("ygrep.ts"), tool_content)?;
-
-    // Update opencode.json for MCP
-    let mut config: serde_json::Value = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        serde_json::from_str(&content).context(format!(
-            "Malformed JSON in {}. Please fix or delete the file and retry.",
-            config_path.display()
-        ))?
-    } else {
-        serde_json::json!({})
-    };
-
-    if config.get("mcp").is_none() {
-        config["mcp"] = serde_json::json!({});
-    }
-
-    // Note: ygrep doesn't have MCP support yet, just the tool
-    fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    fs::create_dir_all(&skills_dir)?;
+    fs::write(skills_dir.join("SKILL.md"), SKILL_CONTENT)?;
 
     println!("Successfully installed ygrep for OpenCode");
     Ok(())
@@ -232,17 +195,26 @@ pub fn uninstall_opencode() -> Result<()> {
     println!("Uninstalling ygrep from OpenCode...");
 
     let home = home_dir()?;
-    let tool_path = home
+    let skills_dir = home
+        .join(".config")
+        .join("opencode")
+        .join("skills")
+        .join("ygrep");
+
+    if skills_dir.exists() {
+        fs::remove_dir_all(&skills_dir)?;
+        println!("Removed ygrep skill from OpenCode");
+    }
+
+    // Migration: clean up old .ts tool file from previous versions
+    let old_tool = home
         .join(".config")
         .join("opencode")
         .join("tool")
         .join("ygrep.ts");
-
-    if tool_path.exists() {
-        fs::remove_file(&tool_path)?;
-        println!("Removed ygrep tool from OpenCode");
-    } else {
-        println!("ygrep tool not found in OpenCode");
+    if old_tool.exists() {
+        fs::remove_file(&old_tool)?;
+        println!("Removed legacy ygrep.ts tool file");
     }
 
     println!("Successfully uninstalled ygrep from OpenCode");
@@ -254,25 +226,10 @@ pub fn install_codex() -> Result<()> {
     println!("Installing ygrep for Codex...");
 
     let home = home_dir()?;
-    let agents_path = home.join(".codex").join("AGENTS.md");
+    let skills_dir = home.join(".agents").join("skills").join("ygrep");
 
-    fs::create_dir_all(agents_path.parent().unwrap())?;
-
-    // Append skill to AGENTS.md if not already present
-    let mut content = if agents_path.exists() {
-        fs::read_to_string(&agents_path)?
-    } else {
-        String::new()
-    };
-
-    if !content.contains("name: ygrep") {
-        content.push_str("\n");
-        content.push_str(SKILL_CONTENT);
-        fs::write(&agents_path, content)?;
-        println!("Added ygrep skill to Codex AGENTS.md");
-    } else {
-        println!("ygrep skill already exists in Codex AGENTS.md");
-    }
+    fs::create_dir_all(&skills_dir)?;
+    fs::write(skills_dir.join("SKILL.md"), SKILL_CONTENT)?;
 
     println!("Successfully installed ygrep for Codex");
     Ok(())
@@ -283,103 +240,30 @@ pub fn uninstall_codex() -> Result<()> {
     println!("Uninstalling ygrep from Codex...");
 
     let home = home_dir()?;
-    let agents_path = home.join(".codex").join("AGENTS.md");
-
-    if agents_path.exists() {
-        let content = fs::read_to_string(&agents_path)?;
-        // Remove the ygrep skill section
-        let updated = content
-            .replace(SKILL_CONTENT, "")
-            .replace(&format!("\n{}", SKILL_CONTENT), "");
-        if updated.trim().is_empty() {
-            fs::remove_file(&agents_path)?;
-        } else {
-            fs::write(&agents_path, updated)?;
-        }
-        println!("Removed ygrep skill from Codex");
-    }
-
-    println!("Successfully uninstalled ygrep from Codex");
-    Ok(())
-}
-
-/// Install ygrep for Factory Droid
-pub fn install_droid() -> Result<()> {
-    println!("Installing ygrep for Factory Droid...");
-
-    let home = home_dir()?;
-    let factory_dir = home.join(".factory");
-
-    if !factory_dir.exists() {
-        bail!("Factory Droid directory not found at {}. Start Factory Droid once to initialize it, then re-run the install.", factory_dir.display());
-    }
-
-    let hooks_dir = factory_dir.join("hooks").join("ygrep");
-    let skills_dir = factory_dir.join("skills").join("ygrep");
-    let settings_path = factory_dir.join("settings.json");
-
-    fs::create_dir_all(&hooks_dir)?;
-    fs::create_dir_all(&skills_dir)?;
-
-    // Write skill
-    fs::write(skills_dir.join("SKILL.md"), SKILL_CONTENT)?;
-
-    // Update settings.json with hooks
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).context(format!(
-            "Malformed JSON in {}. Please fix or delete the file and retry.",
-            settings_path.display()
-        ))?
-    } else {
-        serde_json::json!({})
-    };
-
-    settings["enableHooks"] = serde_json::json!(true);
-
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = serde_json::json!({});
-    }
-
-    // Add SessionStart hook
-    let hook_entry = serde_json::json!([{
-        "matcher": "startup|resume",
-        "hooks": [{
-            "type": "command",
-            "command": "ygrep index >> /tmp/ygrep-hook.log 2>&1 &",
-            "timeout": 60
-        }]
-    }]);
-
-    settings["hooks"]["SessionStart"] = hook_entry;
-
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-
-    println!("Successfully installed ygrep for Factory Droid");
-    Ok(())
-}
-
-/// Uninstall ygrep from Factory Droid
-pub fn uninstall_droid() -> Result<()> {
-    println!("Uninstalling ygrep from Factory Droid...");
-
-    let home = home_dir()?;
-    let factory_dir = home.join(".factory");
-    let hooks_dir = factory_dir.join("hooks").join("ygrep");
-    let skills_dir = factory_dir.join("skills").join("ygrep");
-
-    if hooks_dir.exists() {
-        fs::remove_dir_all(&hooks_dir)?;
-        println!("Removed ygrep hooks from Factory Droid");
-    }
+    let skills_dir = home.join(".agents").join("skills").join("ygrep");
 
     if skills_dir.exists() {
         fs::remove_dir_all(&skills_dir)?;
-        println!("Removed ygrep skill from Factory Droid");
+        println!("Removed ygrep skill from Codex");
     }
 
-    // TODO: Clean up settings.json hooks entries
+    // Migration: clean up old AGENTS.md entry from previous versions
+    let old_agents = home.join(".codex").join("AGENTS.md");
+    if old_agents.exists() {
+        let content = fs::read_to_string(&old_agents)?;
+        if content.contains("name: ygrep") {
+            let updated = content
+                .replace(SKILL_CONTENT, "")
+                .replace(&format!("\n{}", SKILL_CONTENT), "");
+            if updated.trim().is_empty() {
+                fs::remove_file(&old_agents)?;
+            } else {
+                fs::write(&old_agents, updated)?;
+            }
+            println!("Removed legacy ygrep entry from AGENTS.md");
+        }
+    }
 
-    println!("Successfully uninstalled ygrep from Factory Droid");
+    println!("Successfully uninstalled ygrep from Codex");
     Ok(())
 }

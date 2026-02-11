@@ -5,6 +5,32 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-02-11
+
+### Changed
+- OpenCode installer now writes `SKILL.md` to `~/.config/opencode/skills/ygrep/` (replaces `.ts` tool file + `opencode.json` manipulation)
+- Codex installer now writes `SKILL.md` to `~/.agents/skills/ygrep/` (replaces `~/.codex/AGENTS.md` append)
+- Uninstallers include migration cleanup for old install formats
+
+### Removed
+- Factory Droid (`ygrep install droid`) integration
+
+## [2.0.5] - 2026-02-10
+
+### Added
+- camelCase and snake_case subtoken indexing - searching `send` now finds `sendCampaign`, `send_email`, etc. via subtokens emitted at the same token position
+- Multi-word AND fallback - queries like `"campaign sending"` now return results where all terms appear in the document, not just exact adjacent phrases
+- `-s` / `--case-sensitive` flag for case-sensitive search (default remains case-insensitive)
+- `-A` / `-B` / `-K` context flags to control lines of context before/after matches in snippets
+
+### Fixed
+- Reported line numbers now point to the actual matching line instead of the first context line above it
+- `format_ai` output now displays the matching line content instead of the first snippet line (which was often a context line like `);`)
+- Multi-word snippet selection prefers lines containing the most query terms
+
+### Breaking
+- Index schema changed (v2 to v3) for subtoken support - requires `ygrep index --rebuild`
+
 ## [2.0.4] - 2026-02-10
 
 ### Fixed
@@ -153,6 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.0.0]: https://github.com/yetidevworks/ygrep/compare/v2.0.5...v3.0.0
+[2.0.5]: https://github.com/yetidevworks/ygrep/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/yetidevworks/ygrep/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/yetidevworks/ygrep/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/yetidevworks/ygrep/compare/v2.0.1...v2.0.2

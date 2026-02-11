@@ -7,6 +7,8 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 - **Literal text matching** - Works like grep by default, special characters included (`$variable`, `{% block`, `->get(`, `@decorator`)
 - **Regex support** - Use `-r` flag for regex patterns (`fn\s+main`, `TODO|FIXME`)
 - **Code-aware tokenizer** - Preserves `$`, `@`, `#` as part of tokens (essential for PHP, Shell, Python, etc.)
+- **Subtoken matching** - camelCase and snake_case identifiers are split into subtokens, so `send` also finds `sendCampaign`, `send_email`, etc.
+- **Multi-word AND queries** - `"campaign sending"` returns results where all terms appear in the file, not just exact adjacent phrases
 - **Fast indexed search** - Tantivy-powered BM25 ranking, instant results
 - **Incremental indexing** - Only re-indexes changed files based on mtime; no-op runs complete in ~10ms
 - **Non-blocking AI hooks** - Background indexing on session start, never slows down your AI tool
@@ -45,7 +47,6 @@ cp target/release/ygrep ~/.cargo/bin/
 ygrep install claude-code    # Claude Code
 ygrep install opencode       # OpenCode
 ygrep install codex          # Codex
-ygrep install droid          # Factory Droid
 ```
 
 ### 2. Index your project
@@ -79,6 +80,19 @@ ygrep "@decorator"                 # Python decorators
 ygrep search "fn\s+\w+" -r         # Function definitions
 ygrep search "TODO|FIXME" -r       # Multiple patterns
 ygrep search "^import" -r          # Line anchors
+
+# Subtoken matching (automatic with indexed search)
+ygrep "send"                       # Also finds sendCampaign, send_email, etc.
+ygrep "config load"                # AND match: files containing both terms
+
+# Case-sensitive search (default is case-insensitive)
+ygrep "Config" -s                  # Only matches exact case "Config"
+ygrep search "IOException" -s      # Exact case match
+
+# Context lines around matches
+ygrep "error" -A 3                 # 3 lines after each match
+ygrep "error" -B 2                 # 2 lines before each match
+ygrep "error" -K 3                 # 3 lines before and after each match
 
 # With options
 ygrep search "error" -n 20         # Limit results
@@ -196,8 +210,8 @@ After installation, restart Claude Code. The plugin:
 ### OpenCode
 
 ```bash
-ygrep install opencode             # Install tool
-ygrep uninstall opencode           # Uninstall tool
+ygrep install opencode             # Install skill
+ygrep uninstall opencode           # Uninstall skill
 ```
 
 ### Codex
@@ -205,13 +219,6 @@ ygrep uninstall opencode           # Uninstall tool
 ```bash
 ygrep install codex                # Install skill
 ygrep uninstall codex              # Uninstall skill
-```
-
-### Factory Droid
-
-```bash
-ygrep install droid                # Install hooks and skill
-ygrep uninstall droid              # Uninstall
 ```
 
 ## Example Output
@@ -276,7 +283,7 @@ src/main.rs:12-28
 
 1. **Indexing**: Walks directory tree, indexes text files with Tantivy using a code-aware tokenizer
 2. **Incremental updates**: Compares file modification times against the index using fast columnar fields; only changed, new, or deleted files are processed
-3. **Tokenizer**: Custom tokenizer preserves code characters (`$`, `@`, `#`, `-`, `_`) as part of tokens
+3. **Tokenizer**: Custom tokenizer preserves code characters (`$`, `@`, `#`, `-`, `_`) as part of tokens, and emits subtokens for camelCase and snake_case identifiers
 4. **Search**: BM25-ranked literal search (default) or regex matching with `-r` flag, plus optional semantic search
 5. **Results**: Returns matching files with line numbers and context
 
@@ -318,6 +325,9 @@ brew upgrade ygrep
 
 # Indexes auto-rebuild when schema changes are detected
 ygrep index
+
+# If upgrading to v2.0.5+, rebuild is required for subtoken support
+ygrep index --rebuild
 ```
 
 ## Windows Build Prerequisites: C++ SDK & Build Tools

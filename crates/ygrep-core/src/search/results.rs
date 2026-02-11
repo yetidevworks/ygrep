@@ -57,6 +57,9 @@ pub struct SearchHit {
     /// Type of match (text, semantic, or hybrid)
     #[serde(default = "default_match_type")]
     pub match_type: MatchType,
+    /// 0-based offset of the matching line within the snippet
+    #[serde(default)]
+    pub match_line_in_snippet: usize,
 }
 
 fn default_match_type() -> MatchType {
@@ -128,14 +131,16 @@ impl SearchResult {
                 MatchType::Semantic => " ~", // semantic only
                 MatchType::Text => "",       // text only (default, no indicator)
             };
+            // Report the actual matching line, not the snippet start
+            let reported_line = hit.line_start + hit.match_line_in_snippet as u64;
             output.push_str(&format!(
                 "{}:{} ({:.0}%){}\n",
-                hit.path, hit.line_start, score_pct, match_indicator
+                hit.path, reported_line, score_pct, match_indicator
             ));
 
-            // Show only the first matching line, trimmed
-            if let Some(first_line) = hit.snippet.lines().next() {
-                let trimmed = first_line.trim();
+            // Show the actual matching line from the snippet, not the first line
+            if let Some(match_line) = hit.snippet.lines().nth(hit.match_line_in_snippet) {
+                let trimmed = match_line.trim();
                 let preview = if trimmed.len() > 100 {
                     let boundary = trimmed.floor_char_boundary(100);
                     format!("{}...", &trimmed[..boundary])
@@ -205,6 +210,7 @@ mod tests {
             is_chunk: false,
             doc_id: "abc123".to_string(),
             match_type: MatchType::Text,
+            match_line_in_snippet: 0,
         };
         assert_eq!(hit.lines_str(), "10-25");
 
@@ -228,6 +234,7 @@ mod tests {
                 is_chunk: false,
                 doc_id: "abc".to_string(),
                 match_type: MatchType::Text,
+                match_line_in_snippet: 0,
             }],
             total: 1,
             query_time_ms: 15,
@@ -251,6 +258,7 @@ mod tests {
             is_chunk: false,
             doc_id: "test".to_string(),
             match_type,
+            match_line_in_snippet: 0,
         }
     }
 

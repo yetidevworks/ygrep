@@ -13,6 +13,9 @@ pub fn run(
     use_regex: bool,
     _show_scores: bool,
     text_only: bool,
+    case_sensitive: bool,
+    context_before: Option<usize>,
+    context_after: Option<usize>,
     format: OutputFormat,
 ) -> Result<()> {
     // Open existing workspace (fails if not indexed)
@@ -55,7 +58,16 @@ pub fn run(
         let path_filter = if paths.is_empty() { None } else { Some(paths) };
 
         workspace
-            .search_filtered(query, Some(limit), ext_filter, path_filter, use_regex)
+            .search_filtered(
+                query,
+                Some(limit),
+                ext_filter,
+                path_filter,
+                use_regex,
+                case_sensitive,
+                context_before,
+                context_after,
+            )
             .context("Search failed")?
     };
 

@@ -249,12 +249,13 @@ impl HybridSearcher {
             .into_values()
             .map(|fused| {
                 let total_score = fused.bm25_rrf + fused.vector_rrf;
-                let (snippet, match_offset, line_count) =
+                let (snippet, snippet_offset, line_count, match_line_offset) =
                     create_relevant_snippet(&fused.result.content, query, 10);
 
                 // Adjust line numbers to reflect the snippet position
-                let actual_line_start = fused.result.line_start + match_offset as u64;
+                let actual_line_start = fused.result.line_start + snippet_offset as u64;
                 let actual_line_end = actual_line_start + line_count.saturating_sub(1) as u64;
+                let match_line_in_snippet = match_line_offset - snippet_offset;
 
                 // Determine match type based on which sources contributed
                 let match_type = match (fused.bm25_rrf > 0.0, fused.vector_rrf > 0.0) {
@@ -273,6 +274,7 @@ impl HybridSearcher {
                     is_chunk: fused.result.is_chunk,
                     doc_id: fused.result.doc_id,
                     match_type,
+                    match_line_in_snippet,
                 }
             })
             .collect();
@@ -378,10 +380,11 @@ fn reciprocal_rank_fusion_standalone(
         .into_values()
         .map(|fused| {
             let total_score = fused.bm25_rrf + fused.vector_rrf;
-            let (snippet, match_offset, line_count) =
+            let (snippet, snippet_offset, line_count, match_line_offset) =
                 create_relevant_snippet(&fused.result.content, query, 10);
-            let actual_line_start = fused.result.line_start + match_offset as u64;
+            let actual_line_start = fused.result.line_start + snippet_offset as u64;
             let actual_line_end = actual_line_start + line_count.saturating_sub(1) as u64;
+            let match_line_in_snippet = match_line_offset - snippet_offset;
             let match_type = match (fused.bm25_rrf > 0.0, fused.vector_rrf > 0.0) {
                 (true, true) => MatchType::Hybrid,
                 (true, false) => MatchType::Text,
@@ -397,6 +400,7 @@ fn reciprocal_rank_fusion_standalone(
                 is_chunk: fused.result.is_chunk,
                 doc_id: fused.result.doc_id,
                 match_type,
+                match_line_in_snippet,
             }
         })
         .collect();
@@ -411,8 +415,12 @@ fn reciprocal_rank_fusion_standalone(
 }
 
 /// Create a snippet showing lines relevant to the query
-/// Returns (snippet, line_offset_from_start, line_count)
-fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (String, usize, usize) {
+/// Returns (snippet, snippet_offset, line_count, match_line_offset)
+fn create_relevant_snippet(
+    content: &str,
+    query: &str,
+    max_lines: usize,
+) -> (String, usize, usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
     let query_lower = query.to_lowercase();
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -435,20 +443,39 @@ fn create_relevant_snippet(content: &str, query: &str, max_lines: usize) -> (Str
             .collect::<Vec<_>>()
             .join("\n");
         let line_count = snippet.lines().count();
-        return (snippet, 0, line_count);
+        return (snippet, 0, line_count, 0);
     }
 
-    // Get context around the first match
-    let first_match = matching_indices[0];
+    // For multi-word queries, prefer lines with more matching terms
+    let best_match = if query_terms.len() > 1 {
+        let mut best_line = matching_indices[0];
+        let mut best_count = 0;
+        for &idx in &matching_indices {
+            let line_lower = lines[idx].to_lowercase();
+            let count = query_terms
+                .iter()
+                .filter(|t| line_lower.contains(*t))
+                .count();
+            if count > best_count {
+                best_count = count;
+                best_line = idx;
+            }
+        }
+        best_line
+    } else {
+        matching_indices[0]
+    };
+
+    // Get context around the best match
     let context_before = 2;
     let context_after = max_lines.saturating_sub(context_before + 1);
 
-    let start = first_match.saturating_sub(context_before);
-    let end = (first_match + context_after + 1).min(lines.len());
+    let start = best_match.saturating_sub(context_before);
+    let end = (best_match + context_after + 1).min(lines.len());
 
     let snippet = lines[start..end].join("\n");
     let line_count = end - start;
-    (snippet, start, line_count)
+    (snippet, start, line_count, best_match)
 }
 
 #[cfg(test)]
