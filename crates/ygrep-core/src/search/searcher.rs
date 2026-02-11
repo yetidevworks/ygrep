@@ -1,4 +1,5 @@
 use regex::RegexBuilder;
+use std::collections::HashSet;
 use std::time::Instant;
 use tantivy::{collector::TopDocs, query::QueryParser, Index};
 
@@ -70,6 +71,7 @@ impl Searcher {
         // Build results
         let mut hits = Vec::with_capacity(top_docs.len());
         let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
+        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
 
         // Case-insensitive literal matching (like grep -i)
         let query_lower = query.to_lowercase();
@@ -108,6 +110,12 @@ impl Searcher {
             // Adjust line numbers to reflect where the match actually is
             let actual_line_start = line_start + match_line_offset as u64;
             let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+
+            // Deduplicate: skip if we already have a hit for the same file and line range
+            let key = (path.clone(), actual_line_start, actual_line_end);
+            if !seen.insert(key) {
+                continue;
+            }
 
             hits.push(SearchHit {
                 path,
@@ -230,6 +238,7 @@ impl Searcher {
         // Build results by applying regex filter
         let mut hits = Vec::with_capacity(candidates.len());
         let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
+        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
 
         for (score, doc_address) in candidates {
             // Stop if we have enough results
@@ -265,6 +274,12 @@ impl Searcher {
             // Adjust line numbers to reflect where the match actually is
             let actual_line_start = line_start + match_line_offset as u64;
             let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+
+            // Deduplicate: skip if we already have a hit for the same file and line range
+            let key = (path.clone(), actual_line_start, actual_line_end);
+            if !seen.insert(key) {
+                continue;
+            }
 
             hits.push(SearchHit {
                 path,
@@ -657,6 +672,64 @@ mod tests {
         for pair in result.hits.windows(2) {
             assert!(pair[0].score >= pair[1].score);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dedup_full_doc_and_chunk() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        let content = "fn hello() {\n    println!(\"Hello, world!\");\n}";
+
+        // Add full document (empty chunk_id)
+        let mut writer = index.writer(50_000_000).unwrap();
+        writer
+            .add_document(doc!(
+                fields.doc_id => "full-doc",
+                fields.path => "src/main.rs",
+                fields.workspace => "/test",
+                fields.content => content,
+                fields.mtime => 0u64,
+                fields.size => content.len() as u64,
+                fields.extension => "rs",
+                fields.line_start => 1u64,
+                fields.line_end => 3u64,
+                fields.chunk_id => "",
+                fields.parent_doc => ""
+            ))
+            .unwrap();
+        // Add chunk with same content for the same file
+        writer
+            .add_document(doc!(
+                fields.doc_id => "chunk-1",
+                fields.path => "src/main.rs",
+                fields.workspace => "/test",
+                fields.content => content,
+                fields.mtime => 0u64,
+                fields.size => content.len() as u64,
+                fields.extension => "rs",
+                fields.line_start => 1u64,
+                fields.line_end => 3u64,
+                fields.chunk_id => "chunk-1",
+                fields.parent_doc => "full-doc"
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Text search should return only 1 hit (deduplicated)
+        let result = searcher.search("hello", None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/main.rs");
+
+        // Regex search should also return only 1 hit
+        let result = searcher.search_regex("hello", None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/main.rs");
 
         Ok(())
     }
