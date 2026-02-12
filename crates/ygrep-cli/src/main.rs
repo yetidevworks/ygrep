@@ -193,6 +193,14 @@ pub enum Commands {
     /// Manage stored indexes (list, clean, remove)
     #[command(subcommand)]
     Indexes(IndexesCommand),
+
+    /// Start MCP server (stdio transport) for AI assistant integration
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Enable semantic search (downloads embedding model on first use)
+        #[arg(long)]
+        semantic: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -216,6 +224,13 @@ pub enum InstallTarget {
     Opencode,
     /// Codex - Installs skill to ~/.agents/skills/ygrep/
     Codex,
+    /// MCP - Print MCP server configuration for Claude Desktop and other MCP clients
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Include --semantic flag in generated config (enables semantic search)
+        #[arg(long)]
+        semantic: bool,
+    },
 }
 
 /// Output format determined by --json or --pretty flags
@@ -318,17 +333,26 @@ fn main() -> Result<()> {
             InstallTarget::ClaudeCode => commands::install::install_claude_code()?,
             InstallTarget::Opencode => commands::install::install_opencode()?,
             InstallTarget::Codex => commands::install::install_codex()?,
+            #[cfg(feature = "mcp")]
+            InstallTarget::Mcp { semantic } => commands::install::install_mcp(&workspace, semantic)?,
         },
         Some(Commands::Uninstall(target)) => match target {
             InstallTarget::ClaudeCode => commands::install::uninstall_claude_code()?,
             InstallTarget::Opencode => commands::install::uninstall_opencode()?,
             InstallTarget::Codex => commands::install::uninstall_codex()?,
+            #[cfg(feature = "mcp")]
+            InstallTarget::Mcp { .. } => commands::install::uninstall_mcp()?,
         },
         Some(Commands::Indexes(cmd)) => match cmd {
             IndexesCommand::List => commands::indexes::list()?,
             IndexesCommand::Clean => commands::indexes::clean()?,
             IndexesCommand::Remove { identifier } => commands::indexes::remove(&identifier)?,
         },
+        #[cfg(feature = "mcp")]
+        Some(Commands::Mcp { semantic }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(commands::mcp::run(&workspace, semantic))?;
+        }
         None => {
             // Default: treat as search if query provided
             if let Some(query) = cli.query {

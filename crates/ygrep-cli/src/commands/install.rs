@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Skill content for ygrep (embedded at build time from claude-code/SKILL.md)
 const SKILL_CONTENT: &str = include_str!(concat!(env!("OUT_DIR"), "/SKILL.md"));
@@ -235,6 +235,128 @@ pub fn install_codex() -> Result<()> {
     Ok(())
 }
 
+/// Install ygrep MCP server configuration
+#[cfg(feature = "mcp")]
+pub fn install_mcp(workspace_path: &Path, semantic: bool) -> Result<()> {
+    let exe_path = strip_unc_prefix(
+        &std::env::current_exe()
+            .context("Could not determine ygrep binary path")?
+            .to_string_lossy(),
+    );
+
+    let workspace_str = strip_unc_prefix(
+        &std::fs::canonicalize(workspace_path)
+            .unwrap_or_else(|_| workspace_path.to_path_buf())
+            .to_string_lossy(),
+    );
+
+    let mut args: Vec<serde_json::Value> = vec![
+        "mcp".into(),
+        "-C".into(),
+        workspace_str.as_str().into(),
+    ];
+    if semantic {
+        args.push("--semantic".into());
+    }
+
+    let semantic_flag = if semantic { " --semantic" } else { "" };
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "ygrep": {
+                "command": exe_path,
+                "args": args
+            }
+        }
+    });
+
+    // Claude Code instructions
+    println!("Claude Code (run this command):\n");
+    println!(
+        "  claude mcp add ygrep -- {} mcp -C {}{}\n",
+        exe_path, workspace_str, semantic_flag
+    );
+
+    // OpenCode instructions
+    let mut opencode_cmd: Vec<serde_json::Value> = vec![
+        exe_path.as_str().into(),
+        "mcp".into(),
+        "-C".into(),
+        workspace_str.as_str().into(),
+    ];
+    if semantic {
+        opencode_cmd.push("--semantic".into());
+    }
+
+    let opencode_config = serde_json::json!({
+        "mcp": {
+            "ygrep": {
+                "type": "local",
+                "command": opencode_cmd
+            }
+        }
+    });
+
+    println!("OpenCode (add to opencode.json):\n");
+    println!("{}\n", serde_json::to_string_pretty(&opencode_config).unwrap());
+
+    // Claude Desktop / Cursor / Windsurf
+    println!("Claude Desktop, Cursor, Windsurf, and other MCP clients:");
+    println!("Add this to your MCP configuration file:\n");
+    println!("{}\n", serde_json::to_string_pretty(&config).unwrap());
+
+    println!("Config file locations:");
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        println!("  Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        println!("  Claude Desktop: ~/.config/Claude/claude_desktop_config.json");
+    }
+
+    println!("  Cursor:         Settings > MCP Servers / .cursor/mcp.json");
+    println!("  Windsurf:       Settings > MCP");
+    println!("  OpenCode:       opencode.json (project) or ~/.config/opencode/opencode.json (global)");
+    println!();
+    println!(
+        "Or start the server directly: ygrep mcp -C {}{}",
+        workspace_str, semantic_flag
+    );
+
+    Ok(())
+}
+
+/// Uninstall ygrep MCP server
+#[cfg(feature = "mcp")]
+pub fn uninstall_mcp() -> Result<()> {
+    println!("To remove ygrep MCP server:");
+    println!();
+    println!("Remove the \"ygrep\" entry from the \"mcpServers\" object in your");
+    println!("MCP client configuration file.");
+    println!();
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        println!("  Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        println!("  Claude Desktop: ~/.config/Claude/claude_desktop_config.json");
+    }
+
+    Ok(())
+}
+
 /// Uninstall ygrep from Codex
 pub fn uninstall_codex() -> Result<()> {
     println!("Uninstalling ygrep from Codex...");
@@ -266,4 +388,9 @@ pub fn uninstall_codex() -> Result<()> {
 
     println!("Successfully uninstalled ygrep from Codex");
     Ok(())
+}
+
+/// Strip Windows UNC path prefix (\\?\) for cleaner display
+fn strip_unc_prefix(path: &str) -> String {
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
