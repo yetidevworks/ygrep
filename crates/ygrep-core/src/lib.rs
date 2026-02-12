@@ -108,6 +108,28 @@ impl Workspace {
         // Open or create Tantivy index
         let schema = index::build_document_schema();
 
+        // Early check: verify index directory is writable (issue #7).
+        // On macOS, the default data path (~/Library/Application Support/ygrep/) may not
+        // be writable in sandboxed environments, causing cryptic lockfile PermissionDenied
+        // errors.  Detect this upfront and suggest XDG_DATA_HOME.
+        if index_path.exists() {
+            let probe = index_path.join(".ygrep-write-probe");
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(YgrepError::Config(format!(
+                        "Index directory is not writable: {}\n\n\
+                         Hint: Set XDG_DATA_HOME to a writable location, e.g.:\n  \
+                         export XDG_DATA_HOME=\"$PWD/.ygrep-data\"",
+                        index_path.display()
+                    )));
+                }
+                Err(_) => {} // Other errors (e.g. disk full) — let Tantivy handle them
+            }
+        }
+
         // Clean up stale lockfiles that may block readers on macOS (issue #7).
         // Tantivy's reader acquires META_LOCK via flock(); on macOS Intel this can
         // fail with EPERM if a stale lockfile inode still has an unreleased flock.
