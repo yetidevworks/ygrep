@@ -821,6 +821,17 @@ impl Workspace {
             .map(|v| v as u32)
     }
 
+    /// Check if the existing index has an outdated schema that requires a full rebuild.
+    /// Returns false if no index exists (nothing to rebuild).
+    pub fn needs_schema_rebuild(&self) -> bool {
+        if !self.is_indexed() {
+            return false;
+        }
+        self.stored_schema_version()
+            .map(|v| v != index::SCHEMA_VERSION)
+            .unwrap_or(true) // missing version = pre-v2 schema, needs rebuild
+    }
+
     /// Read workspace.json metadata
     fn read_metadata(&self) -> Option<serde_json::Value> {
         let metadata_path = self.index_path.join("workspace.json");
@@ -1008,6 +1019,49 @@ mod tests {
         let result = workspace.search("hello", None)?;
         assert!(!result.is_empty());
         assert!(result.hits.iter().any(|h| h.path.contains("hello")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_needs_schema_rebuild() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("test.rs"), "fn main() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config.clone())?;
+
+        // Not indexed yet — no rebuild needed
+        assert!(!workspace.needs_schema_rebuild());
+
+        // Index the workspace
+        workspace.index_all_with_options(false)?;
+        assert!(workspace.is_indexed());
+        assert!(!workspace.needs_schema_rebuild());
+
+        // Tamper with schema version to simulate an upgrade
+        let metadata_path = workspace.index_path().join("workspace.json");
+        let raw = std::fs::read_to_string(&metadata_path)?;
+        let metadata: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut metadata = metadata.as_object().unwrap().clone();
+        metadata.insert("schema_version".into(), serde_json::json!(0));
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap())?;
+
+        // Re-open workspace and check — should detect stale schema
+        let workspace2 = Workspace::create_with_config(&workspace_dir, config.clone())?;
+        assert!(workspace2.needs_schema_rebuild());
+
+        // Remove schema_version entirely to simulate pre-v2 index
+        metadata.remove("schema_version");
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap())?;
+
+        let workspace3 = Workspace::create_with_config(&workspace_dir, config)?;
+        assert!(workspace3.needs_schema_rebuild());
 
         Ok(())
     }

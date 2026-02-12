@@ -48,6 +48,10 @@ ignore = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.17"
 
+# MCP
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+schemars = "1.0"
+
 # Utils
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

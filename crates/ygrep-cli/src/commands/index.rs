@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
-use ygrep_core::index::SCHEMA_VERSION;
 use ygrep_core::Workspace;
 
 pub fn run(
@@ -20,14 +19,7 @@ pub fn run(
         match Workspace::create(workspace_path) {
             Ok(ws) => {
                 let sem = ws.stored_semantic_flag();
-                let schema_outdated = if ws.is_indexed() {
-                    // Existing index: missing version means pre-v2 schema
-                    ws.stored_schema_version()
-                        .map(|v| v != SCHEMA_VERSION)
-                        .unwrap_or(true)
-                } else {
-                    false // No existing index, nothing to rebuild
-                };
+                let schema_outdated = ws.needs_schema_rebuild();
                 (sem, schema_outdated)
             }
             Err(_) => (None, false),

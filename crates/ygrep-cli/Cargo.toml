@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["embeddings"]
+default = ["embeddings", "mcp"]
 embeddings = ["ygrep-core/embeddings"]
+mcp = ["dep:rmcp", "dep:schemars"]
 
 [[bin]]
 name = "ygrep"
@@ -31,6 +32,10 @@ tracing-subscriber = { workspace = true }
 
 # CLI
 clap = { workspace = true }
+
+# MCP
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 
 # Utils
 dirs = { workspace = true }
