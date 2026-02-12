@@ -2,9 +2,9 @@ use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    schemars, tool, tool_handler, tool_router,
     transport::stdio,
-    ServiceExt,
+    ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -81,18 +81,23 @@ impl YgrepMcp {
         if self.workspace.needs_schema_rebuild() {
             let index_path = self.workspace.index_path().to_path_buf();
             if index_path.exists() {
-                std::fs::remove_dir_all(&index_path)
-                    .map_err(|e| ErrorData::internal_error(format!("Failed to clear stale index: {}", e), None))?;
+                std::fs::remove_dir_all(&index_path).map_err(|e| {
+                    ErrorData::internal_error(format!("Failed to clear stale index: {}", e), None)
+                })?;
             }
             // Re-open workspace after clearing index and do full rebuild
-            let ws = Workspace::create(self.workspace.root())
-                .map_err(|e| ErrorData::internal_error(format!("Failed to reopen workspace: {}", e), None))?;
-            ws.index_all_with_options(false)
-                .map_err(|e| ErrorData::internal_error(format!("Schema rebuild failed: {}", e), None))?;
+            let ws = Workspace::create(self.workspace.root()).map_err(|e| {
+                ErrorData::internal_error(format!("Failed to reopen workspace: {}", e), None)
+            })?;
+            ws.index_all_with_options(false).map_err(|e| {
+                ErrorData::internal_error(format!("Schema rebuild failed: {}", e), None)
+            })?;
         } else if !self.workspace.is_indexed() {
             self.workspace
                 .index_incremental_with_options(false)
-                .map_err(|e| ErrorData::internal_error(format!("Auto-index failed: {}", e), None))?;
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("Auto-index failed: {}", e), None)
+                })?;
         }
 
         let limit = params.limit.unwrap_or(50) as usize;
@@ -161,13 +166,21 @@ impl YgrepMcp {
         let semantic_str = if semantic { " (semantic)" } else { "" };
         let output = format!(
             "Index {}{}: {} indexed, {} unchanged, {} removed, {} skipped, {} errors",
-            mode, semantic_str, stats.indexed, stats.unchanged, stats.removed, stats.skipped, stats.errors
+            mode,
+            semantic_str,
+            stats.indexed,
+            stats.unchanged,
+            stats.removed,
+            stats.skipped,
+            stats.errors
         );
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Show workspace index status: root path, index state, semantic availability.")]
+    #[tool(
+        description = "Show workspace index status: root path, index state, semantic availability."
+    )]
     async fn ygrep_status(&self) -> Result<CallToolResult, ErrorData> {
         let root = self.workspace.root().display().to_string();
         let indexed = self.workspace.is_indexed();
@@ -188,7 +201,11 @@ impl YgrepMcp {
             if indexed { "yes" } else { "no" },
             index_path,
             index_type,
-            if has_semantic { "available" } else { "not available" },
+            if has_semantic {
+                "available"
+            } else {
+                "not available"
+            },
         );
 
         Ok(CallToolResult::success(vec![Content::text(output)]))

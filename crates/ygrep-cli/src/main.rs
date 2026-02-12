@@ -334,7 +334,9 @@ fn main() -> Result<()> {
             InstallTarget::Opencode => commands::install::install_opencode()?,
             InstallTarget::Codex => commands::install::install_codex()?,
             #[cfg(feature = "mcp")]
-            InstallTarget::Mcp { semantic } => commands::install::install_mcp(&workspace, semantic)?,
+            InstallTarget::Mcp { semantic } => {
+                commands::install::install_mcp(&workspace, semantic)?
+            }
         },
         Some(Commands::Uninstall(target)) => match target {
             InstallTarget::ClaudeCode => commands::install::uninstall_claude_code()?,

@@ -250,11 +250,8 @@ pub fn install_mcp(workspace_path: &Path, semantic: bool) -> Result<()> {
             .to_string_lossy(),
     );
 
-    let mut args: Vec<serde_json::Value> = vec![
-        "mcp".into(),
-        "-C".into(),
-        workspace_str.as_str().into(),
-    ];
+    let mut args: Vec<serde_json::Value> =
+        vec!["mcp".into(), "-C".into(), workspace_str.as_str().into()];
     if semantic {
         args.push("--semantic".into());
     }
@@ -298,7 +295,10 @@ pub fn install_mcp(workspace_path: &Path, semantic: bool) -> Result<()> {
     });
 
     println!("OpenCode (add to opencode.json):\n");
-    println!("{}\n", serde_json::to_string_pretty(&opencode_config).unwrap());
+    println!(
+        "{}\n",
+        serde_json::to_string_pretty(&opencode_config).unwrap()
+    );
 
     // Claude Desktop / Cursor / Windsurf
     println!("Claude Desktop, Cursor, Windsurf, and other MCP clients:");
@@ -309,7 +309,9 @@ pub fn install_mcp(workspace_path: &Path, semantic: bool) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        println!("  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json");
+        println!(
+            "  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json"
+        );
     }
     #[cfg(target_os = "windows")]
     {
@@ -322,7 +324,9 @@ pub fn install_mcp(workspace_path: &Path, semantic: bool) -> Result<()> {
 
     println!("  Cursor:         Settings > MCP Servers / .cursor/mcp.json");
     println!("  Windsurf:       Settings > MCP");
-    println!("  OpenCode:       opencode.json (project) or ~/.config/opencode/opencode.json (global)");
+    println!(
+        "  OpenCode:       opencode.json (project) or ~/.config/opencode/opencode.json (global)"
+    );
     println!();
     println!(
         "Or start the server directly: ygrep mcp -C {}{}",
@@ -343,7 +347,9 @@ pub fn uninstall_mcp() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        println!("  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json");
+        println!(
+            "  Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json"
+        );
     }
     #[cfg(target_os = "windows")]
     {
