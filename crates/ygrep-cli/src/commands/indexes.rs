@@ -227,7 +227,7 @@ pub fn list() -> Result<()> {
         };
 
         let time_str = match &info.indexed_at {
-            Some(dt) => format_relative_time(dt),
+            Some(dt) => format!("updated {}", format_relative_time(dt)),
             None => "-".to_string(),
         };
 

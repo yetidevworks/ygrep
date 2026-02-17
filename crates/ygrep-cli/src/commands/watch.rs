@@ -22,6 +22,21 @@ pub fn run(workspace_path: &Path) -> Result<()> {
     let use_semantic = workspace.stored_semantic_flag().unwrap_or(false);
 
     let mode = if use_semantic { "semantic" } else { "text" };
+
+    // Run incremental update before watching
+    eprintln!("Updating index...");
+    match workspace.index_incremental_with_options(use_semantic) {
+        Ok(stats) => {
+            eprintln!(
+                "Index updated: {} indexed, {} unchanged, {} skipped, {} errors",
+                stats.indexed, stats.unchanged, stats.skipped, stats.errors
+            );
+        }
+        Err(e) => {
+            eprintln!("Warning: incremental update failed: {}", e);
+        }
+    }
+
     eprintln!("Starting file watcher (mode: {})...", mode);
     eprintln!("Press Ctrl+C to stop.\n");
 
@@ -54,6 +69,8 @@ pub fn run(workspace_path: &Path) -> Result<()> {
                                 eprintln!("  [!] {} - {}", path.display(), e);
                             }
                         }
+                    } else {
+                        eprintln!("  [.] {} (skipped: not indexable)", path.display());
                     }
                 }
                 Some(WatchEvent::Deleted(path)) => {
