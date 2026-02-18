@@ -18,13 +18,16 @@ Invoke this skill **immediately** when:
 - You need to understand where something is defined or used
 - You need to explore an unfamiliar codebase
 
-## Usage
+## Usage — IMPORTANT: Put Query First
+
+**Always put the query BEFORE flags** when using the shorthand syntax:
 
 ```bash
 ygrep "search query"               # Search (AI-optimized output)
 ygrep "query" -n 10                # Limit results
-ygrep "query" -e rs -e ts          # Filter by extension
-ygrep "query" -p src/              # Filter by path
+ygrep "query" -e rs ts php         # Filter by extensions
+ygrep "query" -p src/api/ -n 20    # Filter by path
+ygrep "query" -p src/*/tests/      # Shell globs work with -p
 ygrep "fn\\s+main" -r              # Regex search
 ygrep "Config" -s                  # Case-sensitive search
 ygrep "error" -A 3                 # 3 lines of context after match
@@ -33,6 +36,13 @@ ygrep "error" -K 3                 # 3 lines of context before and after
 ygrep "query" --json               # JSON output with full metadata
 ygrep "query" --text-only          # Force text-only search
 ```
+
+**Argument order matters**: The query is a positional argument. `-p` and `-e` accept
+multiple values (for shell glob expansion), so they will consume any non-flag values
+after them — including the query if it comes after. Always use: `ygrep "query" [flags]`
+
+Wrong: `ygrep -p src/ "query"` — `-p` consumes "query" as a path
+Right: `ygrep "query" -p src/` — query parsed first, then -p gets the path
 
 ## Output Format
 
@@ -46,6 +56,7 @@ Default output shows: `path:line (score%) [indicator]`
 - Uses **literal text matching** by default (like grep) — special characters work: `$variable`, `->get(`, `{% block`
 - **Subtoken matching**: camelCase and snake_case are split into subtokens — searching `send` also finds `sendCampaign`, `send_email`, etc.
 - **Multi-word queries**: `"campaign sending"` finds files where all terms appear (AND logic), not just exact phrases
+- The `|` pipe character is **literal**, not OR — use `-r` for regex OR: `ygrep "foo|bar" -r`
 - Use `-r` for regex patterns
 - Use `-s` for case-sensitive search (default is case-insensitive)
 - Use `-A`/`-B`/`-K` to control context lines around matches

@@ -34,6 +34,7 @@ Match indicators in default output:\n\
     ygrep index --semantic          Index with semantic search (slower)\n\
     ygrep \"search query\"            Search with default AI output\n\
     ygrep \"fn main\" -n 10           Limit to 10 results\n\
+    ygrep \"error\" -p src/api/ -n 20 Search in path (put query first)\n\
     ygrep \"->get(\" -e php           Search PHP files only\n\
     ygrep \"fn\\\\s+main\" -r            Regex search\n\
     ygrep \"Config\" -s               Case-sensitive search\n\
@@ -75,11 +76,11 @@ pub struct Cli {
     pub regex: bool,
 
     /// Filter by file extension (e.g., -e rs -e ts)
-    #[arg(short = 'e', long = "ext")]
+    #[arg(short = 'e', long = "ext", num_args = 1..)]
     pub extensions: Vec<String>,
 
-    /// Filter by path pattern
-    #[arg(short = 'p', long = "path")]
+    /// Filter by path pattern (shell globs accepted: -p src/*/tests/)
+    #[arg(short = 'p', long = "path", num_args = 1..)]
     pub paths: Vec<String>,
 
     /// Text-only search (disable semantic search)
@@ -115,11 +116,11 @@ pub enum Commands {
         limit: usize,
 
         /// Filter by file extension (e.g., -e rs -e ts)
-        #[arg(short = 'e', long = "ext")]
+        #[arg(short = 'e', long = "ext", num_args = 1..)]
         extensions: Vec<String>,
 
-        /// Filter by path pattern
-        #[arg(short = 'p', long = "path")]
+        /// Filter by path pattern (shell globs accepted: -p src/*/tests/)
+        #[arg(short = 'p', long = "path", num_args = 1..)]
         paths: Vec<String>,
 
         /// Treat query as regex pattern instead of literal text
