@@ -211,9 +211,9 @@ impl Searcher {
         }
 
         if let Some(ref paths) = filters.paths {
-            result.hits.retain(|hit| {
-                paths.iter().any(|p| path_matches(p, &hit.path))
-            });
+            result
+                .hits
+                .retain(|hit| paths.iter().any(|p| path_matches(p, &hit.path)));
         }
 
         // Re-limit
