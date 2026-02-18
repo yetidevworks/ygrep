@@ -34,7 +34,8 @@ Match indicators in default output:\n\
     ygrep index --semantic          Index with semantic search (slower)\n\
     ygrep \"search query\"            Search with default AI output\n\
     ygrep \"fn main\" -n 10           Limit to 10 results\n\
-    ygrep \"error\" -p src/api/ -n 20 Search in path (put query first)\n\
+    ygrep \"error\" -p src/api/        Search within path\n\
+    ygrep \"error\" -p 'src/*/tests/' Glob pattern in path filter\n\
     ygrep \"->get(\" -e php           Search PHP files only\n\
     ygrep \"fn\\\\s+main\" -r            Regex search\n\
     ygrep \"Config\" -s               Case-sensitive search\n\
@@ -52,7 +53,7 @@ pub struct Cli {
     pub query: Option<String>,
 
     /// Maximum results
-    #[arg(short = 'n', long, default_value = "100")]
+    #[arg(short = 'n', long, default_value = "100", global = true)]
     pub limit: usize,
 
     /// Workspace root (default: current directory)
@@ -72,35 +73,35 @@ pub struct Cli {
     pub verbose: bool,
 
     /// Treat query as regex pattern
-    #[arg(short = 'r', long)]
+    #[arg(short = 'r', long, global = true)]
     pub regex: bool,
 
     /// Filter by file extension (e.g., -e rs -e ts)
-    #[arg(short = 'e', long = "ext", num_args = 1..)]
+    #[arg(short = 'e', long = "ext", global = true)]
     pub extensions: Vec<String>,
 
-    /// Filter by path pattern (shell globs accepted: -p src/*/tests/)
-    #[arg(short = 'p', long = "path", num_args = 1..)]
+    /// Filter by path glob (e.g., -p 'src/*/tests/')
+    #[arg(short = 'p', long = "path", global = true)]
     pub paths: Vec<String>,
 
     /// Text-only search (disable semantic search)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub text_only: bool,
 
     /// Case-sensitive search (default is case-insensitive)
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, global = true)]
     pub case_sensitive: bool,
 
     /// Lines of context after each match
-    #[arg(short = 'A', long)]
+    #[arg(short = 'A', long, global = true)]
     pub after_context: Option<usize>,
 
     /// Lines of context before each match
-    #[arg(short = 'B', long)]
+    #[arg(short = 'B', long, global = true)]
     pub before_context: Option<usize>,
 
     /// Lines of context before and after each match
-    #[arg(short = 'K', long)]
+    #[arg(short = 'K', long, global = true)]
     pub context: Option<usize>,
 }
 
@@ -111,45 +112,9 @@ pub enum Commands {
         /// Search query (literal text or regex with --regex)
         query: String,
 
-        /// Maximum results
-        #[arg(short = 'n', long, default_value = "100")]
-        limit: usize,
-
-        /// Filter by file extension (e.g., -e rs -e ts)
-        #[arg(short = 'e', long = "ext", num_args = 1..)]
-        extensions: Vec<String>,
-
-        /// Filter by path pattern (shell globs accepted: -p src/*/tests/)
-        #[arg(short = 'p', long = "path", num_args = 1..)]
-        paths: Vec<String>,
-
-        /// Treat query as regex pattern instead of literal text
-        #[arg(short = 'r', long)]
-        regex: bool,
-
         /// Show relevance scores
         #[arg(long)]
         scores: bool,
-
-        /// Text-only search (disable semantic search)
-        #[arg(long)]
-        text_only: bool,
-
-        /// Case-sensitive search (default is case-insensitive)
-        #[arg(short = 's', long)]
-        case_sensitive: bool,
-
-        /// Lines of context after each match
-        #[arg(short = 'A', long)]
-        after_context: Option<usize>,
-
-        /// Lines of context before each match
-        #[arg(short = 'B', long)]
-        before_context: Option<usize>,
-
-        /// Lines of context before and after each match
-        #[arg(short = 'K', long)]
-        context: Option<usize>,
     },
 
     /// Build search index for a workspace (run before searching)
@@ -269,31 +234,19 @@ fn main() -> Result<()> {
 
     // Handle command
     match cli.command {
-        Some(Commands::Search {
-            query,
-            limit,
-            extensions,
-            paths,
-            regex,
-            scores,
-            text_only,
-            case_sensitive,
-            after_context,
-            before_context,
-            context,
-        }) => {
-            let ctx_before = context.or(before_context);
-            let ctx_after = context.or(after_context);
+        Some(Commands::Search { query, scores }) => {
+            let ctx_before = cli.context.or(cli.before_context);
+            let ctx_after = cli.context.or(cli.after_context);
             commands::search::run(
                 &workspace,
                 &query,
-                limit,
-                extensions,
-                paths,
-                regex,
+                cli.limit,
+                cli.extensions,
+                cli.paths,
+                cli.regex,
                 scores,
-                text_only,
-                case_sensitive,
+                cli.text_only,
+                cli.case_sensitive,
                 ctx_before,
                 ctx_after,
                 format,

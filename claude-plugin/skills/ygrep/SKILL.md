@@ -18,31 +18,29 @@ Invoke this skill **immediately** when:
 - You need to understand where something is defined or used
 - You need to explore an unfamiliar codebase
 
-## Usage — IMPORTANT: Put Query First
+## Usage
 
-**Always put the query BEFORE flags** when using the shorthand syntax:
+All flags are global — they work in any position with or without the `search` subcommand:
 
 ```bash
-ygrep "search query"               # Search (AI-optimized output)
-ygrep "query" -n 10                # Limit results
-ygrep "query" -e rs ts php         # Filter by extensions
-ygrep "query" -p src/api/ -n 20    # Filter by path
-ygrep "query" -p src/*/tests/      # Shell globs work with -p
-ygrep "fn\\s+main" -r              # Regex search
-ygrep "Config" -s                  # Case-sensitive search
-ygrep "error" -A 3                 # 3 lines of context after match
-ygrep "error" -B 2                 # 2 lines of context before match
-ygrep "error" -K 3                 # 3 lines of context before and after
-ygrep "query" --json               # JSON output with full metadata
-ygrep "query" --text-only          # Force text-only search
+ygrep "search query"                  # Search (AI-optimized output)
+ygrep "query" -n 10                   # Limit results
+ygrep "query" -e rs -e ts             # Filter by extension
+ygrep "query" -p 'src/api/'           # Filter by path prefix
+ygrep "query" -p 'src/*/tests/'       # Glob pattern in path filter (quote it!)
+ygrep search "query" -p 'lib/' -n 5   # Explicit search subcommand
+ygrep "fn\\s+main" -r                 # Regex search
+ygrep "Config" -s                     # Case-sensitive search
+ygrep "error" -A 3                    # 3 lines of context after match
+ygrep "error" -B 2                    # 2 lines of context before match
+ygrep "error" -K 3                    # 3 lines of context before and after
+ygrep "query" --json                  # JSON output with full metadata
+ygrep "query" --text-only             # Force text-only search
 ```
 
-**Argument order matters**: The query is a positional argument. `-p` and `-e` accept
-multiple values (for shell glob expansion), so they will consume any non-flag values
-after them — including the query if it comes after. Always use: `ygrep "query" [flags]`
-
-Wrong: `ygrep -p src/ "query"` — `-p` consumes "query" as a path
-Right: `ygrep "query" -p src/` — query parsed first, then -p gets the path
+**IMPORTANT**: Quote glob patterns in `-p` to prevent shell expansion:
+- Right: `-p 'user/plugins/*/tests/'` — ygrep receives the glob and matches internally
+- Wrong: `-p user/plugins/*/tests/` — shell expands into multiple args, causes errors
 
 ## Output Format
 

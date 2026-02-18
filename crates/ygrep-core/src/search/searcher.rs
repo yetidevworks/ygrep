@@ -212,9 +212,7 @@ impl Searcher {
 
         if let Some(ref paths) = filters.paths {
             result.hits.retain(|hit| {
-                paths
-                    .iter()
-                    .any(|p| hit.path.starts_with(p) || hit.path.contains(p))
+                paths.iter().any(|p| path_matches(p, &hit.path))
             });
         }
 
@@ -502,6 +500,60 @@ fn create_regex_snippet(
     (snippet, start, line_count, first_match)
 }
 
+/// Match a path against a pattern, supporting glob wildcards.
+///
+/// - If the pattern contains `*` or `?`, it is treated as a glob:
+///   - `*` matches any characters except `/`
+///   - `**` matches any characters including `/`
+///   - `?` matches any single character except `/`
+/// - Otherwise, falls back to prefix/contains matching.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    if pattern.contains('*') || pattern.contains('?') {
+        glob_to_regex(pattern)
+            .map(|re| re.is_match(path))
+            .unwrap_or(false)
+    } else {
+        path.starts_with(pattern) || path.contains(pattern)
+    }
+}
+
+/// Convert a glob pattern to a compiled regex.
+fn glob_to_regex(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    let mut re = String::with_capacity(pattern.len() * 2);
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // ** matches anything including /
+            re.push_str(".*");
+            i += 2;
+            // Skip trailing / after **
+            if i < chars.len() && chars[i] == '/' {
+                re.push_str("/?");
+                i += 1;
+            }
+        } else if chars[i] == '*' {
+            // * matches anything except /
+            re.push_str("[^/]*");
+            i += 1;
+        } else if chars[i] == '?' {
+            re.push_str("[^/]");
+            i += 1;
+        } else {
+            // Escape regex metacharacters
+            let ch = chars[i];
+            if ".+(){}[]^$|\\".contains(ch) {
+                re.push('\\');
+            }
+            re.push(ch);
+            i += 1;
+        }
+    }
+
+    RegexBuilder::new(&re).case_insensitive(true).build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +770,79 @@ mod tests {
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "lib/utils.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_matches_glob() {
+        // Plain prefix/contains (no wildcards)
+        assert!(path_matches("src/", "src/main.rs"));
+        assert!(path_matches("src/", "project/src/main.rs"));
+        assert!(!path_matches("lib/", "src/main.rs"));
+
+        // Single * matches within one path segment
+        assert!(path_matches("src/*/tests/", "src/api/tests/foo.rs"));
+        assert!(path_matches("src/*/tests/", "src/core/tests/bar.rs"));
+        assert!(!path_matches("src/*/tests/", "src/a/b/tests/foo.rs"));
+
+        // ** matches across segments
+        assert!(path_matches("**/tests/", "src/api/tests/foo.rs"));
+        assert!(path_matches("**/tests/", "deep/nested/tests/bar.rs"));
+        assert!(path_matches("src/**/test.rs", "src/a/b/c/test.rs"));
+
+        // ? matches single character
+        assert!(path_matches("src/?.rs", "src/a.rs"));
+        assert!(!path_matches("src/?.rs", "src/ab.rs"));
+
+        // Glob patterns are case-insensitive
+        assert!(path_matches("SRC/*/tests/", "src/api/tests/foo.rs"));
+        // Plain prefix matching is case-sensitive (existing behavior)
+        assert!(!path_matches("SRC/", "src/main.rs"));
+    }
+
+    #[test]
+    fn test_search_path_filter_glob() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "user/plugins/impersonate/tests/test.php",
+            "class FooTest extends Plugin {}",
+            "php",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "user/plugins/impersonate/src/plugin.php",
+            "class Plugin extends Base {}",
+            "php",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test3",
+            "user/plugins/auth/tests/test.php",
+            "class BarTest extends Plugin {}",
+            "php",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Glob pattern should match only files in tests/ directories
+        let filters = SearchFilters {
+            extensions: None,
+            paths: Some(vec!["user/plugins/*/tests/".to_string()]),
+        };
+        let result =
+            searcher.search_filtered("extends Plugin", None, filters, false, false, None, None)?;
+
+        assert_eq!(result.hits.len(), 2);
+        assert!(result.hits.iter().all(|h| h.path.contains("/tests/")));
 
         Ok(())
     }
