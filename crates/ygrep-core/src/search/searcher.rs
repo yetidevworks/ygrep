@@ -46,8 +46,12 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Build query parser for content field
-        let query_parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
+        // Build query parser for content and filepath fields
+        let mut query_fields = vec![self.fields.content];
+        if let Some(fp) = self.fields.filepath {
+            query_fields.push(fp);
+        }
+        let query_parser = QueryParser::for_index(&self.index, query_fields);
 
         // Extract alphanumeric words for Tantivy query (it can't search special chars)
         // Then we'll post-filter for exact literal match
@@ -110,13 +114,19 @@ impl Searcher {
                 content.to_lowercase()
             };
 
+            // Check if path matches the query (filename search)
+            let path_normalized = path.to_lowercase();
+            let path_match = query_terms
+                .iter()
+                .all(|term| path_normalized.contains(term));
+
             // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
             let exact_match = content_normalized.contains(&query_normalized);
             let and_match = is_multi_word
                 && query_terms
                     .iter()
                     .all(|term| content_normalized.contains(term));
-            if !exact_match && !and_match {
+            if !exact_match && !and_match && !path_match {
                 continue;
             }
 
@@ -127,9 +137,19 @@ impl Searcher {
                 0.0
             };
 
-            // Create snippet showing lines that match the query
+            // For path-only matches (no content match), show beginning of file
+            let is_content_match = exact_match || and_match;
+
             let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
-                create_relevant_snippet(&content, query, 10, context_before, context_after);
+                if is_content_match {
+                    create_relevant_snippet(&content, query, 10, context_before, context_after)
+                } else {
+                    // Path-only match: show first few lines
+                    let lines: Vec<&str> = content.lines().take(10).collect();
+                    let snippet = lines.join("\n");
+                    let line_count = lines.len();
+                    (snippet, 0, line_count, 0)
+                };
 
             // Adjust line numbers to reflect where the snippet is in the file
             let actual_line_start = line_start + snippet_offset as u64;
@@ -258,8 +278,12 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Build query parser for content field
-        let query_parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
+        // Build query parser for content and filepath fields
+        let mut query_fields = vec![self.fields.content];
+        if let Some(fp) = self.fields.filepath {
+            query_fields.push(fp);
+        }
+        let query_parser = QueryParser::for_index(&self.index, query_fields);
 
         // Extract alphanumeric words from the regex pattern for Tantivy pre-filter
         // This is a rough heuristic - we extract literal parts from the regex
@@ -584,6 +608,7 @@ mod tests {
             .add_document(doc!(
                 fields.doc_id => doc_id,
                 fields.path => path,
+                fields.filepath.unwrap() => path,
                 fields.workspace => "/test",
                 fields.content => content,
                 fields.mtime => 0u64,
@@ -896,6 +921,7 @@ mod tests {
             .add_document(doc!(
                 fields.doc_id => "full-doc",
                 fields.path => "src/main.rs",
+                fields.filepath.unwrap() => "src/main.rs",
                 fields.workspace => "/test",
                 fields.content => content,
                 fields.mtime => 0u64,
@@ -912,6 +938,7 @@ mod tests {
             .add_document(doc!(
                 fields.doc_id => "chunk-1",
                 fields.path => "src/main.rs",
+                fields.filepath.unwrap() => "src/main.rs",
                 fields.workspace => "/test",
                 fields.content => content,
                 fields.mtime => 0u64,
@@ -937,6 +964,41 @@ mod tests {
         let result = searcher.search_regex("hello", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filename_search() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        // Add a file where content does NOT contain the search term,
+        // but the filename does
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/commands/dashboard.rs",
+            "fn run() {\n    println!(\"starting...\");\n}",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "src/main.rs",
+            "fn main() { hello(); }",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Search for "dashboard" - should find via filename even though content doesn't contain it
+        let result = searcher.search("dashboard", None, false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/commands/dashboard.rs");
 
         Ok(())
     }

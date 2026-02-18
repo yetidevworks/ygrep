@@ -8,6 +8,7 @@
 //! - Configuration management
 
 pub mod config;
+pub mod dashboard;
 #[cfg(feature = "embeddings")]
 pub mod embeddings;
 pub mod error;
@@ -468,6 +469,17 @@ impl Workspace {
     /// Incremental index: only re-index files that changed since last index
     #[allow(unused_variables)]
     pub fn index_incremental_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
+        self.index_incremental_impl(with_embeddings, false)
+    }
+
+    /// Incremental index without progress output (for dashboard/background use)
+    #[allow(unused_variables)]
+    pub fn index_incremental_quiet(&self, with_embeddings: bool) -> Result<IndexStats> {
+        self.index_incremental_impl(with_embeddings, true)
+    }
+
+    #[allow(unused_variables)]
+    fn index_incremental_impl(&self, with_embeddings: bool, quiet: bool) -> Result<IndexStats> {
         // Build map of currently indexed files
         let mut indexed_map = self.build_indexed_files_map();
 
@@ -517,7 +529,7 @@ impl Workspace {
             match indexer.index_file(&entry.path) {
                 Ok((doc_id, content)) => {
                     indexed += 1;
-                    if indexed % 500 == 0 {
+                    if !quiet && indexed % 500 == 0 {
                         eprint!("\r  Indexed {} files...          ", indexed);
                     }
 
@@ -541,7 +553,7 @@ impl Workspace {
             }
         }
 
-        if indexed > 0 {
+        if !quiet && indexed > 0 {
             eprintln!("\r  Indexed {} files.              ", indexed);
         }
 
@@ -586,14 +598,20 @@ impl Workspace {
                 use indicatif::{ProgressBar, ProgressStyle};
 
                 let total_docs = filtered_batch.len() as u64;
-                eprintln!(
-                    "Building semantic index for {} changed documents...",
-                    total_docs
-                );
+                if !quiet {
+                    eprintln!(
+                        "Building semantic index for {} changed documents...",
+                        total_docs
+                    );
+                }
 
                 self.embedding_model.preload()?;
 
-                let pb = ProgressBar::new(total_docs);
+                let pb = if quiet {
+                    ProgressBar::hidden()
+                } else {
+                    ProgressBar::new(total_docs)
+                };
                 pb.set_style(
                     ProgressStyle::default_bar()
                         .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
@@ -638,13 +656,15 @@ impl Workspace {
                 }
 
                 pb.finish_and_clear();
-                eprintln!("  Indexed {} documents.", total_embedded);
+                if !quiet {
+                    eprintln!("  Indexed {} documents.", total_embedded);
+                }
                 self.vector_index.save()?;
             }
         }
 
         #[cfg(not(feature = "embeddings"))]
-        if with_embeddings {
+        if !quiet && with_embeddings {
             eprintln!("Warning: Semantic search feature not available in this build.");
         }
 

@@ -1,3 +1,4 @@
+pub mod dashboard;
 pub mod index;
 pub mod indexes;
 pub mod install;

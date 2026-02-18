@@ -159,6 +159,9 @@ pub enum Commands {
     /// Manage stored indexes (list, clean, remove)
     #[command(subcommand)]
     Indexes(IndexesCommand),
+
+    /// Interactive dashboard for managing all indexes and watchers
+    Dashboard,
 }
 
 #[derive(Subcommand, Clone)]
@@ -283,6 +286,9 @@ fn main() -> Result<()> {
             IndexesCommand::Clean => commands::indexes::clean()?,
             IndexesCommand::Remove { identifier } => commands::indexes::remove(&identifier)?,
         },
+        Some(Commands::Dashboard) => {
+            commands::dashboard::run()?;
+        }
         None => {
             // Default: treat as search if query provided
             if let Some(query) = cli.query {

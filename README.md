@@ -9,9 +9,11 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 - **Code-aware tokenizer** - Preserves `$`, `@`, `#` as part of tokens (essential for PHP, Shell, Python, etc.)
 - **Subtoken matching** - camelCase and snake_case identifiers are split into subtokens, so `send` also finds `sendCampaign`, `send_email`, etc.
 - **Multi-word AND queries** - `"campaign sending"` returns results where all terms appear in the file, not just exact adjacent phrases
+- **Filename search** - Search matches file paths too, not just content
 - **Fast indexed search** - Tantivy-powered BM25 ranking, instant results
 - **Incremental indexing** - Only re-indexes changed files based on mtime; no-op runs complete in ~10ms
 - **Non-blocking AI hooks** - Background indexing on session start, never slows down your AI tool
+- **Interactive dashboard** - TUI for managing indexes, toggling watchers, and viewing live activity
 - **File watching** - Incremental index updates on file changes
 - **Optional semantic search** - HNSW vector index with local semantic model (all-MiniLM-L6-v2)
 - **Symlink handling** - Follows symlinks with cycle detection
@@ -156,6 +158,31 @@ Example output:
 c4f2ba4712ed98e7  23.7 MB  [semantic]
   /path/to/another-project
 ```
+
+### Dashboard
+
+Interactive TUI for monitoring and managing all your indexes in one place:
+
+```bash
+ygrep dashboard
+```
+
+The dashboard shows a table of all indexes with workspace path, size, file count, last indexed time, and watch state. Below the table is a live activity log showing real-time file indexing events.
+
+**Key bindings:**
+
+| Key | Action |
+|-----|--------|
+| `j/k` or `↑/↓` | Navigate entries |
+| `w` | Toggle watch (off/active) |
+| `r` | Re-index workspace |
+| `d` | Delete index (with confirmation) |
+| `s` | Cycle sort column (Name, Size, Files, Indexed, Watch) |
+| `S` | Toggle sort order (ascending/descending) |
+| `/` | Filter by workspace name |
+| `Tab` | Switch focus between table and activity log |
+| `?` | Help overlay |
+| `q` | Quit |
 
 ### Semantic Search (Optional)
 
@@ -326,7 +353,7 @@ brew upgrade ygrep
 # Indexes auto-rebuild when schema changes are detected
 ygrep index
 
-# If upgrading to v2.0.5+, rebuild is required for subtoken support
+# If upgrading to v3.0.6+, rebuild is required for filename search
 ygrep index --rebuild
 ```
 

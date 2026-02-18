@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Get the indexes directory
-fn get_indexes_dir() -> Result<PathBuf> {
+pub fn get_indexes_dir() -> Result<PathBuf> {
     // Honor XDG_DATA_HOME if set (even on macOS)
     if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
         if !xdg_data.is_empty() {
@@ -18,20 +18,20 @@ fn get_indexes_dir() -> Result<PathBuf> {
 }
 
 /// Index metadata stored in each index directory
-#[derive(Debug)]
-struct IndexInfo {
-    hash: String,
-    path: PathBuf,
-    workspace: Option<String>,
-    size_bytes: u64,
-    semantic: Option<bool>,
-    files_indexed: Option<u64>,
-    indexed_at: Option<DateTime<Utc>>,
-    orphaned: bool,
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub hash: String,
+    pub path: PathBuf,
+    pub workspace: Option<String>,
+    pub size_bytes: u64,
+    pub semantic: Option<bool>,
+    pub files_indexed: Option<u64>,
+    pub indexed_at: Option<DateTime<Utc>>,
+    pub orphaned: bool,
 }
 
 /// Read index info from a directory
-fn read_index_info(hash: &str, index_path: &PathBuf) -> Result<IndexInfo> {
+pub fn read_index_info(hash: &str, index_path: &PathBuf) -> Result<IndexInfo> {
     let workspace_meta_path = index_path.join("workspace.json");
     let (workspace, semantic, files_indexed, indexed_at) = if workspace_meta_path.exists() {
         let json = fs::read_to_string(&workspace_meta_path)
@@ -80,7 +80,7 @@ fn read_index_info(hash: &str, index_path: &PathBuf) -> Result<IndexInfo> {
 }
 
 /// Collect all valid indexes
-fn collect_indexes() -> Result<Vec<IndexInfo>> {
+pub fn collect_indexes() -> Result<Vec<IndexInfo>> {
     let indexes_dir = get_indexes_dir()?;
 
     if !indexes_dir.exists() {
@@ -108,7 +108,7 @@ fn collect_indexes() -> Result<Vec<IndexInfo>> {
 }
 
 /// Calculate directory size recursively
-fn dir_size(path: &PathBuf) -> Result<u64> {
+pub fn dir_size(path: &PathBuf) -> Result<u64> {
     let mut size = 0;
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
@@ -125,7 +125,7 @@ fn dir_size(path: &PathBuf) -> Result<u64> {
 }
 
 /// Format bytes as human readable (compact: "1.9G", "147M", "690K")
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -142,7 +142,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Format a relative time string like "2h ago", "3d ago", "5mo ago"
-fn format_relative_time(dt: &DateTime<Utc>) -> String {
+pub fn format_relative_time(dt: &DateTime<Utc>) -> String {
     let now = Utc::now();
     let duration = now.signed_duration_since(dt);
 
@@ -166,7 +166,7 @@ fn format_relative_time(dt: &DateTime<Utc>) -> String {
 }
 
 /// Shorten path by replacing home dir with ~
-fn shorten_path(path: &str) -> String {
+pub fn shorten_path(path: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Some(home_str) = home.to_str() {
             if path.starts_with(home_str) {

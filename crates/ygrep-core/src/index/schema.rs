@@ -5,7 +5,7 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerManager};
 
 /// Schema version - increment when schema changes require reindexing
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Name of our custom code tokenizer
 pub const CODE_TOKENIZER: &str = "code";
@@ -178,6 +178,7 @@ pub mod fields {
     pub const LINE_END: &str = "line_end";
     pub const CHUNK_ID: &str = "chunk_id";
     pub const PARENT_DOC: &str = "parent_doc";
+    pub const FILEPATH: &str = "filepath";
 }
 
 /// Build the Tantivy schema for document indexing
@@ -214,6 +215,16 @@ pub fn build_document_schema() -> Schema {
     schema_builder.add_u64_field(fields::SIZE, FAST | STORED);
     schema_builder.add_text_field(fields::EXTENSION, STRING | STORED);
 
+    // Searchable file path (uses code tokenizer so path segments are searchable)
+    let filepath_options = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(CODE_TOKENIZER)
+                .set_index_option(IndexRecordOption::Basic),
+        )
+        .set_stored();
+    schema_builder.add_text_field(fields::FILEPATH, filepath_options);
+
     // Content for full-text search
     schema_builder.add_text_field(fields::CONTENT, text_options);
 
@@ -233,6 +244,7 @@ pub fn build_document_schema() -> Schema {
 pub struct SchemaFields {
     pub doc_id: tantivy::schema::Field,
     pub path: tantivy::schema::Field,
+    pub filepath: Option<tantivy::schema::Field>,
     pub workspace: tantivy::schema::Field,
     pub content: tantivy::schema::Field,
     pub mtime: tantivy::schema::Field,
@@ -249,6 +261,7 @@ impl SchemaFields {
         Self {
             doc_id: schema.get_field(fields::DOC_ID).unwrap(),
             path: schema.get_field(fields::PATH).unwrap(),
+            filepath: schema.get_field(fields::FILEPATH).ok(),
             workspace: schema.get_field(fields::WORKSPACE).unwrap(),
             content: schema.get_field(fields::CONTENT).unwrap(),
             mtime: schema.get_field(fields::MTIME).unwrap(),

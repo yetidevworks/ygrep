@@ -32,6 +32,10 @@ tracing-subscriber = { workspace = true }
 # CLI
 clap = { workspace = true }
 
+# TUI
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
 # Utils
 dirs = { workspace = true }
 chrono = { workspace = true }

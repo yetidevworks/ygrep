@@ -126,6 +126,9 @@ impl Indexer {
         let mut doc = TantivyDocument::new();
         doc.add_text(self.fields.doc_id, &doc_id);
         doc.add_text(self.fields.path, &rel_path);
+        if let Some(filepath) = self.fields.filepath {
+            doc.add_text(filepath, &rel_path);
+        }
         doc.add_text(self.fields.workspace, &self.workspace_root);
         doc.add_text(self.fields.content, &content);
         doc.add_u64(self.fields.mtime, mtime);
@@ -209,6 +212,9 @@ impl Indexer {
             let mut doc = TantivyDocument::new();
             doc.add_text(self.fields.doc_id, &chunk_id);
             doc.add_text(self.fields.path, path);
+            if let Some(filepath) = self.fields.filepath {
+                doc.add_text(filepath, path);
+            }
             doc.add_text(self.fields.workspace, &self.workspace_root);
             doc.add_text(self.fields.content, &chunk_content);
             doc.add_u64(self.fields.mtime, 0);

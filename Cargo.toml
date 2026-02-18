@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.5"
+version = "3.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yetidevworks/ygrep"
@@ -47,6 +47,10 @@ ignore = "0.4"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.17"
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Utils
 parking_lot = "0.12"

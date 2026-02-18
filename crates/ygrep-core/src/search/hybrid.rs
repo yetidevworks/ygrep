@@ -100,7 +100,11 @@ impl HybridSearcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
+        let mut query_fields = vec![self.fields.content];
+        if let Some(fp) = self.fields.filepath {
+            query_fields.push(fp);
+        }
+        let query_parser = QueryParser::for_index(&self.index, query_fields);
 
         // Wrap query in quotes for literal phrase matching (like grep)
         let quoted_query = format!("\"{}\"", query.replace('"', "\\\""));

@@ -146,13 +146,18 @@ impl FileWatcher {
         Ok(())
     }
 
-    /// Stop watching
+    /// Stop watching all paths (root + symlink targets)
     pub fn stop(&mut self) -> Result<()> {
-        self.debouncer
-            .unwatch(&self.root)
-            .map_err(|e| YgrepError::WatchError(e.to_string()))?;
-
-        tracing::info!("Stopped watching: {}", self.root.display());
+        for path in &self.watched_paths {
+            match self.debouncer.unwatch(path) {
+                Ok(()) => {
+                    tracing::info!("Stopped watching: {}", path.display());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to unwatch {}: {}", path.display(), e);
+                }
+            }
+        }
         Ok(())
     }
 

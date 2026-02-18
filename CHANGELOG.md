@@ -5,6 +5,21 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-02-18
+
+### Added
+- **Dashboard** (`ygrep dashboard`) - Interactive TUI for managing all indexes at a glance: toggle watchers, re-index, delete, view real-time activity log with file change rates
+  - Column sorting (`s` cycles columns, `S` toggles asc/desc) with name tiebreaker
+  - Live filter (`/` to search by workspace name, `Esc` to clear)
+  - Default sort: active watchers first, then alphabetical
+- **Filename search** - Search results now include files matching by filename, not just content. Searching for `dashboard` now returns `src/commands/dashboard.rs` even if the file content doesn't contain that word
+
+### Fixed
+- Dashboard re-index and watch no longer bleed "Indexed N files" text into the TUI — indexing output is suppressed when running from the dashboard
+
+### Breaking
+- Index schema changed (v3 to v4) for filename search support - requires `ygrep index --rebuild`
+
 ## [3.0.5] - 2026-02-17
 
 ### Fixed
@@ -213,6 +228,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.0.6]: https://github.com/yetidevworks/ygrep/compare/v3.0.5...v3.0.6
 [3.0.5]: https://github.com/yetidevworks/ygrep/compare/v3.0.4...v3.0.5
 [3.0.4]: https://github.com/yetidevworks/ygrep/compare/v3.0.3...v3.0.4
 [3.0.3]: https://github.com/yetidevworks/ygrep/compare/v3.0.2...v3.0.3
