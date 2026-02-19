@@ -5,6 +5,12 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.1] - 2026-02-18
+
+### Fixed
+- Dashboard auto-watch threshold increased from 1 hour to 24 hours — workspaces indexed in the last day now auto-watch on startup
+- Sleeping workspace polling is now staggered (30-second intervals per workspace) to avoid all workspaces polling the filesystem on the same tick
+
 ## [3.1.0] - 2026-02-18
 
 ### Added
@@ -228,6 +234,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.1.1]: https://github.com/yetidevworks/ygrep/compare/v3.1.0...v3.1.1
+[3.1.0]: https://github.com/yetidevworks/ygrep/compare/v3.0.5...v3.1.0
 [3.0.6]: https://github.com/yetidevworks/ygrep/compare/v3.0.5...v3.0.6
 [3.0.5]: https://github.com/yetidevworks/ygrep/compare/v3.0.4...v3.0.5
 [3.0.4]: https://github.com/yetidevworks/ygrep/compare/v3.0.3...v3.0.4

@@ -14,11 +14,11 @@ use super::types::*;
 /// How long to wait with no events before transitioning Active -> Sleeping
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
 
-/// How often to poll for changes when sleeping (used in tick interval)
-const _SLEEP_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How often to poll each sleeping workspace for file changes
+const SLEEP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How recently an index must have been updated to auto-watch on startup
-const AUTO_WATCH_THRESHOLD: Duration = Duration::from_secs(60 * 60); // 1 hour
+const AUTO_WATCH_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// Per-workspace watcher state tracked by the manager
 struct WorkspaceState {
@@ -35,6 +35,8 @@ struct WorkspaceState {
     watcher_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// When the index was last updated (from metadata)
     indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When we last polled this workspace for changes while sleeping
+    last_sleep_poll: Option<Instant>,
 }
 
 /// Multi-workspace watch manager
@@ -105,6 +107,7 @@ impl WatchManager {
             watcher_handle: None,
             watcher_stop_tx: None,
             indexed_at,
+            last_sleep_poll: None,
         };
 
         self.workspaces.insert(hash, state);
@@ -233,6 +236,7 @@ impl WatchManager {
                 if let Some(ws) = self.workspaces.get_mut(hash) {
                     ws.watch_state = WatchState::Off;
                     ws.last_activity = None;
+                    ws.last_sleep_poll = None;
                 }
                 let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
                     hash: hash.to_string(),
@@ -352,10 +356,14 @@ impl WatchManager {
             }
         }
 
-        for hash in to_sleep {
-            self.stop_watcher(&hash);
-            if let Some(ws) = self.workspaces.get_mut(&hash) {
+        for (i, hash) in to_sleep.iter().enumerate() {
+            self.stop_watcher(hash);
+            if let Some(ws) = self.workspaces.get_mut(hash) {
                 ws.watch_state = WatchState::Sleeping;
+                // Stagger initial polls: each workspace gets an offset so they don't all
+                // poll on the same tick. Pretend we polled (interval - offset) ago.
+                let stagger = Duration::from_secs((i as u64 * 5) % SLEEP_POLL_INTERVAL.as_secs());
+                ws.last_sleep_poll = Some(Instant::now() - SLEEP_POLL_INTERVAL + stagger);
             }
             let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
                 hash: hash.clone(),
@@ -364,16 +372,29 @@ impl WatchManager {
         }
     }
 
-    /// Poll sleeping workspaces for changes
+    /// Poll sleeping workspaces for changes, respecting per-workspace poll interval
     async fn poll_sleeping(&mut self) {
+        let now = Instant::now();
         let mut to_wake = Vec::new();
+        let mut polled = Vec::new();
 
         for (hash, ws) in &self.workspaces {
             if ws.watch_state != WatchState::Sleeping {
                 continue;
             }
 
-            // Check if workspace root mtime is newer than indexed_at
+            // Only poll if enough time has passed since last poll
+            let should_poll = match ws.last_sleep_poll {
+                Some(last) => now.duration_since(last) >= SLEEP_POLL_INTERVAL,
+                None => true, // Never polled yet, poll now
+            };
+
+            if !should_poll {
+                continue;
+            }
+
+            polled.push(hash.clone());
+
             if let Some(indexed_at) = ws.indexed_at {
                 if has_recent_changes(&ws.workspace_path, indexed_at) {
                     to_wake.push(hash.clone());
@@ -381,10 +402,18 @@ impl WatchManager {
             }
         }
 
+        // Update last_sleep_poll for all workspaces we checked
+        for hash in &polled {
+            if let Some(ws) = self.workspaces.get_mut(hash) {
+                ws.last_sleep_poll = Some(now);
+            }
+        }
+
         for hash in to_wake {
             if let Some(ws) = self.workspaces.get_mut(&hash) {
                 ws.watch_state = WatchState::Active;
                 ws.last_activity = Some(Instant::now());
+                ws.last_sleep_poll = None;
             }
             self.start_watcher(&hash);
             let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
@@ -402,17 +431,51 @@ impl WatchManager {
     }
 }
 
-/// Check if a workspace has changes newer than the indexed_at timestamp
+/// Check if a workspace has changes newer than the indexed_at timestamp.
+/// Walks the directory tree (up to a cap) looking for any file modified after indexed_at.
 fn has_recent_changes(workspace_path: &Path, indexed_at: chrono::DateTime<chrono::Utc>) -> bool {
     let indexed_secs = indexed_at.timestamp() as u64;
 
-    // Check workspace root directory mtime
-    if let Ok(meta) = std::fs::metadata(workspace_path) {
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                if dur.as_secs() > indexed_secs {
-                    return true;
+    let check_mtime = |path: &Path| -> bool {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    return dur.as_secs() > indexed_secs;
                 }
+            }
+        }
+        false
+    };
+
+    // Walk directory tree, checking file mtimes. Cap at 2000 entries to stay fast.
+    let mut checked = 0;
+    let mut dirs = vec![workspace_path.to_path_buf()];
+
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            checked += 1;
+            if checked > 2000 {
+                return false;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Skip hidden dirs and common non-source dirs
+            if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
+                continue;
+            }
+
+            if path.is_dir() {
+                dirs.push(path);
+            } else if is_indexable(&path) && check_mtime(&path) {
+                return true;
             }
         }
     }

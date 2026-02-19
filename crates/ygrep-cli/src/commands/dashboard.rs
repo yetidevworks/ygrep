@@ -988,7 +988,7 @@ pub fn run() -> Result<()> {
     for entry in &mut app.entries {
         if let Some(indexed_at) = entry.indexed_at {
             let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 3600 && entry.workspace_path.exists() {
+            if age.num_seconds() < 86400 && entry.workspace_path.exists() {
                 entry.watch_state = WatchState::Active;
             }
         }
@@ -996,7 +996,7 @@ pub fn run() -> Result<()> {
     for entry in &mut app.all_entries {
         if let Some(indexed_at) = entry.indexed_at {
             let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 3600 && entry.workspace_path.exists() {
+            if age.num_seconds() < 86400 && entry.workspace_path.exists() {
                 entry.watch_state = WatchState::Active;
             }
         }
