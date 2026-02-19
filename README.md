@@ -2,6 +2,8 @@
 
 A fast, local, indexed code search tool optimized for AI coding assistants. Written in Rust using Tantivy for full-text indexing.
 
+![ygrep screenshot](ygrep-screenshot.png)
+
 ## Features
 
 - **Literal text matching** - Works like grep by default, special characters included (`$variable`, `{% block`, `->get(`, `@decorator`)
