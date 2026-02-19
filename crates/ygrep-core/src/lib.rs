@@ -36,6 +36,9 @@ use std::sync::Arc;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_DIM: usize = 384;
 
+/// Sender for routing log messages (e.g. to dashboard TUI instead of stderr)
+pub type LogSender = std::sync::mpsc::Sender<String>;
+
 /// High-level workspace for indexing and searching
 pub struct Workspace {
     /// Workspace root directory
@@ -46,6 +49,8 @@ pub struct Workspace {
     index: Index,
     /// Index directory path
     index_path: std::path::PathBuf,
+    /// Optional log channel — messages go here instead of stderr when set
+    log_tx: Option<LogSender>,
     /// Vector index for semantic search
     #[cfg(feature = "embeddings")]
     vector_index: Arc<VectorIndex>,
@@ -144,7 +149,7 @@ impl Workspace {
             match Index::open_in_dir(&index_path) {
                 Ok(idx) => idx,
                 Err(e) if create => {
-                    eprintln!("Warning: corrupt index, recreating: {}", e);
+                    // Corrupt index detected, silently recreate
                     // Remove corrupted index and create fresh
                     std::fs::remove_dir_all(&index_path)?;
                     std::fs::create_dir_all(&index_path)?;
@@ -170,8 +175,8 @@ impl Workspace {
             let vector_index = if VectorIndex::exists(&vector_path) {
                 match VectorIndex::load(vector_path.clone()) {
                     Ok(vi) => Arc::new(vi),
-                    Err(e) => {
-                        eprintln!("Warning: corrupt vector index, recreating: {}", e);
+                    Err(_e) => {
+                        // Corrupt vector index detected, silently recreate
                         // Remove corrupted vector files and create fresh
                         if vector_path.exists() {
                             let _ = std::fs::remove_dir_all(&vector_path);
@@ -197,6 +202,7 @@ impl Workspace {
             config,
             index,
             index_path,
+            log_tx: None,
             #[cfg(feature = "embeddings")]
             vector_index,
             #[cfg(feature = "embeddings")]
@@ -204,6 +210,31 @@ impl Workspace {
             #[cfg(feature = "embeddings")]
             embedding_cache,
         })
+    }
+
+    /// Set a log channel — all progress/warning output goes here instead of stderr
+    pub fn set_log_tx(&mut self, tx: LogSender) {
+        self.log_tx = Some(tx);
+        #[cfg(feature = "embeddings")]
+        self.embedding_model.set_quiet(true);
+    }
+
+    /// Route a message to the log channel or stderr
+    fn log(&self, msg: impl std::fmt::Display) {
+        if let Some(ref tx) = self.log_tx {
+            let _ = tx.send(msg.to_string());
+        } else {
+            eprintln!("{}", msg);
+        }
+    }
+
+    /// Route a partial-line message (no newline) to the log channel or stderr
+    fn log_inline(&self, msg: impl std::fmt::Display) {
+        if let Some(ref tx) = self.log_tx {
+            let _ = tx.send(msg.to_string());
+        } else {
+            eprint!("{}", msg);
+        }
     }
 
     /// Index all files in the workspace (text-only by default, fast)
@@ -240,7 +271,7 @@ impl Workspace {
                 Ok((doc_id, content)) => {
                     indexed += 1;
                     if indexed % 500 == 0 {
-                        eprint!("\r  Indexed {} files...          ", indexed);
+                        self.log_inline(format!("\r  Indexed {} files...          ", indexed));
                     }
 
                     // Collect for embedding if enabled (reuse content from indexer)
@@ -264,7 +295,7 @@ impl Workspace {
             }
         }
 
-        eprintln!("\r  Indexed {} files.              ", indexed);
+        self.log(format!("\r  Indexed {} files.              ", indexed));
         indexer.commit()?;
 
         // Track embedded count
@@ -284,17 +315,24 @@ impl Workspace {
                 .collect();
 
             if filtered_batch.is_empty() {
-                eprintln!("No documents suitable for semantic indexing.");
+                self.log("No documents suitable for semantic indexing.");
             } else {
                 use indicatif::{ProgressBar, ProgressStyle};
 
                 let total_docs = filtered_batch.len() as u64;
-                eprintln!("Building semantic index for {} documents...", total_docs);
+                self.log(format!(
+                    "Building semantic index for {} documents...",
+                    total_docs
+                ));
 
                 // Pre-load the semantic model before starting progress bar
                 self.embedding_model.preload()?;
 
-                let pb = ProgressBar::new(total_docs);
+                let pb = if self.log_tx.is_some() {
+                    ProgressBar::hidden()
+                } else {
+                    ProgressBar::new(total_docs)
+                };
                 pb.set_style(
                     ProgressStyle::default_bar()
                         .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
@@ -341,14 +379,14 @@ impl Workspace {
                 }
 
                 pb.finish_and_clear();
-                eprintln!("  Indexed {} documents.", total_embedded);
+                self.log(format!("  Indexed {} documents.", total_embedded));
                 self.vector_index.save()?;
             }
         }
 
         #[cfg(not(feature = "embeddings"))]
         if with_embeddings {
-            eprintln!("Warning: Semantic search feature not available in this build.");
+            self.log("Warning: Semantic search feature not available in this build.");
         }
 
         let stats = walker.stats();
@@ -469,17 +507,6 @@ impl Workspace {
     /// Incremental index: only re-index files that changed since last index
     #[allow(unused_variables)]
     pub fn index_incremental_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
-        self.index_incremental_impl(with_embeddings, false)
-    }
-
-    /// Incremental index without progress output (for dashboard/background use)
-    #[allow(unused_variables)]
-    pub fn index_incremental_quiet(&self, with_embeddings: bool) -> Result<IndexStats> {
-        self.index_incremental_impl(with_embeddings, true)
-    }
-
-    #[allow(unused_variables)]
-    fn index_incremental_impl(&self, with_embeddings: bool, quiet: bool) -> Result<IndexStats> {
         // Build map of currently indexed files
         let mut indexed_map = self.build_indexed_files_map();
 
@@ -529,8 +556,8 @@ impl Workspace {
             match indexer.index_file(&entry.path) {
                 Ok((doc_id, content)) => {
                     indexed += 1;
-                    if !quiet && indexed % 500 == 0 {
-                        eprint!("\r  Indexed {} files...          ", indexed);
+                    if indexed % 500 == 0 {
+                        self.log_inline(format!("\r  Indexed {} files...          ", indexed));
                     }
 
                     #[cfg(feature = "embeddings")]
@@ -553,8 +580,8 @@ impl Workspace {
             }
         }
 
-        if !quiet && indexed > 0 {
-            eprintln!("\r  Indexed {} files.              ", indexed);
+        if indexed > 0 {
+            self.log(format!("\r  Indexed {} files.              ", indexed));
         }
 
         // Remove files that no longer exist on disk
@@ -598,16 +625,14 @@ impl Workspace {
                 use indicatif::{ProgressBar, ProgressStyle};
 
                 let total_docs = filtered_batch.len() as u64;
-                if !quiet {
-                    eprintln!(
-                        "Building semantic index for {} changed documents...",
-                        total_docs
-                    );
-                }
+                self.log(format!(
+                    "Building semantic index for {} changed documents...",
+                    total_docs
+                ));
 
                 self.embedding_model.preload()?;
 
-                let pb = if quiet {
+                let pb = if self.log_tx.is_some() {
                     ProgressBar::hidden()
                 } else {
                     ProgressBar::new(total_docs)
@@ -656,16 +681,14 @@ impl Workspace {
                 }
 
                 pb.finish_and_clear();
-                if !quiet {
-                    eprintln!("  Indexed {} documents.", total_embedded);
-                }
+                self.log(format!("  Indexed {} documents.", total_embedded));
                 self.vector_index.save()?;
             }
         }
 
         #[cfg(not(feature = "embeddings"))]
-        if !quiet && with_embeddings {
-            eprintln!("Warning: Semantic search feature not available in this build.");
+        if with_embeddings {
+            self.log("Warning: Semantic search feature not available in this build.");
         }
 
         let walk_stats = walker.stats();

@@ -18,7 +18,7 @@ const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
 const SLEEP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How recently an index must have been updated to auto-watch on startup
-const AUTO_WATCH_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const AUTO_WATCH_THRESHOLD: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
 /// Per-workspace watcher state tracked by the manager
 struct WorkspaceState {
@@ -184,8 +184,31 @@ impl WatchManager {
         let file_event_tx = self.file_event_tx.clone();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
+        // Create a log channel so workspace output goes to the TUI
+        let (log_tx, log_rx) = std::sync::mpsc::channel::<String>();
+        let log_hash = hash.to_string();
+        let log_event_tx = self.event_tx.clone();
+
+        // Drain log messages on a blocking thread (std::sync::mpsc::recv is blocking)
+        tokio::task::spawn_blocking(move || {
+            while let Ok(msg) = log_rx.recv() {
+                let _ = log_event_tx.send(ManagerEvent::Log {
+                    hash: log_hash.clone(),
+                    message: msg,
+                });
+            }
+        });
+
         let handle = tokio::spawn(async move {
-            watcher_task(workspace_path, semantic, hash_clone, file_event_tx, stop_rx).await;
+            watcher_task(
+                workspace_path,
+                semantic,
+                hash_clone,
+                file_event_tx,
+                log_tx,
+                stop_rx,
+            )
+            .await;
         });
 
         ws.watcher_handle = Some(handle);
@@ -223,6 +246,7 @@ impl WatchManager {
                 if let Some(ws) = self.workspaces.get_mut(hash) {
                     ws.watch_state = WatchState::Active;
                     ws.last_activity = Some(Instant::now());
+                    ws.indexed_at = Some(chrono::Utc::now());
                 }
                 self.start_watcher(hash);
                 let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
@@ -262,10 +286,27 @@ impl WatchManager {
         });
 
         // Spawn re-index as a blocking task
+        let event_tx2 = event_tx.clone();
         tokio::spawn(async move {
+            // Create a log channel so workspace output goes to the TUI
+            let (log_tx, log_rx) = std::sync::mpsc::channel::<String>();
+            let log_hash = hash_clone.clone();
+            let log_event_tx = event_tx2;
+
+            // Drain log messages on a blocking thread
+            tokio::task::spawn_blocking(move || {
+                while let Ok(msg) = log_rx.recv() {
+                    let _ = log_event_tx.send(ManagerEvent::Log {
+                        hash: log_hash.clone(),
+                        message: msg,
+                    });
+                }
+            });
+
             let result = tokio::task::spawn_blocking(move || {
-                let workspace = Workspace::open(&workspace_path)?;
-                let stats = workspace.index_incremental_quiet(semantic)?;
+                let mut workspace = Workspace::open(&workspace_path)?;
+                workspace.set_log_tx(log_tx);
+                let stats = workspace.index_incremental_with_options(semantic)?;
                 Ok::<_, crate::error::YgrepError>(stats.indexed as u64 + stats.unchanged as u64)
             })
             .await;
@@ -414,6 +455,10 @@ impl WatchManager {
                 ws.watch_state = WatchState::Active;
                 ws.last_activity = Some(Instant::now());
                 ws.last_sleep_poll = None;
+                // Update indexed_at to now — the watcher's initial incremental index will
+                // bring the index up to date. Without this, the stale indexed_at causes
+                // an immediate sleep→wake loop on the next poll.
+                ws.indexed_at = Some(chrono::Utc::now());
             }
             self.start_watcher(&hash);
             let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
@@ -601,17 +646,20 @@ async fn watcher_task(
     semantic: bool,
     hash: String,
     event_tx: mpsc::UnboundedSender<(String, WatchEvent)>,
+    log_tx: crate::LogSender,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Open workspace and create watcher (blocking)
     let result = tokio::task::spawn_blocking({
         let workspace_path = workspace_path.clone();
         move || -> Result<(Workspace, crate::watcher::FileWatcher), String> {
-            let workspace = Workspace::open(&workspace_path).map_err(|e| format!("open: {}", e))?;
+            let mut workspace =
+                Workspace::open(&workspace_path).map_err(|e| format!("open: {}", e))?;
+            workspace.set_log_tx(log_tx);
 
             // Run incremental update first
             let _stats = workspace
-                .index_incremental_quiet(semantic)
+                .index_incremental_with_options(semantic)
                 .map_err(|e| format!("incremental: {}", e))?;
 
             let mut watcher = workspace

@@ -50,6 +50,8 @@ impl Default for ModelType {
 pub struct EmbeddingModel {
     model_type: ModelType,
     model: RwLock<Option<Arc<TextEmbedding>>>,
+    /// When set, suppresses stderr output (e.g. when running inside a TUI)
+    quiet: std::sync::atomic::AtomicBool,
 }
 
 impl EmbeddingModel {
@@ -58,7 +60,14 @@ impl EmbeddingModel {
         Self {
             model_type,
             model: RwLock::new(None),
+            quiet: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Set quiet mode (suppress stderr output)
+    pub fn set_quiet(&self, quiet: bool) {
+        self.quiet
+            .store(quiet, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the embedding dimension
@@ -89,17 +98,23 @@ impl EmbeddingModel {
             return Ok(Arc::clone(model));
         }
 
-        eprint!("  Loading semantic model...");
+        if !self.quiet.load(std::sync::atomic::Ordering::Relaxed) {
+            eprint!("  Loading semantic model...");
+        }
 
         let model = TextEmbedding::try_new(
-            InitOptions::new(self.model_type.to_fastembed()).with_show_download_progress(true),
+            InitOptions::new(self.model_type.to_fastembed()).with_show_download_progress(
+                !self.quiet.load(std::sync::atomic::Ordering::Relaxed),
+            ),
         )
         .map_err(|e| YgrepError::Config(format!("Failed to load semantic model: {}", e)))?;
 
         let model = Arc::new(model);
         *guard = Some(Arc::clone(&model));
 
-        eprintln!(" done");
+        if !self.quiet.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(" done");
+        }
 
         Ok(model)
     }

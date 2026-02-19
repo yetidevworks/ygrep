@@ -106,4 +106,6 @@ pub enum ManagerEvent {
     ReindexCompleted { hash: String, files_indexed: u64 },
     /// Index was removed
     IndexRemoved { hash: String },
+    /// Log message from a workspace operation
+    Log { hash: String, message: String },
 }

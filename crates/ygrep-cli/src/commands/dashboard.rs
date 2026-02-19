@@ -383,6 +383,19 @@ impl App {
                     }
                 }
             }
+            ManagerEvent::Log { hash, message } => {
+                let name = self.workspace_name(&hash);
+                // Strip \r progress prefixes for clean display
+                let msg = message.trim_start_matches('\r').trim();
+                if !msg.is_empty() {
+                    self.activity_log.push_back(ActivityEvent {
+                        timestamp: chrono::Utc::now(),
+                        workspace_name: name,
+                        message: msg.to_string(),
+                        kind: ActivityKind::Indexed,
+                    });
+                }
+            }
         }
     }
 
@@ -988,7 +1001,7 @@ pub fn run() -> Result<()> {
     for entry in &mut app.entries {
         if let Some(indexed_at) = entry.indexed_at {
             let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 86400 && entry.workspace_path.exists() {
+            if age.num_seconds() < 4 * 3600 && entry.workspace_path.exists() {
                 entry.watch_state = WatchState::Active;
             }
         }
@@ -996,7 +1009,7 @@ pub fn run() -> Result<()> {
     for entry in &mut app.all_entries {
         if let Some(indexed_at) = entry.indexed_at {
             let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 86400 && entry.workspace_path.exists() {
+            if age.num_seconds() < 4 * 3600 && entry.workspace_path.exists() {
                 entry.watch_state = WatchState::Active;
             }
         }
