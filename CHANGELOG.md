@@ -5,6 +5,11 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.3] - 2026-02-19
+
+### Added
+- Version number displayed in the dashboard footer (right-aligned, stays in sync with Cargo.toml)
+
 ## [3.1.2] - 2026-02-19
 
 ### Improved
@@ -242,6 +247,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.1.3]: https://github.com/yetidevworks/ygrep/compare/v3.1.2...v3.1.3
+[3.1.2]: https://github.com/yetidevworks/ygrep/compare/v3.1.1...v3.1.2
 [3.1.1]: https://github.com/yetidevworks/ygrep/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/yetidevworks/ygrep/compare/v3.0.5...v3.1.0
 [3.0.6]: https://github.com/yetidevworks/ygrep/compare/v3.0.5...v3.0.6

@@ -835,8 +835,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    let footer = Line::from(spans);
-    frame.render_widget(Paragraph::new(footer), area);
+    let left = Line::from(spans);
+    let version = Line::from(Span::styled(
+        format!("v{} ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let footer_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(version.width() as u16)])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(left), footer_layout[0]);
+    frame.render_widget(Paragraph::new(version), footer_layout[1]);
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
