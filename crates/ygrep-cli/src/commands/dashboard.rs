@@ -843,7 +843,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let footer_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(version.width() as u16)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(version.width() as u16),
+        ])
         .split(area);
 
     frame.render_widget(Paragraph::new(left), footer_layout[0]);
