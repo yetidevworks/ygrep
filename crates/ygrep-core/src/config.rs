@@ -291,12 +291,19 @@ impl Default for OutputConfig {
 }
 
 fn default_data_dir() -> PathBuf {
-    // Honor XDG_DATA_HOME if set (even on macOS)
+    // 1. YGREP_HOME — dedicated override, used as-is
+    if let Ok(ygrep_home) = std::env::var("YGREP_HOME") {
+        if !ygrep_home.is_empty() {
+            return PathBuf::from(ygrep_home);
+        }
+    }
+    // 2. XDG_DATA_HOME/ygrep
     if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
         if !xdg_data.is_empty() {
             return PathBuf::from(xdg_data).join("ygrep");
         }
     }
+    // 3. Platform default
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
         .join("ygrep")

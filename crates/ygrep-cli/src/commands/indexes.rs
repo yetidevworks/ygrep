@@ -1,20 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::PathBuf;
 
-/// Get the indexes directory
+/// Get the indexes directory (delegates to Config for consistent resolution)
 pub fn get_indexes_dir() -> Result<PathBuf> {
-    // Honor XDG_DATA_HOME if set (even on macOS)
-    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
-        if !xdg_data.is_empty() {
-            return Ok(PathBuf::from(xdg_data).join("ygrep").join("indexes"));
-        }
-    }
-    let data_dir = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-        .context("Could not determine data directory")?;
-    Ok(data_dir.join("ygrep").join("indexes"))
+    let config = ygrep_core::Config::load();
+    Ok(config.indexer.data_dir.join("indexes"))
 }
 
 /// Index metadata stored in each index directory

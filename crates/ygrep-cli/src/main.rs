@@ -103,6 +103,10 @@ pub struct Cli {
     /// Lines of context before and after each match
     #[arg(short = 'K', long, global = true)]
     pub context: Option<usize>,
+
+    /// Override data directory (where indexes are stored)
+    #[arg(long, global = true)]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -225,6 +229,11 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Override data directory if --data-dir is set
+    if let Some(ref data_dir) = cli.data_dir {
+        std::env::set_var("YGREP_HOME", data_dir);
+    }
 
     // Determine workspace
     let workspace = cli

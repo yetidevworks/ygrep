@@ -8,7 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.1.3] - 2026-02-19
 
 ### Added
+- `YGREP_HOME` environment variable — dedicated override for data directory, used as-is (no `/ygrep` suffix appended). Takes highest priority in resolution: `YGREP_HOME` → `XDG_DATA_HOME/ygrep` → platform default
+- `--data-dir` global CLI flag — overrides data directory for a single invocation without needing env var wrappers
 - Version number displayed in the dashboard footer (right-aligned, stays in sync with Cargo.toml)
+
+### Fixed
+- `indexes list`, `indexes clean`, `indexes remove`, and `dashboard` now use the same data directory resolution as `index`/`search`/`watch`/`status` — previously these commands had duplicated logic that ignored config file overrides
 
 ## [3.1.2] - 2026-02-19
 
