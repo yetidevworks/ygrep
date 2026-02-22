@@ -5,6 +5,15 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.4] - 2026-02-22
+
+### Added
+- **Auto-detect `.ygrep/` directory** — if a `.ygrep/` directory exists in the workspace root, it is automatically used as the data directory (zero config, no `.ygrep.toml` needed)
+- **Relative `data_dir` in `.ygrep.toml`** — relative paths are now resolved against the workspace root, so `data_dir = ".ygrep"` stores indexes inside the project
+
+### Fixed
+- Permission error hint now suggests `mkdir .ygrep` and `YGREP_HOME` instead of the outdated `XDG_DATA_HOME` workaround
+
 ## [3.1.3] - 2026-02-19
 
 ### Added

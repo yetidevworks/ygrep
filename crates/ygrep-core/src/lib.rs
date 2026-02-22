@@ -90,13 +90,21 @@ impl Workspace {
     fn open_internal(root: &Path, config: Config, create: bool) -> Result<Self> {
         let root = std::fs::canonicalize(root)?;
 
-        // Calculate index directory path based on workspace path hash
+        // Resolve data directory:
+        // 1. Auto-detect: .ygrep/ directory in workspace root
+        // 2. Relative data_dir in config: resolve against workspace root
+        // 3. Absolute data_dir from config: use as-is
+        let local_ygrep = root.join(".ygrep");
+        let data_dir = if local_ygrep.is_dir() {
+            local_ygrep
+        } else if config.indexer.data_dir.is_relative() {
+            root.join(&config.indexer.data_dir)
+        } else {
+            config.indexer.data_dir.clone()
+        };
+
         let workspace_hash = hash_path(&root);
-        let index_path = config
-            .indexer
-            .data_dir
-            .join("indexes")
-            .join(&workspace_hash);
+        let index_path = data_dir.join("indexes").join(&workspace_hash);
 
         // Check if workspace has been properly indexed (workspace.json is written after indexing)
         let workspace_indexed = index_path.join("workspace.json").exists();
@@ -127,8 +135,8 @@ impl Workspace {
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     return Err(YgrepError::Config(format!(
                         "Index directory is not writable: {}\n\n\
-                         Hint: Set XDG_DATA_HOME to a writable location, e.g.:\n  \
-                         export XDG_DATA_HOME=\"$PWD/.ygrep-data\"",
+                         Hint: Create a .ygrep/ directory in your project root for local indexes,\n\
+                         or set YGREP_HOME to a writable location.",
                         index_path.display()
                     )));
                 }
