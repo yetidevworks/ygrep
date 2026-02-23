@@ -3,10 +3,22 @@ use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::PathBuf;
 
-/// Get the indexes directory (delegates to Config for consistent resolution)
+/// Get the indexes directory with the same resolution as Workspace::open_internal():
+/// 1. Auto-detect: .ygrep/ in CWD
+/// 2. Relative data_dir in config: resolve against CWD
+/// 3. Absolute data_dir from config: use as-is
 pub fn get_indexes_dir() -> Result<PathBuf> {
     let config = ygrep_core::Config::load();
-    Ok(config.indexer.data_dir.join("indexes"))
+    let cwd = std::env::current_dir()?;
+    let local_ygrep = cwd.join(".ygrep");
+    let data_dir = if local_ygrep.is_dir() {
+        local_ygrep
+    } else if config.indexer.data_dir.is_relative() {
+        cwd.join(&config.indexer.data_dir)
+    } else {
+        config.indexer.data_dir.clone()
+    };
+    Ok(data_dir.join("indexes"))
 }
 
 /// Index metadata stored in each index directory
