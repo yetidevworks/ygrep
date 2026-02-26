@@ -3,6 +3,13 @@ name = "ygrep-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Core library for ygrep – fast, local, indexed code search"
+repository = "https://github.com/yetidevworks/ygrep"
+homepage = "https://github.com/yetidevworks/ygrep"
+readme = "../../README.md"
+keywords = ["search", "code-search", "indexing", "grep", "tantivy"]
+categories = ["command-line-utilities", "text-processing"]
+authors = ["YetiDevWorks"]
 
 [features]
 default = []

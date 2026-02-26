@@ -3,6 +3,13 @@ name = "ygrep-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Fast, local, indexed code search for AI coding assistants"
+repository = "https://github.com/yetidevworks/ygrep"
+homepage = "https://github.com/yetidevworks/ygrep"
+readme = "../../README.md"
+keywords = ["search", "code-search", "grep", "cli", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["YetiDevWorks"]
 
 [features]
 default = ["embeddings"]

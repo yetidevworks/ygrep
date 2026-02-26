@@ -323,3 +323,27 @@ jobs:
           fi
           git commit -m "ygrep ${GITHUB_REF_NAME#v}: update Homebrew formula"
           git push "https://${GH_TOKEN}@github.com/${TAP_REPO}.git" HEAD:main
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish ygrep-core
+        run: cargo publish -p ygrep-core --no-default-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish ygrep-cli
+        run: cargo publish -p ygrep-cli --no-default-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
