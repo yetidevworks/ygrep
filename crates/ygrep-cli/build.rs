@@ -6,8 +6,8 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let version = env::var("CARGO_PKG_VERSION").unwrap();
 
-    // Path to claude-code directory (relative to ygrep-cli crate)
-    let claude_code_dir = Path::new("../../claude-code");
+    // Path to claude-code directory (bundled within the crate)
+    let claude_code_dir = Path::new("claude-code");
 
     // Files that don't need version substitution
     let static_files = ["SKILL.md", "hook.json"];
