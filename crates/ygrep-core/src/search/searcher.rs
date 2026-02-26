@@ -795,7 +795,8 @@ mod tests {
             extensions: Some(vec!["rs".to_string()]),
             paths: None,
         };
-        let result = searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
+        let result =
+            searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
@@ -831,7 +832,8 @@ mod tests {
             extensions: None,
             paths: Some(vec!["lib/".to_string()]),
         };
-        let result = searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
+        let result =
+            searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "lib/utils.rs");
@@ -903,8 +905,16 @@ mod tests {
             extensions: None,
             paths: Some(vec!["user/plugins/*/tests/".to_string()]),
         };
-        let result =
-            searcher.search_filtered("extends Plugin", None, filters, false, false, None, None, false)?;
+        let result = searcher.search_filtered(
+            "extends Plugin",
+            None,
+            filters,
+            false,
+            false,
+            None,
+            None,
+            false,
+        )?;
 
         assert_eq!(result.hits.len(), 2);
         assert!(result.hits.iter().all(|h| h.path.contains("/tests/")));
