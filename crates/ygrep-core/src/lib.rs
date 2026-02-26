@@ -746,6 +746,7 @@ impl Workspace {
         case_sensitive: bool,
         context_before: Option<usize>,
         context_after: Option<usize>,
+        verbose: bool,
     ) -> Result<search::SearchResult> {
         let searcher = search::Searcher::new(self.config.search.clone(), self.index.clone());
         let filters = search::SearchFilters { extensions, paths };
@@ -757,6 +758,7 @@ impl Workspace {
             case_sensitive,
             context_before,
             context_after,
+            verbose,
         )
     }
 

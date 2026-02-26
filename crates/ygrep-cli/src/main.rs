@@ -262,6 +262,7 @@ fn main() -> Result<()> {
                 ctx_before,
                 ctx_after,
                 format,
+                cli.verbose,
             )?;
         }
         Some(Commands::Index {
@@ -316,6 +317,7 @@ fn main() -> Result<()> {
                     ctx_before,
                     ctx_after,
                     format,
+                    cli.verbose,
                 )?;
             } else {
                 // No query, show help

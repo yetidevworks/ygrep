@@ -103,6 +103,9 @@ ygrep search "error" -n 20         # Limit results
 ygrep search "config" -e rs -e toml # Filter by extension
 ygrep search "api" -p src/         # Filter by path
 
+# Verbose mode (debug search pipeline)
+ygrep "error" -e php -p src/ -v    # Shows per-stage filtering counts on stderr
+
 # Output formats (AI format is default)
 ygrep search "query"               # AI-optimized (default)
 ygrep search "query" --json        # JSON output

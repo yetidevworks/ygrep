@@ -197,6 +197,7 @@ impl Searcher {
         case_sensitive: bool,
         context_before: Option<usize>,
         context_after: Option<usize>,
+        verbose: bool,
     ) -> Result<SearchResult> {
         // Use regex search if requested
         let mut result = if use_regex {
@@ -217,6 +218,15 @@ impl Searcher {
             )?
         };
 
+        let pre_filter_count = result.hits.len();
+        if verbose {
+            eprintln!(
+                "[verbose] search mode: {}",
+                if use_regex { "regex" } else { "text" }
+            );
+            eprintln!("[verbose] matches before filtering: {}", pre_filter_count);
+        }
+
         // Apply filters
         if let Some(ref extensions) = filters.extensions {
             result.hits.retain(|hit| {
@@ -228,12 +238,26 @@ impl Searcher {
                     false
                 }
             });
+            if verbose {
+                eprintln!(
+                    "[verbose] after extension filter ({}): {}",
+                    extensions.join(", "),
+                    result.hits.len()
+                );
+            }
         }
 
         if let Some(ref paths) = filters.paths {
             result
                 .hits
                 .retain(|hit| paths.iter().any(|p| path_matches(p, &hit.path)));
+            if verbose {
+                eprintln!(
+                    "[verbose] after path filter ({}): {}",
+                    paths.join(", "),
+                    result.hits.len()
+                );
+            }
         }
 
         // Re-limit
@@ -242,6 +266,22 @@ impl Searcher {
             .min(self.config.max_limit);
         result.hits.truncate(limit);
         result.total = result.hits.len();
+
+        // Fix text_hits/semantic_hits to reflect post-filter counts (issue #10)
+        result.text_hits = result
+            .hits
+            .iter()
+            .filter(|h| matches!(h.match_type, MatchType::Text | MatchType::Hybrid))
+            .count();
+        result.semantic_hits = result
+            .hits
+            .iter()
+            .filter(|h| matches!(h.match_type, MatchType::Semantic | MatchType::Hybrid))
+            .count();
+
+        if verbose {
+            eprintln!("[verbose] final results: {}", result.total);
+        }
 
         Ok(result)
     }
@@ -755,7 +795,7 @@ mod tests {
             extensions: Some(vec!["rs".to_string()]),
             paths: None,
         };
-        let result = searcher.search_filtered("hello", None, filters, false, false, None, None)?;
+        let result = searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
@@ -791,7 +831,7 @@ mod tests {
             extensions: None,
             paths: Some(vec!["lib/".to_string()]),
         };
-        let result = searcher.search_filtered("hello", None, filters, false, false, None, None)?;
+        let result = searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "lib/utils.rs");
@@ -864,7 +904,7 @@ mod tests {
             paths: Some(vec!["user/plugins/*/tests/".to_string()]),
         };
         let result =
-            searcher.search_filtered("extends Plugin", None, filters, false, false, None, None)?;
+            searcher.search_filtered("extends Plugin", None, filters, false, false, None, None, false)?;
 
         assert_eq!(result.hits.len(), 2);
         assert!(result.hits.iter().all(|h| h.path.contains("/tests/")));
@@ -999,6 +1039,65 @@ mod tests {
         let result = searcher.search("dashboard", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/commands/dashboard.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_text_hits_consistent_after_filter() -> Result<()> {
+        // Issue #10: text_hits should reflect post-filter count, not pre-filter
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/main.rs",
+            "fn hello() {}",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test2",
+            "src/main.py",
+            "def hello(): pass",
+            "py",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "test3",
+            "lib/utils.js",
+            "function hello() {}",
+            "js",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        // Filter to only .rs files - should get 1 hit, and text_hits must equal total
+        let filters = SearchFilters {
+            extensions: Some(vec!["rs".to_string()]),
+            paths: None,
+        };
+        let result =
+            searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.text_hits, 1);
+        assert_eq!(result.text_hits, result.total);
+
+        // Filter to a path that matches nothing - should get 0 hits with text_hits = 0
+        let filters = SearchFilters {
+            extensions: None,
+            paths: Some(vec!["nonexistent/".to_string()]),
+        };
+        let result =
+            searcher.search_filtered("hello", None, filters, false, false, None, None, false)?;
+
+        assert_eq!(result.total, 0);
+        assert_eq!(result.text_hits, 0);
 
         Ok(())
     }

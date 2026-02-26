@@ -17,6 +17,7 @@ pub fn run(
     context_before: Option<usize>,
     context_after: Option<usize>,
     format: OutputFormat,
+    verbose: bool,
 ) -> Result<()> {
     // Open existing workspace (fails if not indexed)
     let workspace = match Workspace::open(workspace_path) {
@@ -67,6 +68,7 @@ pub fn run(
                 case_sensitive,
                 context_before,
                 context_after,
+                verbose,
             )
             .context("Search failed")?
     };
