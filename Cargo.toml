@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.1.6"
+version = "3.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yetidevworks/ygrep"
@@ -51,6 +51,9 @@ indicatif = "0.17"
 # TUI
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+
+# HTTP
+ureq = "2"
 
 # Utils
 parking_lot = "0.12"

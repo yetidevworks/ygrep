@@ -4,4 +4,5 @@ pub mod indexes;
 pub mod install;
 pub mod search;
 pub mod status;
+pub mod update;
 pub mod watch;

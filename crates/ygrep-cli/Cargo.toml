@@ -36,6 +36,9 @@ clap = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 
+# HTTP
+ureq = { workspace = true }
+
 # Utils
 dirs = { workspace = true }
 chrono = { workspace = true }

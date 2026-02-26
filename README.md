@@ -189,6 +189,21 @@ The dashboard shows a table of all indexes with workspace path, size, file count
 | `?` | Help overlay |
 | `q` | Quit |
 
+### Updating
+
+```bash
+ygrep update                       # Check and install latest version
+ygrep update --check               # Just check, don't install
+```
+
+ygrep automatically checks for updates once per day (in the background, after search) and shows a hint when a new version is available:
+
+```
+ygrep v3.2.0 available (current: v3.1.6). Run `ygrep update` to upgrade.
+```
+
+If installed via Homebrew or cargo, `ygrep update` will suggest the appropriate command (`brew upgrade ygrep` or `cargo install ygrep-cli`) instead of self-updating.
+
 ### Semantic Search (Optional)
 
 Enable semantic search for better results on natural language queries:
@@ -352,6 +367,9 @@ Index data stored in:
 ## Upgrading
 
 ```bash
+# Self-update (downloads latest release binary)
+ygrep update
+
 # Via Homebrew
 brew upgrade ygrep
 

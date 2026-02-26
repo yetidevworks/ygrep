@@ -5,13 +5,20 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.1.6] - 2026-02-25
+## [3.2.0] - 2026-02-25
 
-### Fixed
-- `text_hits` and `semantic_hits` in `--json` output now reflect post-filter counts — previously they reported pre-filter candidate counts, causing confusing output like `text_hits: 15` with `total: 0` when path or extension filters removed all matches (#10)
+### Added
+- **Self-update** (`ygrep update`) — checks GitHub Releases for the latest version and replaces the binary in-place. Detects Homebrew and cargo installs and suggests the appropriate upgrade command instead
+- **Update check** (`ygrep update --check`) — just prints whether a newer version is available, without installing
+- **Automatic update notifications** — after search, ygrep checks a local cache (refreshed every 24 hours in the background) and prints a one-liner hint to stderr when a newer version is available
+
+## [3.1.6] - 2026-02-25
 
 ### Added
 - **Verbose search diagnostics** (`-v` / `--verbose`) — shows per-stage filtering pipeline on stderr: matches before filtering, after extension filter, after path filter, and final results. Useful for debugging zero-result searches
+
+### Fixed
+- `text_hits` and `semantic_hits` in `--json` output now reflect post-filter counts — previously they reported pre-filter candidate counts, causing confusing output like `text_hits: 15` with `total: 0` when path or extension filters removed all matches (#10)
 
 ## [3.1.5] - 2026-02-23
 
@@ -274,6 +281,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.2.0]: https://github.com/yetidevworks/ygrep/compare/v3.1.6...v3.2.0
 [3.1.6]: https://github.com/yetidevworks/ygrep/compare/v3.1.5...v3.1.6
 [3.1.5]: https://github.com/yetidevworks/ygrep/compare/v3.1.4...v3.1.5
 [3.1.4]: https://github.com/yetidevworks/ygrep/compare/v3.1.3...v3.1.4

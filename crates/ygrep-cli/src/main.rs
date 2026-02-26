@@ -166,6 +166,13 @@ pub enum Commands {
 
     /// Interactive dashboard for managing all indexes and watchers
     Dashboard,
+
+    /// Check for and install updates
+    Update {
+        /// Only check, don't install
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -264,6 +271,7 @@ fn main() -> Result<()> {
                 format,
                 cli.verbose,
             )?;
+            commands::update::maybe_print_update_hint();
         }
         Some(Commands::Index {
             path,
@@ -299,6 +307,9 @@ fn main() -> Result<()> {
         Some(Commands::Dashboard) => {
             commands::dashboard::run()?;
         }
+        Some(Commands::Update { check }) => {
+            commands::update::run(check)?;
+        }
         None => {
             // Default: treat as search if query provided
             if let Some(query) = cli.query {
@@ -319,6 +330,7 @@ fn main() -> Result<()> {
                     format,
                     cli.verbose,
                 )?;
+                commands::update::maybe_print_update_hint();
             } else {
                 // No query, show help
                 use clap::CommandFactory;
