@@ -53,7 +53,7 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # HTTP
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 
 # Utils
 parking_lot = "0.12"
