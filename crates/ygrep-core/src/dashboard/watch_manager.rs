@@ -401,6 +401,7 @@ impl WatchManager {
             self.stop_watcher(hash);
             if let Some(ws) = self.workspaces.get_mut(hash) {
                 ws.watch_state = WatchState::Sleeping;
+                ws.indexed_at = Some(chrono::Utc::now());
                 // Stagger initial polls: each workspace gets an offset so they don't all
                 // poll on the same tick. Pretend we polled (interval - offset) ago.
                 let stagger = Duration::from_secs((i as u64 * 5) % SLEEP_POLL_INTERVAL.as_secs());
@@ -505,7 +506,7 @@ fn has_recent_changes(workspace_path: &Path, indexed_at: chrono::DateTime<chrono
         for entry in entries.flatten() {
             checked += 1;
             if checked > 2000 {
-                return false;
+                return true;
             }
 
             let path = entry.path();
@@ -513,7 +514,20 @@ fn has_recent_changes(workspace_path: &Path, indexed_at: chrono::DateTime<chrono
             let name_str = name.to_string_lossy();
 
             // Skip hidden dirs and common non-source dirs
-            if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
+            if name_str.starts_with('.')
+                || matches!(
+                    name_str.as_ref(),
+                    "node_modules"
+                        | "vendor"
+                        | "target"
+                        | "dist"
+                        | "build"
+                        | "cache"
+                        | "__pycache__"
+                        | "logs"
+                        | "tmp"
+                )
+            {
                 continue;
             }
 

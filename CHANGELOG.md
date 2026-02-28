@@ -5,6 +5,13 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-02-28
+
+### Fixed
+- **Dashboard sleeping workspaces never waking** — `has_recent_changes()` had a 2000-entry cap that silently returned "no changes" when exceeded, so any workspace with >2000 directory entries would never wake from sleep. Now fails open (assumes changes may exist) so the workspace wakes and runs an incremental index
+- **Sleep poll wasting budget on irrelevant directories** — the mtime poll only skipped `.`-prefixed, `node_modules`, and `target` directories. Aligned with the full FileWatcher skip list (`vendor`, `dist`, `build`, `cache`, `__pycache__`, `logs`, `tmp`) so the 2000-entry budget covers actual source files
+- **Stale `indexed_at` on Active to Sleeping transition** — `indexed_at` was never updated when a workspace went to sleep, so the mtime comparison used a potentially stale timestamp. Now set to the actual sleep time so only genuinely new changes trigger a wake
+
 ## [3.2.0] - 2026-02-25
 
 ### Added
