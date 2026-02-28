@@ -7,6 +7,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   TAP_REPO: yetidevworks/homebrew-ygrep
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
 
 permissions:
   contents: write
@@ -64,13 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Parse version from tag
         id: v
         shell: bash
         run: |
-          RAW_TAG="${GITHUB_REF_NAME}"
+          RAW_TAG="${RELEASE_TAG}"
           echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
@@ -154,7 +156,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release upload "${RELEASE_TAG}" "${{ steps.pkg.outputs.file }}" --repo "${GITHUB_REPOSITORY}" --clobber
 
       - name: Publish archive as artifact
         uses: actions/upload-artifact@v4
@@ -171,6 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Download artifacts (archives)
@@ -218,7 +221,7 @@ jobs:
       - name: Verify version matches tag
         run: |
           set -euo pipefail
-          RAW_TAG="${GITHUB_REF_NAME}"
+          RAW_TAG="${RELEASE_TAG}"
           TAG_VERSION="${RAW_TAG#v}"
           CARGO_VERSION='${{ steps.cargo.outputs.version }}'
           if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
@@ -232,7 +235,7 @@ jobs:
         run: |
           set -euo pipefail
           VER='${{ steps.cargo.outputs.version }}'
-          TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
           DARWIN_ARM64_SHA='${{ steps.shas.outputs.darwin_arm64_sha }}'
           DARWIN_X86_64_SHA='${{ steps.shas.outputs.darwin_x86_64_sha }}'
           LINUX_X86_64_SHA='${{ steps.shas.outputs.linux_x86_64_sha }}'
@@ -321,7 +324,7 @@ jobs:
             echo "No formula changes to commit."
             exit 0
           fi
-          git commit -m "ygrep ${GITHUB_REF_NAME#v}: update Homebrew formula"
+          git commit -m "ygrep ${RELEASE_TAG#v}: update Homebrew formula"
           git push "https://${GH_TOKEN}@github.com/${TAP_REPO}.git" HEAD:main
 
   publish-crate:
@@ -331,6 +334,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
