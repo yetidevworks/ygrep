@@ -1111,10 +1111,16 @@ mod tests {
 
         // Verify deleted files are gone, others remain
         let result = workspace.search("func_0", None)?;
-        assert!(result.is_empty(), "Deleted file should not appear in search");
+        assert!(
+            result.is_empty(),
+            "Deleted file should not appear in search"
+        );
 
         let result = workspace.search("func_10", None)?;
-        assert!(!result.is_empty(), "Non-deleted file should still be searchable");
+        assert!(
+            !result.is_empty(),
+            "Non-deleted file should still be searchable"
+        );
 
         Ok(())
     }
@@ -1159,7 +1165,10 @@ mod tests {
 
         // Verify odd-numbered files are still searchable with updated content
         let result = workspace.search("v2_1", None)?;
-        assert!(!result.is_empty(), "Surviving file should have latest content");
+        assert!(
+            !result.is_empty(),
+            "Surviving file should have latest content"
+        );
 
         // Verify even-numbered (deleted) files are gone
         let result = workspace.search("v2_0", None)?;
@@ -1191,7 +1200,10 @@ mod tests {
         workspace.index_file_with_options(&path, false)?;
 
         let result = workspace.search("standalone_function", None)?;
-        assert!(!result.is_empty(), "File indexed via index_file_with_options should be searchable");
+        assert!(
+            !result.is_empty(),
+            "File indexed via index_file_with_options should be searchable"
+        );
 
         Ok(())
     }
