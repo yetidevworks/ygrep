@@ -5,6 +5,11 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.2] - 2026-03-08
+
+### Fixed
+- **Watch crashes under heavy filesystem churn** — `ygrep watch` and dashboard watchers created a new IndexWriter for every file event, causing `LockBusy` and `FileAlreadyExists` errors during rapid operations like zip extraction or git clone. Now reuses a single IndexWriter for the lifetime of each watcher, eliminating lock contention entirely
+
 ## [3.2.1] - 2026-02-28
 
 ### Fixed
@@ -288,6 +293,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.2.2]: https://github.com/yetidevworks/ygrep/compare/v3.2.1...v3.2.2
+[3.2.1]: https://github.com/yetidevworks/ygrep/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/yetidevworks/ygrep/compare/v3.1.6...v3.2.0
 [3.1.6]: https://github.com/yetidevworks/ygrep/compare/v3.1.5...v3.1.6
 [3.1.5]: https://github.com/yetidevworks/ygrep/compare/v3.1.4...v3.1.5

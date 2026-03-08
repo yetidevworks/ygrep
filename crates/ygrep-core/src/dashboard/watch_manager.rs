@@ -666,7 +666,7 @@ async fn watcher_task(
     // Open workspace and create watcher (blocking)
     let result = tokio::task::spawn_blocking({
         let workspace_path = workspace_path.clone();
-        move || -> Result<(Workspace, crate::watcher::FileWatcher), String> {
+        move || -> Result<(Workspace, crate::watcher::FileWatcher, crate::index::Indexer), String> {
             let mut workspace =
                 Workspace::open(&workspace_path).map_err(|e| format!("open: {}", e))?;
             workspace.set_log_tx(log_tx);
@@ -681,13 +681,16 @@ async fn watcher_task(
                 .map_err(|e| format!("watcher: {}", e))?;
             watcher.start().map_err(|e| format!("start: {}", e))?;
 
-            Ok((workspace, watcher))
+            let indexer = workspace
+                .create_indexer()
+                .map_err(|e| format!("indexer: {}", e))?;
+            Ok((workspace, watcher, indexer))
         }
     })
     .await;
 
-    let (workspace, mut watcher) = match result {
-        Ok(Ok((ws, w))) => (ws, w),
+    let (workspace, mut watcher, indexer) = match result {
+        Ok(Ok((ws, w, idx))) => (ws, w, idx),
         Ok(Err(e)) => {
             let _ = event_tx.send((hash, WatchEvent::Error(e)));
             return;
@@ -709,7 +712,7 @@ async fn watcher_task(
                 match event {
                     Some(WatchEvent::Changed(ref path)) => {
                         if is_indexable(path) {
-                            match workspace.index_file_with_options(path, semantic) {
+                            match workspace.index_file_with_indexer(&indexer, path, semantic) {
                                 Ok(()) => {
                                     let _ = event_tx.send((hash.clone(), WatchEvent::Changed(path.clone())));
                                 }
@@ -720,7 +723,7 @@ async fn watcher_task(
                         }
                     }
                     Some(WatchEvent::Deleted(ref path)) => {
-                        let _ = workspace.delete_file(path);
+                        let _ = workspace.delete_file_with_indexer(&indexer, path);
                         let _ = event_tx.send((hash.clone(), WatchEvent::Deleted(path.clone())));
                     }
                     Some(WatchEvent::Error(ref msg)) => {

@@ -1064,4 +1064,135 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_shared_indexer_multiple_files() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // Create initial file and index
+        std::fs::write(workspace_dir.join("initial.rs"), "fn initial() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
+        workspace.index_all()?;
+
+        // Create a shared indexer and use it for multiple file operations
+        let indexer = workspace.create_indexer()?;
+
+        // Index several files rapidly with the same indexer (simulates watch loop)
+        for i in 0..20 {
+            let filename = format!("file_{}.rs", i);
+            let content = format!("fn func_{}() {{ /* content {} */ }}", i, i);
+            std::fs::write(workspace_dir.join(&filename), &content).unwrap();
+            workspace.index_file_with_indexer(&indexer, &workspace_dir.join(&filename), false)?;
+        }
+
+        // Verify all files are searchable
+        for i in 0..20 {
+            let query = format!("func_{}", i);
+            let result = workspace.search(&query, None)?;
+            assert!(
+                !result.is_empty(),
+                "File {} should be searchable after indexing with shared indexer",
+                i
+            );
+        }
+
+        // Delete some files with the same indexer
+        for i in 0..5 {
+            let path = workspace_dir.join(format!("file_{}.rs", i));
+            workspace.delete_file_with_indexer(&indexer, &path)?;
+        }
+
+        // Verify deleted files are gone, others remain
+        let result = workspace.search("func_0", None)?;
+        assert!(result.is_empty(), "Deleted file should not appear in search");
+
+        let result = workspace.search("func_10", None)?;
+        assert!(!result.is_empty(), "Non-deleted file should still be searchable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_shared_indexer_no_lock_contention() -> Result<()> {
+        // This test verifies that creating a single indexer and reusing it
+        // for rapid sequential operations doesn't cause LockBusy errors,
+        // which was the bug when creating a new indexer per file event.
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        std::fs::write(workspace_dir.join("seed.rs"), "fn seed() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
+        workspace.index_all()?;
+
+        let indexer = workspace.create_indexer()?;
+
+        // Simulate heavy churn: rapidly create, index, modify, re-index, delete
+        for i in 0..50 {
+            let path = workspace_dir.join(format!("churn_{}.rs", i));
+
+            // Create and index
+            std::fs::write(&path, format!("fn v1_{}() {{}}", i)).unwrap();
+            workspace.index_file_with_indexer(&indexer, &path, false)?;
+
+            // Modify and re-index (simulates rapid file changes)
+            std::fs::write(&path, format!("fn v2_{}() {{}}", i)).unwrap();
+            workspace.index_file_with_indexer(&indexer, &path, false)?;
+
+            // Delete half of them
+            if i % 2 == 0 {
+                workspace.delete_file_with_indexer(&indexer, &path)?;
+            }
+        }
+
+        // Verify odd-numbered files are still searchable with updated content
+        let result = workspace.search("v2_1", None)?;
+        assert!(!result.is_empty(), "Surviving file should have latest content");
+
+        // Verify even-numbered (deleted) files are gone
+        let result = workspace.search("v2_0", None)?;
+        assert!(result.is_empty(), "Deleted file should not appear");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_per_file_indexer_still_works() -> Result<()> {
+        // Ensure the original index_file_with_options path (one indexer per call)
+        // still works correctly for non-watch usage.
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        std::fs::write(workspace_dir.join("base.rs"), "fn base() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
+        workspace.index_all()?;
+
+        // Use the per-call indexer path (index_file_with_options)
+        let path = workspace_dir.join("standalone.rs");
+        std::fs::write(&path, "fn standalone_function() {}").unwrap();
+        workspace.index_file_with_options(&path, false)?;
+
+        let result = workspace.search("standalone_function", None)?;
+        assert!(!result.is_empty(), "File indexed via index_file_with_options should be searchable");
+
+        Ok(())
+    }
 }
