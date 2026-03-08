@@ -36,6 +36,10 @@ use std::sync::Arc;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_DIM: usize = 384;
 
+/// Retry budget for transient writer contention.
+const WRITER_RETRY_MAX_ATTEMPTS: usize = 4;
+const WRITER_RETRY_BASE_DELAY_MS: u64 = 100;
+
 /// Sender for routing log messages (e.g. to dashboard TUI instead of stderr)
 pub type LogSender = std::sync::mpsc::Sender<String>;
 
@@ -245,6 +249,60 @@ impl Workspace {
         }
     }
 
+    fn is_transient_writer_error(err: &YgrepError) -> bool {
+        match err {
+            YgrepError::Index(tantivy::TantivyError::LockFailure(
+                tantivy::directory::error::LockError::LockBusy,
+                _,
+            )) => true,
+            YgrepError::Index(tantivy::TantivyError::OpenWriteError(
+                tantivy::directory::error::OpenWriteError::FileAlreadyExists(_),
+            )) => true,
+            _ => {
+                let msg = err.to_string();
+                msg.contains("Lockfile")
+                    || msg.contains("LockBusy")
+                    || msg.contains("OpenWriteError(FileAlreadyExists")
+            }
+        }
+    }
+
+    fn with_writer_retry<T, F>(&self, op_name: &str, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Result<T>,
+    {
+        let mut last_err = None;
+        for attempt in 0..WRITER_RETRY_MAX_ATTEMPTS {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err)
+                    if Self::is_transient_writer_error(&err)
+                        && attempt + 1 < WRITER_RETRY_MAX_ATTEMPTS =>
+                {
+                    let wait_ms = WRITER_RETRY_BASE_DELAY_MS * (1u64 << attempt);
+                    tracing::debug!(
+                        "Transient writer contention during {} (attempt {}/{}), retrying in {}ms: {}",
+                        op_name,
+                        attempt + 1,
+                        WRITER_RETRY_MAX_ATTEMPTS,
+                        wait_ms,
+                        err
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            YgrepError::Search(format!(
+                "Transient writer retries exhausted for {}",
+                op_name
+            ))
+        }))
+    }
+
     /// Index all files in the workspace (text-only by default, fast)
     pub fn index_all(&self) -> Result<IndexStats> {
         self.index_all_with_options(false)
@@ -258,8 +316,9 @@ impl Workspace {
         self.vector_index.clear();
 
         // Phase 1: Index all files with BM25 (fast)
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+        let indexer = self.with_writer_retry("index_all/indexer_open", || {
+            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
+        })?;
 
         let mut walker = fs::FileWalker::new(self.root.clone(), self.config.indexer.clone())?;
 
@@ -519,8 +578,9 @@ impl Workspace {
         let mut indexed_map = self.build_indexed_files_map();
 
         // Create indexer (does NOT clear vector index)
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+        let indexer = self.with_writer_retry("index_incremental/indexer_open", || {
+            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
+        })?;
 
         let mut walker = fs::FileWalker::new(self.root.clone(), self.config.indexer.clone())?;
 
@@ -839,11 +899,13 @@ impl Workspace {
             .get_field("path")
             .map_err(|_| YgrepError::Config("path field not found in schema".to_string()))?;
 
-        let term = Term::from_field_text(path_field, &relative_path);
-
-        let mut writer = self.index.writer::<tantivy::TantivyDocument>(50_000_000)?;
-        writer.delete_term(term);
-        writer.commit()?;
+        self.with_writer_retry("delete_file", || {
+            let term = Term::from_field_text(path_field, &relative_path);
+            let mut writer = self.index.writer::<tantivy::TantivyDocument>(50_000_000)?;
+            writer.delete_term(term);
+            writer.commit()?;
+            Ok(())
+        })?;
 
         tracing::debug!("Deleted from index: {}", path.display());
         Ok(())
@@ -889,10 +951,11 @@ impl Workspace {
     /// Index or re-index a single file with optional semantic indexing (for incremental updates)
     #[allow(unused_variables)]
     pub fn index_file_with_options(&self, path: &Path, with_embeddings: bool) -> Result<()> {
-        // Create indexer and index the file
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
-        self.index_file_with_indexer(&indexer, path, with_embeddings)
+        self.with_writer_retry("index_file_with_options", || {
+            let indexer =
+                index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+            self.index_file_with_indexer(&indexer, path, with_embeddings)
+        })
     }
 
     /// Index or re-index a single file using an existing Indexer (avoids lock churn)
@@ -1007,6 +1070,7 @@ fn hash_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tantivy::directory::error::{LockError, OpenWriteError};
     use tempfile::tempdir;
 
     #[test]
@@ -1063,5 +1127,22 @@ mod tests {
         assert!(result.hits.iter().any(|h| h.path.contains("hello")));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_transient_writer_error_detection() {
+        let lock_busy = YgrepError::Index(tantivy::TantivyError::LockFailure(
+            LockError::LockBusy,
+            None,
+        ));
+        assert!(Workspace::is_transient_writer_error(&lock_busy));
+
+        let file_exists = YgrepError::Index(tantivy::TantivyError::OpenWriteError(
+            OpenWriteError::FileAlreadyExists(std::path::PathBuf::from("segment.tmp")),
+        ));
+        assert!(Workspace::is_transient_writer_error(&file_exists));
+
+        let non_transient = YgrepError::Config("not transient".to_string());
+        assert!(!Workspace::is_transient_writer_error(&non_transient));
     }
 }
