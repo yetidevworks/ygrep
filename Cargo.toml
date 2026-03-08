@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.2.2"
+version = "3.2.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yetidevworks/ygrep"
@@ -14,7 +14,7 @@ authors = ["YetiDevWorks"]
 
 [workspace.dependencies]
 # Internal crates
-ygrep-core = { path = "crates/ygrep-core", version = "3.2.2" }
+ygrep-core = { path = "crates/ygrep-core", version = "3.2.3" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

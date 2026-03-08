@@ -166,6 +166,11 @@ impl FileWatcher {
         self.event_rx.recv().await
     }
 
+    /// Try to get the next watch event without waiting (returns None if no event queued)
+    pub fn try_next_event(&mut self) -> Option<WatchEvent> {
+        self.event_rx.try_recv().ok()
+    }
+
     /// Get the root directory being watched
     pub fn root(&self) -> &Path {
         &self.root

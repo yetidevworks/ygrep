@@ -702,6 +702,7 @@ async fn watcher_task(
     };
 
     // Event loop: process file events until told to stop
+    // Events are batched — we drain all queued events, then commit once.
     loop {
         tokio::select! {
             _ = &mut stop_rx => {
@@ -709,28 +710,50 @@ async fn watcher_task(
                 break;
             }
             event = watcher.next_event() => {
-                match event {
-                    Some(WatchEvent::Changed(ref path)) => {
-                        if is_indexable(path) {
-                            match workspace.index_file_with_indexer(&indexer, path, semantic) {
-                                Ok(()) => {
-                                    let _ = event_tx.send((hash.clone(), WatchEvent::Changed(path.clone())));
-                                }
-                                Err(e) => {
-                                    let _ = event_tx.send((hash.clone(), WatchEvent::Error(format!("{}: {}", path.display(), e))));
+                let first_event = match event {
+                    Some(e) => e,
+                    None => break, // Channel closed
+                };
+
+                // Collect all queued events into a batch
+                let mut events = vec![first_event];
+                while let Some(e) = watcher.try_next_event() {
+                    events.push(e);
+                }
+
+                let mut needs_commit = false;
+
+                for event in events {
+                    match event {
+                        WatchEvent::Changed(ref path) => {
+                            if is_indexable(path) {
+                                match workspace.index_file_no_commit(&indexer, path, semantic) {
+                                    Ok(()) => {
+                                        needs_commit = true;
+                                        let _ = event_tx.send((hash.clone(), WatchEvent::Changed(path.clone())));
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send((hash.clone(), WatchEvent::Error(format!("{}: {}", path.display(), e))));
+                                    }
                                 }
                             }
                         }
+                        WatchEvent::Deleted(ref path) => {
+                            let _ = workspace.delete_file_no_commit(&indexer, path);
+                            needs_commit = true;
+                            let _ = event_tx.send((hash.clone(), WatchEvent::Deleted(path.clone())));
+                        }
+                        WatchEvent::Error(ref msg) => {
+                            let _ = event_tx.send((hash.clone(), WatchEvent::Error(msg.clone())));
+                        }
+                        _ => {} // DirCreated/DirDeleted - ignore
                     }
-                    Some(WatchEvent::Deleted(ref path)) => {
-                        let _ = workspace.delete_file_with_indexer(&indexer, path);
-                        let _ = event_tx.send((hash.clone(), WatchEvent::Deleted(path.clone())));
+                }
+
+                if needs_commit {
+                    if let Err(e) = workspace.commit_indexer(&indexer) {
+                        let _ = event_tx.send((hash.clone(), WatchEvent::Error(format!("commit: {}", e))));
                     }
-                    Some(WatchEvent::Error(ref msg)) => {
-                        let _ = event_tx.send((hash.clone(), WatchEvent::Error(msg.clone())));
-                    }
-                    Some(_) => {} // DirCreated/DirDeleted - ignore
-                    None => break, // Channel closed
                 }
             }
         }

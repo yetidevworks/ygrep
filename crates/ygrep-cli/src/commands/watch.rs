@@ -59,49 +59,68 @@ pub fn run(workspace_path: &Path) -> Result<()> {
         let mut error_count = 0u64;
 
         loop {
-            match watcher.next_event().await {
-                Some(WatchEvent::Changed(path)) => {
-                    // Check if it's a text file we should index
-                    if is_indexable(&path) {
-                        match workspace.index_file_with_indexer(&indexer, &path, use_semantic) {
+            // Wait for first event
+            let first_event = match watcher.next_event().await {
+                Some(e) => e,
+                None => break, // Channel closed
+            };
+
+            // Drain all queued events into a batch
+            let mut events = vec![first_event];
+            while let Some(e) = watcher.try_next_event() {
+                events.push(e);
+            }
+
+            let mut needs_commit = false;
+
+            for event in events {
+                match event {
+                    WatchEvent::Changed(path) => {
+                        if is_indexable(&path) {
+                            match workspace.index_file_no_commit(&indexer, &path, use_semantic) {
+                                Ok(()) => {
+                                    needs_commit = true;
+                                    changed_count += 1;
+                                    eprintln!("  [+] {}", path.display());
+                                }
+                                Err(e) => {
+                                    error_count += 1;
+                                    eprintln!("  [!] {} - {}", path.display(), e);
+                                }
+                            }
+                        } else {
+                            eprintln!("  [.] {} (skipped: not indexable)", path.display());
+                        }
+                    }
+                    WatchEvent::Deleted(path) => {
+                        match workspace.delete_file_no_commit(&indexer, &path) {
                             Ok(()) => {
-                                changed_count += 1;
-                                eprintln!("  [+] {}", path.display());
+                                needs_commit = true;
+                                deleted_count += 1;
+                                eprintln!("  [-] {}", path.display());
                             }
                             Err(e) => {
-                                error_count += 1;
-                                eprintln!("  [!] {} - {}", path.display(), e);
+                                tracing::debug!("Delete error for {}: {}", path.display(), e);
                             }
                         }
-                    } else {
-                        eprintln!("  [.] {} (skipped: not indexable)", path.display());
+                    }
+                    WatchEvent::DirCreated(path) => {
+                        eprintln!("  [d] {} (new directory)", path.display());
+                    }
+                    WatchEvent::DirDeleted(path) => {
+                        eprintln!("  [d] {} (directory removed)", path.display());
+                    }
+                    WatchEvent::Error(e) => {
+                        error_count += 1;
+                        eprintln!("  [!] Watch error: {}", e);
                     }
                 }
-                Some(WatchEvent::Deleted(path)) => {
-                    match workspace.delete_file_with_indexer(&indexer, &path) {
-                        Ok(()) => {
-                            deleted_count += 1;
-                            eprintln!("  [-] {}", path.display());
-                        }
-                        Err(e) => {
-                            // File might not have been in index, that's OK
-                            tracing::debug!("Delete error for {}: {}", path.display(), e);
-                        }
-                    }
-                }
-                Some(WatchEvent::DirCreated(path)) => {
-                    eprintln!("  [d] {} (new directory)", path.display());
-                }
-                Some(WatchEvent::DirDeleted(path)) => {
-                    eprintln!("  [d] {} (directory removed)", path.display());
-                }
-                Some(WatchEvent::Error(e)) => {
+            }
+
+            if needs_commit {
+                if let Err(e) = workspace.commit_indexer(&indexer) {
                     error_count += 1;
-                    eprintln!("  [!] Watch error: {}", e);
-                }
-                None => {
-                    // Channel closed, exit
-                    break;
+                    eprintln!("  [!] Commit error: {}", e);
                 }
             }
 

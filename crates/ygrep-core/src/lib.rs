@@ -970,6 +970,84 @@ impl Workspace {
         index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
     }
 
+    /// Index a single file without committing (for batched watch operations)
+    #[allow(unused_variables)]
+    pub fn index_file_no_commit(
+        &self,
+        indexer: &index::Indexer,
+        path: &Path,
+        with_embeddings: bool,
+    ) -> Result<()> {
+        match indexer.index_file(path) {
+            Ok((doc_id, content)) => {
+                tracing::debug!("Staged: {}", path.display());
+
+                #[cfg(feature = "embeddings")]
+                if with_embeddings {
+                    let len = content.len();
+                    if (50..=50_000).contains(&len) {
+                        const EMBED_TRUNCATE: usize = 4096;
+                        let text = if content.len() > EMBED_TRUNCATE {
+                            let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
+                            &content[..boundary]
+                        } else {
+                            content.as_str()
+                        };
+
+                        match self.embedding_model.embed(text) {
+                            Ok(embedding) => {
+                                if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
+                                    tracing::debug!(
+                                        "Failed to insert embedding for {}: {}",
+                                        doc_id,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed to generate embedding for {}: {}",
+                                    doc_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "embeddings"))]
+                {
+                    let _ = doc_id;
+                    let _ = content;
+                }
+
+                Ok(())
+            }
+            Err(YgrepError::FileTooLarge { .. }) => {
+                tracing::debug!("Skipped (too large): {}", path.display());
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete a file from the index without committing (for batched watch operations)
+    pub fn delete_file_no_commit(&self, indexer: &index::Indexer, path: &Path) -> Result<()> {
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy();
+
+        indexer.delete_by_path(&relative_path)?;
+        tracing::debug!("Staged delete: {}", path.display());
+        Ok(())
+    }
+
+    /// Commit all pending indexer changes
+    pub fn commit_indexer(&self, indexer: &index::Indexer) -> Result<()> {
+        indexer.commit()
+    }
+
     /// Delete a file from the index using an existing Indexer (avoids lock churn)
     pub fn delete_file_with_indexer(&self, indexer: &index::Indexer, path: &Path) -> Result<()> {
         let relative_path = path
@@ -1203,6 +1281,130 @@ mod tests {
         assert!(
             !result.is_empty(),
             "File indexed via index_file_with_options should be searchable"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_batched_commit_multiple_files() -> Result<()> {
+        // Simulates the watch loop pattern: stage many files, commit once.
+        // This is the pattern that prevents segment merge warnings under churn.
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        std::fs::write(workspace_dir.join("seed.rs"), "fn seed() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
+        workspace.index_all()?;
+
+        let indexer = workspace.create_indexer()?;
+
+        // Stage 30 file additions without committing (simulates a git branch switch)
+        for i in 0..30 {
+            let path = workspace_dir.join(format!("batch_{}.rs", i));
+            std::fs::write(&path, format!("fn batch_func_{}() {{}}", i)).unwrap();
+            workspace.index_file_no_commit(&indexer, &path, false)?;
+        }
+
+        // Single commit for all 30 files
+        workspace.commit_indexer(&indexer)?;
+
+        // All files should be searchable
+        for i in 0..30 {
+            let result = workspace.search(&format!("batch_func_{}", i), None)?;
+            assert!(
+                !result.is_empty(),
+                "File {} should be searchable after batched commit",
+                i
+            );
+        }
+
+        // Now stage mixed deletes and adds without committing
+        for i in 0..10 {
+            let path = workspace_dir.join(format!("batch_{}.rs", i));
+            workspace.delete_file_no_commit(&indexer, &path)?;
+        }
+        for i in 30..40 {
+            let path = workspace_dir.join(format!("batch_{}.rs", i));
+            std::fs::write(&path, format!("fn batch_func_{}() {{}}", i)).unwrap();
+            workspace.index_file_no_commit(&indexer, &path, false)?;
+        }
+
+        // Single commit for mixed batch
+        workspace.commit_indexer(&indexer)?;
+
+        // Deleted files gone
+        let result = workspace.search("batch_func_0", None)?;
+        assert!(result.is_empty(), "Deleted file should not appear");
+
+        // Surviving and new files present
+        let result = workspace.search("batch_func_15", None)?;
+        assert!(!result.is_empty(), "Surviving file should be searchable");
+
+        let result = workspace.search("batch_func_35", None)?;
+        assert!(!result.is_empty(), "Newly added file should be searchable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_batched_commit_heavy_churn() -> Result<()> {
+        // Simulates git-style churn: many files created, modified, and deleted
+        // in rapid succession with only periodic commits (not per-file).
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        std::fs::write(workspace_dir.join("seed.rs"), "fn seed() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config)?;
+        workspace.index_all()?;
+
+        let indexer = workspace.create_indexer()?;
+
+        // Simulate 5 rapid batches (like 5 debounce windows during git checkout)
+        for batch in 0..5 {
+            // Each batch: create/modify/delete 20 files, commit once
+            for i in 0..20 {
+                let idx = batch * 20 + i;
+                let path = workspace_dir.join(format!("churn_{}.rs", idx));
+
+                std::fs::write(&path, format!("fn churn_v{}_{} () {{}}", batch, idx)).unwrap();
+                workspace.index_file_no_commit(&indexer, &path, false)?;
+            }
+
+            // Delete files from previous batch
+            if batch > 0 {
+                for i in 0..10 {
+                    let idx = (batch - 1) * 20 + i;
+                    let path = workspace_dir.join(format!("churn_{}.rs", idx));
+                    workspace.delete_file_no_commit(&indexer, &path)?;
+                }
+            }
+
+            // One commit per batch
+            workspace.commit_indexer(&indexer)?;
+        }
+
+        // Verify last batch's files are searchable
+        let result = workspace.search("churn_v4_80", None)?;
+        assert!(!result.is_empty(), "Latest batch file should be searchable");
+
+        // Verify early deleted files are gone
+        let result = workspace.search("churn_v0_0", None)?;
+        assert!(
+            result.is_empty(),
+            "Deleted file from early batch should be gone"
         );
 
         Ok(())
