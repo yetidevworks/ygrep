@@ -682,7 +682,7 @@ async fn watcher_task(
             watcher.start().map_err(|e| format!("start: {}", e))?;
 
             let indexer = workspace
-                .create_indexer()
+                .create_watch_indexer()
                 .map_err(|e| format!("indexer: {}", e))?;
             Ok((workspace, watcher, indexer))
         }

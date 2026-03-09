@@ -47,7 +47,7 @@ pub fn run(workspace_path: &Path) -> Result<()> {
     watcher.start().context("Failed to start file watcher")?;
 
     let indexer = workspace
-        .create_indexer()
+        .create_watch_indexer()
         .context("Failed to create indexer")?;
 
     // Create tokio runtime for async event handling

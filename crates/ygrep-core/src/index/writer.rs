@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -34,6 +35,32 @@ impl Indexer {
     /// Create a new indexer for a workspace (text search only)
     pub fn new(config: IndexerConfig, index: Index, workspace_root: &Path) -> Result<Self> {
         let writer = index.writer(50_000_000)?; // 50MB heap
+        let schema = index.schema();
+        let fields = SchemaFields::new(&schema);
+
+        Ok(Self {
+            config,
+            index,
+            writer: Arc::new(RwLock::new(writer)),
+            fields,
+            workspace_root: workspace_root.to_string_lossy().to_string(),
+            #[cfg(feature = "embeddings")]
+            vector_index: None,
+            #[cfg(feature = "embeddings")]
+            embedding_model: None,
+            #[cfg(feature = "embeddings")]
+            embedding_cache: None,
+        })
+    }
+
+    /// Create a new indexer with NoMergePolicy (for watch mode — prevents segment merge races)
+    pub fn new_no_merge(
+        config: IndexerConfig,
+        index: Index,
+        workspace_root: &Path,
+    ) -> Result<Self> {
+        let writer = index.writer(50_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
         let schema = index.schema();
         let fields = SchemaFields::new(&schema);
 

@@ -225,9 +225,9 @@ impl OutputFormat {
 fn main() -> Result<()> {
     // Initialize logging
     let filter = if std::env::var("YGREP_DEBUG").is_ok() {
-        "debug"
+        "debug,tantivy=warn"
     } else {
-        "warn"
+        "warn,tantivy=error"
     };
 
     tracing_subscriber::fmt()

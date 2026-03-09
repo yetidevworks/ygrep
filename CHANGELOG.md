@@ -5,6 +5,12 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.4] - 2026-03-09
+
+### Fixed
+- **Segment merge warnings during git operations** — rapid per-file commits caused Tantivy's background merge threads to race with subsequent commits, producing `couldn't find segment in SegmentManager` warnings during branch switching and bulk file changes. Watch-mode indexers now use `NoMergePolicy` to prevent background merge races entirely, and batch all queued events into a single commit. Segments accumulate during watch sessions but are consolidated on the next incremental index
+- **Tantivy internal warnings cluttering output** — Tantivy's internal WARN-level segment manager messages now filtered from stderr output (suppressed to error-level; visible with `YGREP_DEBUG=1`)
+
 ## [3.2.3] - 2026-03-08
 
 ### Fixed
@@ -298,6 +304,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.2.4]: https://github.com/yetidevworks/ygrep/compare/v3.2.3...v3.2.4
 [3.2.3]: https://github.com/yetidevworks/ygrep/compare/v3.2.2...v3.2.3
 [3.2.2]: https://github.com/yetidevworks/ygrep/compare/v3.2.1...v3.2.2
 [3.2.1]: https://github.com/yetidevworks/ygrep/compare/v3.2.0...v3.2.1

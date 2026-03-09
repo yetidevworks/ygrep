@@ -970,6 +970,13 @@ impl Workspace {
         index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
     }
 
+    /// Create a persistent Indexer with NoMergePolicy (for watch mode)
+    /// Prevents background merge threads from racing with commits.
+    /// Segments accumulate but are consolidated on next incremental index.
+    pub fn create_watch_indexer(&self) -> Result<index::Indexer> {
+        index::Indexer::new_no_merge(self.config.indexer.clone(), self.index.clone(), &self.root)
+    }
+
     /// Index a single file without committing (for batched watch operations)
     #[allow(unused_variables)]
     pub fn index_file_no_commit(
