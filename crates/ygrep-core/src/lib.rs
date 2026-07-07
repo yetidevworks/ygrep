@@ -156,7 +156,7 @@ impl Workspace {
         let index = if tantivy_exists {
             match Index::open_in_dir(&index_path) {
                 Ok(idx) => idx,
-                Err(e) if create => {
+                Err(_e) if create => {
                     // Corrupt index detected, silently recreate
                     // Remove corrupted index and create fresh
                     std::fs::remove_dir_all(&index_path)?;
@@ -275,7 +275,8 @@ impl Workspace {
         const BATCH_SIZE: usize = 64;
 
         for entry in walker.walk() {
-            match indexer.index_file(&entry.path) {
+            match indexer.index_file_with_chunks(&entry.path, should_index_chunks(with_embeddings))
+            {
                 Ok((doc_id, content)) => {
                     indexed += 1;
                     if indexed % 500 == 0 {
@@ -307,7 +308,10 @@ impl Workspace {
         indexer.commit()?;
 
         // Track embedded count
+        #[cfg(feature = "embeddings")]
         let mut total_embedded = 0usize;
+        #[cfg(not(feature = "embeddings"))]
+        let total_embedded = 0usize;
 
         // Phase 2: Generate embeddings in batches (if enabled)
         #[cfg(feature = "embeddings")]
@@ -561,7 +565,8 @@ impl Workspace {
             }
             // else: new file, not in map
 
-            match indexer.index_file(&entry.path) {
+            match indexer.index_file_with_chunks(&entry.path, should_index_chunks(with_embeddings))
+            {
                 Ok((doc_id, content)) => {
                     indexed += 1;
                     if indexed % 500 == 0 {
@@ -616,7 +621,10 @@ impl Workspace {
         indexer.commit()?;
 
         // Track embedded count
+        #[cfg(feature = "embeddings")]
         let mut total_embedded = 0usize;
+        #[cfg(not(feature = "embeddings"))]
+        let total_embedded = 0usize;
 
         // Generate embeddings for changed files
         #[cfg(feature = "embeddings")]
@@ -810,7 +818,7 @@ impl Workspace {
         let indexer =
             index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
 
-        match indexer.index_file(path) {
+        match indexer.index_file_with_chunks(path, false) {
             Ok((_doc_id, _content)) => {
                 indexer.commit()?;
                 tracing::debug!("Indexed: {}", path.display());
@@ -903,7 +911,7 @@ impl Workspace {
         path: &Path,
         with_embeddings: bool,
     ) -> Result<()> {
-        match indexer.index_file(path) {
+        match indexer.index_file_with_chunks(path, should_index_chunks(with_embeddings)) {
             Ok((doc_id, content)) => {
                 indexer.commit()?;
                 tracing::debug!("Indexed: {}", path.display());
@@ -985,7 +993,7 @@ impl Workspace {
         path: &Path,
         with_embeddings: bool,
     ) -> Result<()> {
-        match indexer.index_file(path) {
+        match indexer.index_file_with_chunks(path, should_index_chunks(with_embeddings)) {
             Ok((doc_id, content)) => {
                 tracing::debug!("Staged: {}", path.display());
 
@@ -1087,6 +1095,10 @@ fn hash_path(path: &Path) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let hash = xxh3_64(path.to_string_lossy().as_bytes());
     format!("{:016x}", hash)
+}
+
+fn should_index_chunks(with_embeddings: bool) -> bool {
+    cfg!(feature = "embeddings") && with_embeddings
 }
 
 #[cfg(test)]

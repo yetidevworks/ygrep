@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tantivy::merge_policy::NoMergePolicy;
@@ -20,6 +21,8 @@ pub struct Indexer {
     writer: Arc<RwLock<IndexWriter>>,
     fields: SchemaFields,
     workspace_root: String,
+    index_chunks_by_default: bool,
+    seen_content_hashes: Arc<RwLock<HashSet<String>>>,
     /// Optional vector index for semantic search
     #[cfg(feature = "embeddings")]
     vector_index: Option<Arc<VectorIndex>>,
@@ -44,6 +47,8 @@ impl Indexer {
             writer: Arc::new(RwLock::new(writer)),
             fields,
             workspace_root: workspace_root.to_string_lossy().to_string(),
+            index_chunks_by_default: false,
+            seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
             #[cfg(feature = "embeddings")]
             vector_index: None,
             #[cfg(feature = "embeddings")]
@@ -70,6 +75,8 @@ impl Indexer {
             writer: Arc::new(RwLock::new(writer)),
             fields,
             workspace_root: workspace_root.to_string_lossy().to_string(),
+            index_chunks_by_default: false,
+            seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
             #[cfg(feature = "embeddings")]
             vector_index: None,
             #[cfg(feature = "embeddings")]
@@ -99,6 +106,8 @@ impl Indexer {
             writer: Arc::new(RwLock::new(writer)),
             fields,
             workspace_root: workspace_root.to_string_lossy().to_string(),
+            index_chunks_by_default: true,
+            seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
             vector_index: Some(vector_index),
             embedding_model: Some(embedding_model),
             embedding_cache: Some(embedding_cache),
@@ -108,6 +117,16 @@ impl Indexer {
     /// Index a single file
     /// Returns (doc_id, content) so callers can reuse the content without re-reading.
     pub fn index_file(&self, path: &Path) -> Result<(String, String)> {
+        self.index_file_with_chunks(path, self.index_chunks_by_default)
+    }
+
+    /// Index a single file, optionally adding chunk documents.
+    /// Returns (doc_id, content) so callers can reuse the content without re-reading.
+    pub fn index_file_with_chunks(
+        &self,
+        path: &Path,
+        index_chunks: bool,
+    ) -> Result<(String, String)> {
         // Read file content
         let content = std::fs::read_to_string(path)?;
         let metadata = std::fs::metadata(path)?;
@@ -125,6 +144,7 @@ impl Indexer {
         // Generate content hash for deduplication and doc_id
         let content_hash = xxh3_64(content.as_bytes());
         let doc_id = format!("{:016x}", content_hash);
+        let is_duplicate_content = self.config.deduplicate && !self.mark_content_seen(&doc_id);
 
         // Get relative path
         let rel_path = path
@@ -174,10 +194,11 @@ impl Indexer {
         writer.add_document(doc)?;
 
         // Also create chunks for the file
-        #[cfg(feature = "embeddings")]
-        let chunk_ids = self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?;
-        #[cfg(not(feature = "embeddings"))]
-        let _ = self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?;
+        let chunk_ids = if index_chunks && !is_duplicate_content {
+            self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?
+        } else {
+            Vec::new()
+        };
 
         // Release the writer lock before embedding generation
         drop(writer);
@@ -205,8 +226,17 @@ impl Indexer {
                 vector_index.insert(&chunk_id, &chunk_embedding)?;
             }
         }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            let _ = chunk_ids;
+        }
 
         Ok((doc_id, content))
+    }
+
+    fn mark_content_seen(&self, doc_id: &str) -> bool {
+        let mut seen = self.seen_content_hashes.write();
+        seen.insert(doc_id.to_string())
     }
 
     /// Index chunks of a file for more granular search
@@ -220,9 +250,9 @@ impl Indexer {
     ) -> Result<Vec<(String, String)>> {
         let lines: Vec<&str> = content.lines().collect();
         let chunk_size = self.config.chunk_size;
-        let overlap = self.config.chunk_overlap;
+        let overlap = self.config.chunk_overlap.min(chunk_size.saturating_sub(1));
 
-        if lines.len() <= chunk_size {
+        if chunk_size == 0 || lines.len() <= chunk_size {
             // File is small enough, no need for chunks
             return Ok(vec![]);
         }
@@ -409,7 +439,7 @@ mod tests {
         let test_file = temp_dir.path().join("big.rs");
         std::fs::write(&test_file, &content).unwrap();
 
-        indexer.index_file(&test_file)?;
+        indexer.index_file_with_chunks(&test_file, true)?;
         indexer.commit()?;
 
         // Verify chunks were created by searching the index
@@ -425,6 +455,72 @@ mod tests {
             "Expected chunks, got {} docs",
             top_docs.len()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_text_indexing_does_not_create_chunks() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+
+        let index_path = temp_dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let mut config = IndexerConfig::default();
+        config.chunk_size = 5;
+        config.chunk_overlap = 1;
+
+        let indexer = Indexer::new(config, index.clone(), temp_dir.path()).unwrap();
+
+        let lines: Vec<String> = (1..=15).map(|i| format!("line {} content", i)).collect();
+        let test_file = temp_dir.path().join("big.rs");
+        std::fs::write(&test_file, lines.join("\n")).unwrap();
+
+        indexer.index_file(&test_file)?;
+        indexer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let all_query = tantivy::query::AllQuery;
+        let top_docs =
+            searcher.search(&all_query, &tantivy::collector::TopDocs::with_limit(100))?;
+
+        assert_eq!(top_docs.len(), 1, "Text-only indexing should store one doc");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_overlap_cannot_stall_chunking() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+
+        let index_path = temp_dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let mut config = IndexerConfig::default();
+        config.chunk_size = 3;
+        config.chunk_overlap = 3;
+
+        let indexer = Indexer::new(config, index.clone(), temp_dir.path()).unwrap();
+
+        let lines: Vec<String> = (1..=8).map(|i| format!("line {}", i)).collect();
+        let test_file = temp_dir.path().join("overlap.rs");
+        std::fs::write(&test_file, lines.join("\n")).unwrap();
+
+        indexer.index_file_with_chunks(&test_file, true)?;
+        indexer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let all_query = tantivy::query::AllQuery;
+        let top_docs =
+            searcher.search(&all_query, &tantivy::collector::TopDocs::with_limit(100))?;
+
+        assert!(top_docs.len() > 1, "Expected parent document plus chunks");
         Ok(())
     }
 

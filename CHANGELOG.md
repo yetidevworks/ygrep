@@ -5,6 +5,16 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-07-07
+
+### Added
+- **Index compaction** (`ygrep indexes compact [hash|path]`) — manually merge index segments and garbage-collect stale files for a selected index or the current workspace
+
+### Fixed
+- **Punctuation-only literal searches** — queries such as `->`, `{%`, and `::` now scan stored documents when they have no searchable index terms, preserving grep-like behavior
+- **Text-only indexing segment churn** — chunk documents are now skipped unless embeddings are enabled, reducing index size and avoiding unnecessary segment growth
+- **Zero-limit and empty-query searches** — text and hybrid search now return empty results immediately without issuing oversized Tantivy queries
+
 ## [3.2.4] - 2026-03-09
 
 ### Fixed

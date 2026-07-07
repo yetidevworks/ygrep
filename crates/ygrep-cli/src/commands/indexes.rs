@@ -255,7 +255,115 @@ pub fn list() -> Result<()> {
 
     println!("Commands:");
     println!("  ygrep indexes remove <hash|path>  Remove a specific index");
+    println!("  ygrep indexes compact [hash|path] Compact an index");
     println!("  ygrep indexes clean               Remove all orphaned indexes");
+
+    Ok(())
+}
+
+fn find_index(identifier: Option<&str>) -> Result<Option<IndexInfo>> {
+    let indexes = collect_indexes()?;
+
+    if indexes.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(identifier) = identifier {
+        if let Some(info) = indexes.iter().find(|info| info.hash == identifier) {
+            return Ok(Some(info.clone()));
+        }
+
+        let target_path = std::fs::canonicalize(identifier).ok();
+        let matches: Vec<_> = indexes
+            .into_iter()
+            .filter(|info| match (&info.workspace, &target_path) {
+                (Some(ws), Some(target)) => PathBuf::from(ws) == *target,
+                (Some(ws), None) => ws.contains(identifier),
+                _ => false,
+            })
+            .collect();
+
+        return match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => {
+                println!(
+                    "Ambiguous identifier '{}' matches {} indexes:",
+                    identifier,
+                    matches.len()
+                );
+                for info in &matches {
+                    println!(
+                        "  {} ({})",
+                        shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
+                        info.hash
+                    );
+                }
+                println!("\nUse the full hash to select a specific index.");
+                Ok(None)
+            }
+        };
+    }
+
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    if let Some(cwd) = cwd {
+        if let Some(info) = indexes.iter().find(|info| {
+            info.workspace
+                .as_ref()
+                .map(|workspace| PathBuf::from(workspace) == cwd)
+                .unwrap_or(false)
+        }) {
+            return Ok(Some(info.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Compact an index by merging segments and garbage-collecting stale files.
+pub fn compact(identifier: Option<&str>) -> Result<()> {
+    let Some(info) = find_index(identifier)? else {
+        match identifier {
+            Some(identifier) => println!("Index not found: {}", identifier),
+            None => println!("No index found for the current workspace."),
+        }
+        return Ok(());
+    };
+
+    if info.orphaned {
+        println!(
+            "Refusing to compact orphaned index: {} ({})",
+            shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
+            info.hash
+        );
+        println!("Use `ygrep indexes remove {}` to delete it.", info.hash);
+        return Ok(());
+    }
+
+    let before = info.size_bytes;
+    println!(
+        "Compacting {} ({})...",
+        shorten_path(info.workspace.as_deref().unwrap_or(&info.hash)),
+        format_size(before)
+    );
+
+    let stats = ygrep_core::index::compact_index(&info.path)?;
+    let after = dir_size(&info.path).unwrap_or(before);
+
+    println!(
+        "Compacted: {} -> {}",
+        format_size(before),
+        format_size(after)
+    );
+    println!(
+        "Segments: {} -> {}",
+        stats.segments_before, stats.segments_after
+    );
+    if before > after {
+        println!("Freed {}", format_size(before - after));
+    }
 
     Ok(())
 }

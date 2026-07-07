@@ -51,9 +51,18 @@ impl HybridSearcher {
         let limit = limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(SearchResult {
+                total: 0,
+                hits: vec![],
+                query_time_ms: start.elapsed().as_millis() as u64,
+                text_hits: 0,
+                semantic_hits: 0,
+            });
+        }
 
         // Fetch more results from each method for better fusion
-        let fetch_limit = limit * 3;
+        let fetch_limit = limit.saturating_mul(3);
 
         // Run BM25 search
         let bm25_results = self.bm25_search(query, fetch_limit)?;

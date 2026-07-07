@@ -256,7 +256,7 @@ impl Default for IndexerConfig {
             respect_gitignore: false,
             deduplicate: true,
             chunk_size: 50,
-            chunk_overlap: 10,
+            chunk_overlap: 0,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get().min(4))
                 .unwrap_or(2),

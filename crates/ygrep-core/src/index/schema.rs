@@ -5,7 +5,7 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerManager};
 
 /// Schema version - increment when schema changes require reindexing
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Name of our custom code tokenizer
 pub const CODE_TOKENIZER: &str = "code";

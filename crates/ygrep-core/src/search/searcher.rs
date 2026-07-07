@@ -1,7 +1,7 @@
 use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::time::Instant;
-use tantivy::{collector::TopDocs, query::QueryParser, Index};
+use tantivy::{collector::TopDocs, query::QueryParser, Index, TantivyDocument};
 
 use super::results::{MatchType, SearchHit, SearchResult};
 use crate::config::SearchConfig;
@@ -41,6 +41,9 @@ impl Searcher {
         let limit = limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(empty_result(start));
+        }
 
         // Get a reader (with retry for META_LOCK contention, issue #7)
         let reader = super::open_reader_with_retry(&self.index)?;
@@ -60,28 +63,8 @@ impl Searcher {
             .filter(|s| !s.is_empty())
             .collect();
 
-        // If no searchable terms, return empty
-        if search_terms.is_empty() {
-            return Ok(SearchResult {
-                total: 0,
-                hits: vec![],
-                query_time_ms: start.elapsed().as_millis() as u64,
-                text_hits: 0,
-                semantic_hits: 0,
-            });
-        }
-
-        // Search for the extracted terms
-        let tantivy_query_str = search_terms.join(" ");
-        let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
-
-        // Fetch more results since we'll filter them down
-        let fetch_limit = limit * 50;
-        let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
-
         // Build results
-        let mut hits = Vec::with_capacity(top_docs.len());
-        let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
+        let mut hits = Vec::with_capacity(limit);
         let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
 
         // Prepare query for matching
@@ -93,86 +76,65 @@ impl Searcher {
         let query_terms: Vec<&str> = query_normalized.split_whitespace().collect();
         let is_multi_word = query_terms.len() > 1;
 
-        for (score, doc_address) in top_docs {
-            // Stop if we have enough results
-            if hits.len() >= limit {
-                break;
+        if search_terms.is_empty() {
+            // Punctuation-only literals such as "->", "{%", or "::" have no
+            // useful index terms. Scan stored docs so literal search still
+            // behaves like grep.
+            'segments: for segment_reader in searcher.segment_readers() {
+                let store_reader = segment_reader.get_store_reader(8)?;
+                for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+                    if hits.len() >= limit {
+                        break 'segments;
+                    }
+                    if let Some(hit) = self.literal_hit_from_doc(
+                        &doc?,
+                        1.0,
+                        1.0,
+                        query,
+                        &query_normalized,
+                        &query_terms,
+                        is_multi_word,
+                        case_sensitive,
+                        context_before,
+                        context_after,
+                        &mut seen,
+                    ) {
+                        hits.push(hit);
+                    }
+                }
             }
+        } else {
+            // Search for the extracted terms
+            let tantivy_query_str = search_terms.join(" ");
+            let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
 
-            let doc = searcher.doc(doc_address)?;
+            // Fetch more results since we'll filter them down
+            let fetch_limit = limit.saturating_mul(50);
+            let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+            let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
 
-            // Extract fields
-            let path = extract_text(&doc, self.fields.path).unwrap_or_default();
-            let doc_id = extract_text(&doc, self.fields.doc_id).unwrap_or_default();
-            let content = extract_text(&doc, self.fields.content).unwrap_or_default();
-            let line_start = extract_u64(&doc, self.fields.line_start).unwrap_or(1);
-            let chunk_id = extract_text(&doc, self.fields.chunk_id).unwrap_or_default();
+            for (score, doc_address) in top_docs {
+                if hits.len() >= limit {
+                    break;
+                }
 
-            let content_normalized = if case_sensitive {
-                content.clone()
-            } else {
-                content.to_lowercase()
-            };
-
-            // Check if path matches the query (filename search)
-            let path_normalized = path.to_lowercase();
-            let path_match = query_terms
-                .iter()
-                .all(|term| path_normalized.contains(term));
-
-            // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
-            let exact_match = content_normalized.contains(&query_normalized);
-            let and_match = is_multi_word
-                && query_terms
-                    .iter()
-                    .all(|term| content_normalized.contains(term));
-            if !exact_match && !and_match && !path_match {
-                continue;
+                let doc = searcher.doc(doc_address)?;
+                if let Some(hit) = self.literal_hit_from_doc(
+                    &doc,
+                    score,
+                    max_score,
+                    query,
+                    &query_normalized,
+                    &query_terms,
+                    is_multi_word,
+                    case_sensitive,
+                    context_before,
+                    context_after,
+                    &mut seen,
+                ) {
+                    hits.push(hit);
+                }
             }
-
-            // Normalize score to 0-1 range
-            let normalized_score = if max_score > 0.0 {
-                score / max_score
-            } else {
-                0.0
-            };
-
-            // For path-only matches (no content match), show beginning of file
-            let is_content_match = exact_match || and_match;
-
-            let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
-                if is_content_match {
-                    create_relevant_snippet(&content, query, 10, context_before, context_after)
-                } else {
-                    // Path-only match: show first few lines
-                    let lines: Vec<&str> = content.lines().take(10).collect();
-                    let snippet = lines.join("\n");
-                    let line_count = lines.len();
-                    (snippet, 0, line_count, 0)
-                };
-
-            // Adjust line numbers to reflect where the snippet is in the file
-            let actual_line_start = line_start + snippet_offset as u64;
-            let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
-            let match_line_in_snippet = match_line_offset - snippet_offset;
-
-            // Deduplicate: skip if we already have a hit for the same file and line range
-            let key = (path.clone(), actual_line_start, actual_line_end);
-            if !seen.insert(key) {
-                continue;
-            }
-
-            hits.push(SearchHit {
-                path,
-                line_start: actual_line_start,
-                line_end: actual_line_end,
-                snippet,
-                score: normalized_score,
-                is_chunk: !chunk_id.is_empty(),
-                doc_id,
-                match_type: MatchType::Text,
-                match_line_in_snippet,
-            });
         }
 
         let query_time_ms = start.elapsed().as_millis() as u64;
@@ -199,11 +161,24 @@ impl Searcher {
         context_after: Option<usize>,
         verbose: bool,
     ) -> Result<SearchResult> {
+        let requested_limit = limit
+            .unwrap_or(self.config.default_limit)
+            .min(self.config.max_limit);
+        if requested_limit == 0 {
+            return Ok(SearchResult {
+                total: 0,
+                hits: vec![],
+                query_time_ms: 0,
+                text_hits: 0,
+                semantic_hits: 0,
+            });
+        }
+
         // Use regex search if requested
         let mut result = if use_regex {
             self.search_regex(
                 query,
-                Some(limit.unwrap_or(self.config.max_limit) * 2),
+                Some(requested_limit.saturating_mul(2)),
                 case_sensitive,
                 context_before,
                 context_after,
@@ -211,7 +186,7 @@ impl Searcher {
         } else {
             self.search(
                 query,
-                Some(limit.unwrap_or(self.config.max_limit) * 2),
+                Some(requested_limit.saturating_mul(2)),
                 case_sensitive,
                 context_before,
                 context_after,
@@ -261,10 +236,7 @@ impl Searcher {
         }
 
         // Re-limit
-        let limit = limit
-            .unwrap_or(self.config.default_limit)
-            .min(self.config.max_limit);
-        result.hits.truncate(limit);
+        result.hits.truncate(requested_limit);
         result.total = result.hits.len();
 
         // Fix text_hits/semantic_hits to reflect post-filter counts (issue #10)
@@ -299,10 +271,14 @@ impl Searcher {
         let limit = limit
             .unwrap_or(self.config.default_limit)
             .min(self.config.max_limit);
+        if limit == 0 || pattern.trim().is_empty() {
+            return Ok(empty_result(start));
+        }
 
         // Compile regex (case-insensitive by default unless --case-sensitive)
         let regex = match RegexBuilder::new(pattern)
             .case_insensitive(!case_sensitive)
+            .multi_line(true)
             .build()
         {
             Ok(r) => r,
@@ -332,80 +308,60 @@ impl Searcher {
             .filter(|s| !s.is_empty() && s.len() > 1) // Skip single chars (likely regex syntax)
             .collect();
 
-        // If we have searchable terms, use Tantivy to narrow down candidates
-        let candidates: Vec<_> = if !search_terms.is_empty() {
+        // Build results by applying regex filter
+        let mut hits = Vec::with_capacity(limit);
+        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
+
+        // If we have searchable terms, use Tantivy to narrow down candidates.
+        // Otherwise scan stored docs so regexes like "^#" or punctuation-only
+        // expressions are exhaustive instead of capped by an arbitrary TopDocs size.
+        if !search_terms.is_empty() {
             let tantivy_query_str = search_terms.join(" ");
             let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
 
             // Fetch many candidates since regex might be selective
-            let fetch_limit = limit * 100;
-            searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?
+            let fetch_limit = limit.saturating_mul(100);
+            let candidates = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+            let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
+
+            for (score, doc_address) in candidates {
+                if hits.len() >= limit {
+                    break;
+                }
+
+                let doc = searcher.doc(doc_address)?;
+                if let Some(hit) = self.regex_hit_from_doc(
+                    &doc,
+                    &regex,
+                    score,
+                    max_score,
+                    context_before,
+                    context_after,
+                    &mut seen,
+                ) {
+                    hits.push(hit);
+                }
+            }
         } else {
-            // No good search terms - scan all documents
-            // This is slow but necessary for patterns like "^#" or ".*"
-            let all_query = tantivy::query::AllQuery;
-            let fetch_limit = limit * 100;
-            searcher.search(&all_query, &TopDocs::with_limit(fetch_limit))?
-        };
-
-        // Build results by applying regex filter
-        let mut hits = Vec::with_capacity(candidates.len());
-        let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
-        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
-
-        for (score, doc_address) in candidates {
-            // Stop if we have enough results
-            if hits.len() >= limit {
-                break;
+            'segments: for segment_reader in searcher.segment_readers() {
+                let store_reader = segment_reader.get_store_reader(8)?;
+                for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+                    if hits.len() >= limit {
+                        break 'segments;
+                    }
+                    if let Some(hit) = self.regex_hit_from_doc(
+                        &doc?,
+                        &regex,
+                        1.0,
+                        1.0,
+                        context_before,
+                        context_after,
+                        &mut seen,
+                    ) {
+                        hits.push(hit);
+                    }
+                }
             }
-
-            let doc = searcher.doc(doc_address)?;
-
-            // Extract fields
-            let path = extract_text(&doc, self.fields.path).unwrap_or_default();
-            let doc_id = extract_text(&doc, self.fields.doc_id).unwrap_or_default();
-            let content = extract_text(&doc, self.fields.content).unwrap_or_default();
-            let line_start = extract_u64(&doc, self.fields.line_start).unwrap_or(1);
-            let chunk_id = extract_text(&doc, self.fields.chunk_id).unwrap_or_default();
-
-            // REGEX FILTER: Only include if content matches the regex
-            if !regex.is_match(&content) {
-                continue;
-            }
-
-            // Normalize score to 0-1 range
-            let normalized_score = if max_score > 0.0 {
-                score / max_score
-            } else {
-                0.0
-            };
-
-            // Create snippet showing lines that match the regex
-            let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
-                create_regex_snippet(&content, &regex, 10, context_before, context_after);
-
-            // Adjust line numbers to reflect where the snippet is in the file
-            let actual_line_start = line_start + snippet_offset as u64;
-            let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
-            let match_line_in_snippet = match_line_offset - snippet_offset;
-
-            // Deduplicate: skip if we already have a hit for the same file and line range
-            let key = (path.clone(), actual_line_start, actual_line_end);
-            if !seen.insert(key) {
-                continue;
-            }
-
-            hits.push(SearchHit {
-                path,
-                line_start: actual_line_start,
-                line_end: actual_line_end,
-                snippet,
-                score: normalized_score,
-                is_chunk: !chunk_id.is_empty(),
-                doc_id,
-                match_type: MatchType::Text,
-                match_line_in_snippet,
-            });
         }
 
         let query_time_ms = start.elapsed().as_millis() as u64;
@@ -419,6 +375,154 @@ impl Searcher {
             semantic_hits: 0,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn literal_hit_from_doc(
+        &self,
+        doc: &TantivyDocument,
+        score: f32,
+        max_score: f32,
+        query: &str,
+        query_normalized: &str,
+        query_terms: &[&str],
+        is_multi_word: bool,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+        seen: &mut HashSet<(String, u64, u64)>,
+    ) -> Option<SearchHit> {
+        let path = extract_text(doc, self.fields.path).unwrap_or_default();
+        let doc_id = extract_text(doc, self.fields.doc_id).unwrap_or_default();
+        let content = extract_text(doc, self.fields.content).unwrap_or_default();
+        let line_start = extract_u64(doc, self.fields.line_start).unwrap_or(1);
+        let chunk_id = extract_text(doc, self.fields.chunk_id).unwrap_or_default();
+
+        let content_normalized = if case_sensitive {
+            content.clone()
+        } else {
+            content.to_lowercase()
+        };
+
+        // Check if path matches the query (filename search)
+        let path_normalized = if case_sensitive {
+            path.clone()
+        } else {
+            path.to_lowercase()
+        };
+        let path_match = !query_terms.is_empty()
+            && query_terms
+                .iter()
+                .all(|term| path_normalized.contains(term));
+
+        // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
+        let exact_match = content_normalized.contains(query_normalized);
+        let and_match = is_multi_word
+            && query_terms
+                .iter()
+                .all(|term| content_normalized.contains(term));
+        if !exact_match && !and_match && !path_match {
+            return None;
+        }
+
+        // Normalize score to 0-1 range
+        let normalized_score = if max_score > 0.0 {
+            score / max_score
+        } else {
+            0.0
+        };
+
+        // For path-only matches (no content match), show beginning of file
+        let is_content_match = exact_match || and_match;
+
+        let (snippet, snippet_offset, snippet_line_count, match_line_offset) = if is_content_match {
+            create_relevant_snippet(&content, query, 10, context_before, context_after)
+        } else {
+            // Path-only match: show first few lines
+            let lines: Vec<&str> = content.lines().take(10).collect();
+            let snippet = lines.join("\n");
+            let line_count = lines.len();
+            (snippet, 0, line_count, 0)
+        };
+
+        // Adjust line numbers to reflect where the snippet is in the file
+        let actual_line_start = line_start + snippet_offset as u64;
+        let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+        let match_line_in_snippet = match_line_offset.saturating_sub(snippet_offset);
+
+        // Deduplicate: skip if we already have a hit for the same file and line range
+        let key = (path.clone(), actual_line_start, actual_line_end);
+        if !seen.insert(key) {
+            return None;
+        }
+
+        Some(SearchHit {
+            path,
+            line_start: actual_line_start,
+            line_end: actual_line_end,
+            snippet,
+            score: normalized_score,
+            is_chunk: !chunk_id.is_empty(),
+            doc_id,
+            match_type: MatchType::Text,
+            match_line_in_snippet,
+        })
+    }
+
+    fn regex_hit_from_doc(
+        &self,
+        doc: &TantivyDocument,
+        regex: &regex::Regex,
+        score: f32,
+        max_score: f32,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+        seen: &mut HashSet<(String, u64, u64)>,
+    ) -> Option<SearchHit> {
+        let path = extract_text(doc, self.fields.path).unwrap_or_default();
+        let doc_id = extract_text(doc, self.fields.doc_id).unwrap_or_default();
+        let content = extract_text(doc, self.fields.content).unwrap_or_default();
+        let line_start = extract_u64(doc, self.fields.line_start).unwrap_or(1);
+        let chunk_id = extract_text(doc, self.fields.chunk_id).unwrap_or_default();
+
+        // REGEX FILTER: Only include if content matches the regex
+        if !regex.is_match(&content) {
+            return None;
+        }
+
+        // Normalize score to 0-1 range
+        let normalized_score = if max_score > 0.0 {
+            score / max_score
+        } else {
+            0.0
+        };
+
+        // Create snippet showing lines that match the regex
+        let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
+            create_regex_snippet(&content, regex, 10, context_before, context_after);
+
+        // Adjust line numbers to reflect where the snippet is in the file
+        let actual_line_start = line_start + snippet_offset as u64;
+        let actual_line_end = actual_line_start + snippet_line_count.saturating_sub(1) as u64;
+        let match_line_in_snippet = match_line_offset.saturating_sub(snippet_offset);
+
+        // Deduplicate: skip if we already have a hit for the same file and line range
+        let key = (path.clone(), actual_line_start, actual_line_end);
+        if !seen.insert(key) {
+            return None;
+        }
+
+        Some(SearchHit {
+            path,
+            line_start: actual_line_start,
+            line_end: actual_line_end,
+            snippet,
+            score: normalized_score,
+            is_chunk: !chunk_id.is_empty(),
+            doc_id,
+            match_type: MatchType::Text,
+            match_line_in_snippet,
+        })
+    }
 }
 
 /// Filters for search
@@ -428,6 +532,16 @@ pub struct SearchFilters {
     pub extensions: Option<Vec<String>>,
     /// Filter by path patterns
     pub paths: Option<Vec<String>>,
+}
+
+fn empty_result(start: Instant) -> SearchResult {
+    SearchResult {
+        total: 0,
+        hits: vec![],
+        query_time_ms: start.elapsed().as_millis() as u64,
+        text_hits: 0,
+        semantic_hits: 0,
+    }
 }
 
 /// Extract text value from a document
@@ -471,7 +585,12 @@ fn create_relevant_snippet(
     let mut matching_indices: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let line_lower = line.to_lowercase();
-        if query_terms.iter().any(|term| line_lower.contains(term)) {
+        let matches = if query_terms.is_empty() {
+            !query_lower.is_empty() && line_lower.contains(&query_lower)
+        } else {
+            query_terms.iter().any(|term| line_lower.contains(term))
+        };
+        if matches {
             matching_indices.push(i);
         }
     }
@@ -734,6 +853,64 @@ mod tests {
     }
 
     #[test]
+    fn test_punctuation_literal_search_scans_when_no_index_terms() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/client.php",
+            "$client->get('/api/users');",
+            "php",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search("->", None, false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/client.php");
+        assert!(result.hits[0].snippet.contains("->get"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_without_index_terms_scans_all_documents() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        for i in 0..120 {
+            add_doc(
+                &index,
+                &fields,
+                &format!("nonmatch-{i}"),
+                &format!("src/file_{i}.rs"),
+                "fn main() {}",
+                "rs",
+            );
+        }
+        add_doc(
+            &index,
+            &fields,
+            "match",
+            "README.md",
+            "# Project\n\nDetails",
+            "md",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search_regex("^#", Some(1), false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "README.md");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_regex_search_basic() -> Result<()> {
         let temp_dir = tempdir().unwrap();
         let (index, fields) = create_test_index(temp_dir.path());
@@ -751,6 +928,30 @@ mod tests {
 
         let result = searcher.search_regex("hello.*world", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_search_line_anchors_are_multiline() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/imports.php",
+            "<?php\nuse Grav\\Common\\Grav;\nclass Imports {}",
+            "php",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search_regex("^use ", None, false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/imports.php");
+        assert!(result.hits[0].snippet.contains("use Grav"));
 
         Ok(())
     }

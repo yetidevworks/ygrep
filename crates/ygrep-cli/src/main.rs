@@ -186,6 +186,11 @@ pub enum IndexesCommand {
         /// Index hash (from `ygrep indexes list`) or workspace path
         identifier: String,
     },
+    /// Compact an index by merging segments and collecting stale files
+    Compact {
+        /// Index hash or workspace path (default: current workspace)
+        identifier: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -303,6 +308,9 @@ fn main() -> Result<()> {
             IndexesCommand::List => commands::indexes::list()?,
             IndexesCommand::Clean => commands::indexes::clean()?,
             IndexesCommand::Remove { identifier } => commands::indexes::remove(&identifier)?,
+            IndexesCommand::Compact { identifier } => {
+                commands::indexes::compact(identifier.as_deref())?
+            }
         },
         Some(Commands::Dashboard) => {
             commands::dashboard::run()?;
