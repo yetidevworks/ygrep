@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use ygrep_core::{WatchEvent, Workspace};
+use ygrep_core::{WatchEvent, Workspace, YgrepError};
 
 pub fn run(workspace_path: &Path) -> Result<()> {
     eprintln!("Opening workspace {}...", workspace_path.display());
@@ -8,12 +8,20 @@ pub fn run(workspace_path: &Path) -> Result<()> {
     // Open existing workspace (fails if not indexed)
     let workspace = match Workspace::open(workspace_path) {
         Ok(ws) => ws,
-        Err(_) => {
+        Err(YgrepError::WorkspaceNotIndexed(_)) => {
             eprintln!("Workspace not indexed: {}", workspace_path.display());
             eprintln!();
             eprintln!("To watch this workspace, first index it:");
             eprintln!("  ygrep index              # Text-only (fast)");
             eprintln!("  ygrep index --semantic   # With semantic search (slower, better results)");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "Failed to open index for {}: {}",
+                workspace_path.display(),
+                e
+            );
             std::process::exit(1);
         }
     };

@@ -5,6 +5,12 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.1] - 2026-07-16
+
+### Fixed
+- **Read-only access to existing indexes** ([#12](https://github.com/yetidevworks/ygrep/issues/12)) — `ygrep search` and `ygrep status` no longer require write access to the index directory. They now open the index through a lock-free read-only Tantivy directory, so a sandboxed process (e.g. a coding agent) can consume a centrally-maintained index it can only read. Previously a readable but non-writable index was misreported as `Workspace not indexed`
+- **Misleading errors from `search`, `status`, and `watch`** — these commands no longer collapse every open failure into "Workspace not indexed". Genuine open errors (corrupt index, permission problems for mutating commands) are now reported as-is instead of recommending a rebuild
+
 ## [3.3.0] - 2026-07-07
 
 ### Added
@@ -314,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.3.1]: https://github.com/yetidevworks/ygrep/compare/v3.3.0...v3.3.1
+[3.3.0]: https://github.com/yetidevworks/ygrep/compare/v3.2.4...v3.3.0
 [3.2.4]: https://github.com/yetidevworks/ygrep/compare/v3.2.3...v3.2.4
 [3.2.3]: https://github.com/yetidevworks/ygrep/compare/v3.2.2...v3.2.3
 [3.2.2]: https://github.com/yetidevworks/ygrep/compare/v3.2.1...v3.2.2

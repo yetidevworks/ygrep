@@ -1,3 +1,4 @@
+pub mod readonly_dir;
 pub mod schema;
 #[cfg(feature = "embeddings")]
 pub mod vector;
@@ -5,6 +6,7 @@ pub mod writer;
 
 use std::path::Path;
 
+pub use readonly_dir::ReadOnlyDirectory;
 pub use schema::{
     build_document_schema, fields, register_tokenizers, SchemaFields, CODE_TOKENIZER,
     SCHEMA_VERSION,

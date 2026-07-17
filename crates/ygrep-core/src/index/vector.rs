@@ -45,7 +45,12 @@ impl VectorIndex {
     /// Create a new vector index
     pub fn new(path: PathBuf, dimension: usize) -> Result<Self> {
         std::fs::create_dir_all(&path)?;
+        Ok(Self::empty(path, dimension))
+    }
 
+    /// Create an empty in-memory vector index without touching the filesystem.
+    /// Used for read-only opens when no semantic index exists on disk.
+    pub fn empty(path: PathBuf, dimension: usize) -> Self {
         // HNSW parameters:
         // - max_nb_connection (M): 16 is a good default
         // - max_elements: Initial capacity, will grow
@@ -59,12 +64,12 @@ impl VectorIndex {
             DistCosine {},
         );
 
-        Ok(Self {
+        Self {
             path,
             hnsw: RwLock::new(hnsw),
             dimension,
             doc_ids: RwLock::new(Vec::new()),
-        })
+        }
     }
 
     /// Load an existing vector index

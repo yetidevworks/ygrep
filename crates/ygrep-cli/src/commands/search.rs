@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use ygrep_core::Workspace;
+use ygrep_core::{Workspace, YgrepError};
 
 use crate::OutputFormat;
 
@@ -19,15 +19,23 @@ pub fn run(
     format: OutputFormat,
     verbose: bool,
 ) -> Result<()> {
-    // Open existing workspace (fails if not indexed)
-    let workspace = match Workspace::open(workspace_path) {
+    // Open existing workspace read-only (fails if not indexed)
+    let workspace = match Workspace::open_readonly(workspace_path) {
         Ok(ws) => ws,
-        Err(_) => {
+        Err(YgrepError::WorkspaceNotIndexed(_)) => {
             eprintln!("Workspace not indexed: {}", workspace_path.display());
             eprintln!();
             eprintln!("To index this workspace, run:");
             eprintln!("  ygrep index              # Text-only (fast)");
             eprintln!("  ygrep index --semantic   # With semantic search (slower, better results)");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "Failed to open index for {}: {}",
+                workspace_path.display(),
+                e
+            );
             std::process::exit(1);
         }
     };

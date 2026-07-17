@@ -62,32 +62,58 @@ pub struct Workspace {
     embedding_cache: Arc<EmbeddingCache>,
 }
 
+/// How the workspace index will be used, which determines what filesystem
+/// access `open_internal` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// Create the index if it doesn't exist (indexing)
+    Create,
+    /// Open an existing index with write access (watch, incremental updates)
+    Write,
+    /// Open an existing index for search/status only. Never writes to the
+    /// index directory, so it works when the directory is read-only (issue #12)
+    ReadOnly,
+}
+
 impl Workspace {
-    /// Open an existing workspace (fails if not indexed)
+    /// Open an existing workspace for updates (fails if not indexed)
     pub fn open(root: &Path) -> Result<Self> {
         let config = Config::load();
-        Self::open_internal(root, config, false)
+        Self::open_internal(root, config, OpenMode::Write)
     }
 
-    /// Open an existing workspace with custom config (fails if not indexed)
+    /// Open an existing workspace for updates with custom config (fails if not indexed)
     pub fn open_with_config(root: &Path, config: Config) -> Result<Self> {
-        Self::open_internal(root, config, false)
+        Self::open_internal(root, config, OpenMode::Write)
+    }
+
+    /// Open an existing workspace read-only (fails if not indexed).
+    /// Works when the index directory is readable but not writable, e.g. a
+    /// sandboxed process consuming a centrally-maintained index (issue #12).
+    pub fn open_readonly(root: &Path) -> Result<Self> {
+        let config = Config::load();
+        Self::open_internal(root, config, OpenMode::ReadOnly)
+    }
+
+    /// Open an existing workspace read-only with custom config (fails if not indexed)
+    pub fn open_readonly_with_config(root: &Path, config: Config) -> Result<Self> {
+        Self::open_internal(root, config, OpenMode::ReadOnly)
     }
 
     /// Create or open a workspace for indexing
     pub fn create(root: &Path) -> Result<Self> {
         let config = Config::load();
-        Self::open_internal(root, config, true)
+        Self::open_internal(root, config, OpenMode::Create)
     }
 
     /// Create or open a workspace with custom config for indexing
     pub fn create_with_config(root: &Path, config: Config) -> Result<Self> {
-        Self::open_internal(root, config, true)
+        Self::open_internal(root, config, OpenMode::Create)
     }
 
-    /// Open or create a workspace with custom config
-    /// If create is false, returns an error if the index doesn't exist
-    fn open_internal(root: &Path, config: Config, create: bool) -> Result<Self> {
+    /// Open or create a workspace with custom config.
+    /// Unless the mode is `Create`, returns an error if the index doesn't exist.
+    fn open_internal(root: &Path, config: Config, mode: OpenMode) -> Result<Self> {
         let root = std::fs::canonicalize(root)?;
 
         // Resolve data directory:
@@ -112,11 +138,8 @@ impl Workspace {
         let tantivy_exists = index_path.join("meta.json").exists();
 
         // If not creating and workspace not indexed, return error
-        if !create && !workspace_indexed {
-            return Err(YgrepError::Config(format!(
-                "Workspace not indexed: {}",
-                root.display()
-            )));
+        if mode != OpenMode::Create && !workspace_indexed {
+            return Err(YgrepError::WorkspaceNotIndexed(root));
         }
 
         // Open or create Tantivy index
@@ -126,7 +149,8 @@ impl Workspace {
         // On macOS, the default data path (~/Library/Application Support/ygrep/) may not
         // be writable in sandboxed environments, causing cryptic lockfile PermissionDenied
         // errors.  Detect this upfront and suggest XDG_DATA_HOME.
-        if index_path.exists() {
+        // Skipped for read-only opens, which never write to the index directory.
+        if mode != OpenMode::ReadOnly && index_path.exists() {
             let probe = index_path.join(".ygrep-write-probe");
             match std::fs::write(&probe, b"") {
                 Ok(()) => {
@@ -148,23 +172,38 @@ impl Workspace {
         // Tantivy's reader acquires META_LOCK via flock(); on macOS Intel this can
         // fail with EPERM if a stale lockfile inode still has an unreleased flock.
         // Removing the file forces the next acquire_lock() to create a fresh inode.
-        if !create {
+        // Read-only opens use no-op locks instead, so stale lockfiles can't block them.
+        if mode == OpenMode::Write {
             let _ = std::fs::remove_file(index_path.join(".tantivy-meta.lock"));
             let _ = std::fs::remove_file(index_path.join(".tantivy-writer.lock"));
         }
 
         let index = if tantivy_exists {
-            match Index::open_in_dir(&index_path) {
-                Ok(idx) => idx,
-                Err(_e) if create => {
-                    // Corrupt index detected, silently recreate
-                    // Remove corrupted index and create fresh
-                    std::fs::remove_dir_all(&index_path)?;
-                    std::fs::create_dir_all(&index_path)?;
-                    Index::create_in_dir(&index_path, schema)?
+            if mode == OpenMode::ReadOnly {
+                // Open through a directory wrapper that never takes filesystem
+                // locks, so search works on a non-writable index directory
+                let mmap = tantivy::directory::MmapDirectory::open(&index_path)
+                    .map_err(tantivy::TantivyError::from)?;
+                Index::open(index::ReadOnlyDirectory::new(mmap))?
+            } else {
+                match Index::open_in_dir(&index_path) {
+                    Ok(idx) => idx,
+                    Err(_e) if mode == OpenMode::Create => {
+                        // Corrupt index detected, silently recreate
+                        // Remove corrupted index and create fresh
+                        std::fs::remove_dir_all(&index_path)?;
+                        std::fs::create_dir_all(&index_path)?;
+                        Index::create_in_dir(&index_path, schema)?
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
+        } else if mode == OpenMode::ReadOnly {
+            return Err(YgrepError::Config(format!(
+                "Index at {} is incomplete (missing Tantivy metadata).\n\
+                 Re-run 'ygrep index' to rebuild it.",
+                index_path.display()
+            )));
         } else {
             // Create directory only when explicitly creating the index
             std::fs::create_dir_all(&index_path)?;
@@ -183,6 +222,11 @@ impl Workspace {
             let vector_index = if VectorIndex::exists(&vector_path) {
                 match VectorIndex::load(vector_path.clone()) {
                     Ok(vi) => Arc::new(vi),
+                    Err(_e) if mode == OpenMode::ReadOnly => {
+                        // Corrupt vector index, but we can't rewrite it —
+                        // fall back to text-only search
+                        Arc::new(VectorIndex::empty(vector_path, EMBEDDING_DIM))
+                    }
                     Err(_e) => {
                         // Corrupt vector index detected, silently recreate
                         // Remove corrupted vector files and create fresh
@@ -192,6 +236,9 @@ impl Workspace {
                         Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
                     }
                 }
+            } else if mode == OpenMode::ReadOnly {
+                // No semantic index on disk; don't create its directory
+                Arc::new(VectorIndex::empty(vector_path, EMBEDDING_DIM))
             } else {
                 Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
             };
@@ -1160,6 +1207,107 @@ mod tests {
         assert!(result.hits.iter().any(|h| h.path.contains("hello")));
 
         Ok(())
+    }
+
+    /// Recursively set or clear write permission on a directory tree
+    #[cfg(unix)]
+    fn set_tree_writable(path: &Path, writable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.is_dir() {
+            if writable {
+                0o755
+            } else {
+                0o555
+            }
+        } else if writable {
+            0o644
+        } else {
+            0o444
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                set_tree_writable(&entry.unwrap().path(), writable);
+            }
+        }
+    }
+
+    /// Read-only search on a non-writable index directory (issue #12):
+    /// a sandboxed process must be able to search an index it cannot write to.
+    #[cfg(unix)]
+    #[test]
+    fn test_readonly_open_and_search_on_unwritable_index() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("hello.rs"),
+            "fn hello_world() { println!(\"Hello!\"); }",
+        )
+        .unwrap();
+
+        let data_dir = temp_dir.path().join("data");
+        let mut config = Config::default();
+        config.indexer.data_dir = data_dir.clone();
+        config.indexer.ignore_patterns = vec![];
+
+        // Index normally, then drop the workspace to release locks
+        {
+            let workspace = Workspace::create_with_config(&workspace_dir, config.clone())?;
+            let stats = workspace.index_all()?;
+            assert!(stats.indexed >= 1);
+        }
+
+        // Make the entire data directory read-only
+        set_tree_writable(&data_dir, false);
+
+        let result = (|| -> Result<()> {
+            let workspace = Workspace::open_readonly_with_config(&workspace_dir, config.clone())?;
+            let result = workspace.search("hello", None)?;
+            assert!(!result.is_empty());
+            assert!(result.hits.iter().any(|h| h.path.contains("hello")));
+
+            // Status-style metadata reads must also work
+            assert_eq!(workspace.stored_semantic_flag(), Some(false));
+
+            // A writable open of the same index must fail with the
+            // writability hint, not something cryptic
+            let err = Workspace::open_with_config(&workspace_dir, config.clone())
+                .err()
+                .expect("writable open of a read-only index should fail");
+            assert!(
+                err.to_string().contains("not writable"),
+                "unexpected error: {err}"
+            );
+            Ok(())
+        })();
+
+        // Restore permissions so the tempdir can be cleaned up
+        set_tree_writable(&data_dir, true);
+        result
+    }
+
+    /// Opening an unindexed workspace must return the WorkspaceNotIndexed
+    /// variant so the CLI can distinguish it from other open failures (issue #12)
+    #[test]
+    fn test_open_unindexed_returns_not_indexed_variant() {
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+
+        for result in [
+            Workspace::open_with_config(&workspace_dir, config.clone()),
+            Workspace::open_readonly_with_config(&workspace_dir, config.clone()),
+        ] {
+            match result {
+                Err(YgrepError::WorkspaceNotIndexed(_)) => {}
+                Err(e) => panic!("expected WorkspaceNotIndexed, got: {e}"),
+                Ok(_) => panic!("expected WorkspaceNotIndexed, got Ok"),
+            }
+        }
     }
 
     #[test]

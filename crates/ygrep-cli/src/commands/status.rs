@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
-use ygrep_core::Workspace;
+use ygrep_core::{Workspace, YgrepError};
 
 pub fn run(workspace_path: &Path, detailed: bool) -> Result<()> {
     println!("ygrep status");
@@ -8,8 +8,8 @@ pub fn run(workspace_path: &Path, detailed: bool) -> Result<()> {
     println!();
     println!("Workspace: {}", workspace_path.display());
 
-    // Try to open workspace
-    match Workspace::open(workspace_path) {
+    // Try to open workspace read-only — status never modifies the index
+    match Workspace::open_readonly(workspace_path) {
         Ok(workspace) => {
             println!("Index path: {}", workspace.index_path().display());
             println!("Indexed: yes");
@@ -35,12 +35,17 @@ pub fn run(workspace_path: &Path, detailed: bool) -> Result<()> {
                 println!("  (detailed stats coming in future version)");
             }
         }
-        Err(_) => {
+        Err(YgrepError::WorkspaceNotIndexed(_)) => {
             println!("Indexed: no");
             println!();
             println!("To index this workspace, run:");
             println!("  ygrep index              # Text-only (fast)");
             println!("  ygrep index --semantic   # With semantic search");
+        }
+        Err(e) => {
+            println!("Indexed: yes (but the index could not be opened)");
+            println!();
+            println!("Error: {}", e);
         }
     }
 
