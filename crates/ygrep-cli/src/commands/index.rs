@@ -111,26 +111,33 @@ fn run_with_verbosity(
         eprintln!("Indexing {}...", workspace_path.display());
     }
 
-    // Open workspace first to read stored flags (before potential rebuild)
-    // Use create() here since we may need to create the index
-    let (stored_semantic, needs_schema_rebuild) = if !rebuild {
-        match Workspace::create(workspace_path) {
-            Ok(ws) => {
-                let sem = ws.stored_semantic_flag();
-                let schema_outdated = if ws.is_indexed() {
-                    // Existing index: missing version means pre-v2 schema
-                    ws.stored_schema_version()
-                        .map(|v| v != SCHEMA_VERSION)
-                        .unwrap_or(true)
-                } else {
-                    false // No existing index, nothing to rebuild
-                };
-                (sem, schema_outdated)
-            }
-            Err(_) => (None, false),
-        }
+    let config = Config::load();
+    let index_path = Workspace::resolve_index_path(workspace_path, &config)
+        .with_context(|| format!("Cannot read {}", workspace_path.display()))?;
+
+    // Open the workspace once and keep it: every open costs a directory scan, an mmap
+    // and (with embeddings) an HNSW load. A rebuild is the one case that needs a second
+    // open, because the index directory it opened is about to be deleted.
+    let mut workspace = if rebuild {
+        None
     } else {
-        (None, false)
+        Workspace::create_with_config(workspace_path, config.clone()).ok()
+    };
+
+    let (stored_semantic, needs_schema_rebuild) = match &workspace {
+        Some(ws) => {
+            let sem = ws.stored_semantic_flag();
+            let schema_outdated = if ws.is_indexed() {
+                // Existing index: missing version means pre-v2 schema
+                ws.stored_schema_version()
+                    .map(|v| v != SCHEMA_VERSION)
+                    .unwrap_or(true)
+            } else {
+                false // No existing index, nothing to rebuild
+            };
+            (sem, schema_outdated)
+        }
+        None => (None, false),
     };
 
     let do_rebuild = rebuild || needs_schema_rebuild;
@@ -143,15 +150,12 @@ fn run_with_verbosity(
         } else {
             eprintln!("Rebuilding index from scratch...");
         }
-        // Delete existing index directory
-        if let Ok(workspace) = Workspace::create(workspace_path) {
-            let index_path = workspace.index_path().to_path_buf();
-            drop(workspace); // Release the workspace before deleting
-            if index_path.exists() {
-                std::fs::remove_dir_all(&index_path).context("Failed to remove existing index")?;
-                if !quiet {
-                    eprintln!("  Cleared old index at {}", index_path.display());
-                }
+        // Release the workspace before deleting the index it points at
+        workspace = None;
+        if index_path.exists() {
+            std::fs::remove_dir_all(&index_path).context("Failed to remove existing index")?;
+            if !quiet {
+                eprintln!("  Cleared old index at {}", index_path.display());
             }
         }
     }
@@ -182,10 +186,11 @@ fn run_with_verbosity(
         eprintln!("(converting to text-only index)");
     }
 
-    let config = Config::load();
-
-    // Create or open workspace for indexing
-    let mut workspace = Workspace::create(workspace_path).context("Failed to create workspace")?;
+    let mut workspace = match workspace {
+        Some(ws) => ws,
+        None => Workspace::create_with_config(workspace_path, config.clone())
+            .context("Failed to create workspace")?,
+    };
 
     // In quiet mode, route the indexer's own progress output into a dropped channel so
     // it never reaches the terminal. Sends to a closed channel are already ignored.
@@ -217,8 +222,6 @@ fn run_with_verbosity(
             .index_all_with_options(with_embeddings)
             .context("Failed to index workspace")?
     };
-
-    let index_path = workspace.index_path().to_path_buf();
 
     // Reclaim accumulated garbage before reporting the size, so what we print is what
     // the index actually costs on disk.
@@ -276,35 +279,17 @@ fn run_with_verbosity(
 /// Never fatal: an index that couldn't be compacted is merely larger than it needs to
 /// be, which is no reason to fail the indexing run that just succeeded.
 fn auto_compact(index_path: &Path, threshold: usize, quiet: bool) -> bool {
-    if threshold == 0 {
-        return false;
-    }
-
-    let Some(segments) = ygrep_core::index::segment_count(index_path) else {
-        return false;
-    };
-    if segments <= threshold {
+    if !ygrep_core::index::compaction_due(index_path, threshold) {
         return false;
     }
 
     if !quiet {
-        eprintln!("(compacting {} segments)", segments);
+        if let Some(segments) = ygrep_core::index::segment_count(index_path) {
+            eprintln!("(compacting {} segments)", segments);
+        }
     }
 
-    match ygrep_core::index::compact_index(index_path) {
-        Ok(stats) => {
-            tracing::debug!(
-                "Auto-compacted {} -> {} segments",
-                stats.segments_before,
-                stats.segments_after
-            );
-            true
-        }
-        Err(e) => {
-            tracing::warn!("Auto-compaction failed for {}: {e}", index_path.display());
-            false
-        }
-    }
+    ygrep_core::index::auto_compact(index_path, threshold).is_some()
 }
 
 fn dir_size(path: &Path) -> u64 {

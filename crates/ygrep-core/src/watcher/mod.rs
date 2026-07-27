@@ -50,7 +50,7 @@ impl FileWatcher {
 
         // Find symlink targets upfront so we can pass them to the event handler
         let symlink_targets = if config.follow_symlinks {
-            find_symlink_targets(&root)
+            find_symlink_targets(&root, &config)
         } else {
             vec![]
         };
@@ -188,24 +188,7 @@ fn process_notify_event(
     let mut events = Vec::new();
 
     for path in &event.paths {
-        // Skip if path is not under any watched path
-        let is_under_watched = watched_paths.iter().any(|wp| path.starts_with(wp));
-        if !is_under_watched {
-            continue;
-        }
-
-        // Skip hidden files/directories
-        if is_hidden(path) {
-            continue;
-        }
-
-        // Skip ignored directories
-        if is_ignored_dir(path) {
-            continue;
-        }
-
-        // Skip files matching ignore patterns
-        if matches_ignore_pattern(path, config) {
+        if !is_watched_path(path, watched_paths, config) {
             continue;
         }
 
@@ -234,27 +217,59 @@ fn process_notify_event(
     events
 }
 
+/// Whether a changed path is one we index.
+///
+/// Every check runs against the path relative to the watch root it sits under. Matching
+/// the absolute path would let directories *above* the workspace exclude everything
+/// inside it, so a project stored under `~/build` or `~/.local/src` would see no events
+/// at all — the same trap the walker already avoids.
+fn is_watched_path(path: &Path, watched_paths: &[PathBuf], config: &IndexerConfig) -> bool {
+    let Some(relative) = watched_paths
+        .iter()
+        .find_map(|watched| path.strip_prefix(watched).ok())
+    else {
+        return false;
+    };
+
+    !is_hidden(relative) && !is_ignored_dir(relative) && !matches_ignore_pattern(relative, config)
+}
+
 /// Check if a path is hidden (starts with .)
 fn is_hidden(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .map(|s| s.starts_with('.'))
-            .unwrap_or(false)
-    })
+    path.components().any(|c| is_hidden_name(c.as_os_str()))
+}
+
+/// Check if a single path component is hidden (starts with .)
+fn is_hidden_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().map(|s| s.starts_with('.')).unwrap_or(false)
 }
 
 /// Find all symlink targets in a directory tree
 /// Returns the canonical paths of directories that are symlinked
-fn find_symlink_targets(root: &Path) -> Vec<PathBuf> {
+///
+/// Prunes the same subtrees the indexing walk prunes. Without that this lstats every
+/// file in node_modules/, .git/ and target/ on watcher startup and on every wake from
+/// sleep, to find symlinks in directories whose contents are never indexed anyway.
+fn find_symlink_targets(root: &Path, config: &IndexerConfig) -> Vec<PathBuf> {
     use std::collections::HashSet;
     use walkdir::WalkDir;
 
+    let prune = crate::fs::walker::prune_suffixes(&config.ignore_patterns);
     let mut targets = HashSet::new();
 
     for entry in WalkDir::new(root)
         .follow_links(false) // Don't follow links during walk
         .into_iter()
+        .filter_entry(|e| {
+            // The root itself is always walked: it's the tree the caller asked to watch.
+            if e.depth() == 0 {
+                return true;
+            }
+            if is_hidden_name(e.file_name()) {
+                return false;
+            }
+            !(e.file_type().is_dir() && crate::fs::walker::is_pruned_dir(root, e.path(), &prune))
+        })
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -310,52 +325,12 @@ fn matches_ignore_pattern(path: &Path, config: &IndexerConfig) -> bool {
     let path_str = path.to_string_lossy();
 
     for pattern in &config.ignore_patterns {
-        if glob_match(pattern, &path_str) {
+        if crate::fs::walker::glob_match(pattern, &path_str) {
             return true;
         }
     }
 
     false
-}
-
-/// Simple glob matching (copied from walker.rs for consistency)
-fn glob_match(pattern: &str, path: &str) -> bool {
-    // Handle **/dir/** patterns (match dir anywhere in path)
-    if pattern.starts_with("**/") && pattern.ends_with("/**") {
-        let dir_name = &pattern[3..pattern.len() - 3];
-        return path.contains(&format!("/{}/", dir_name))
-            || path.starts_with(&format!("{}/", dir_name))
-            || path.ends_with(&format!("/{}", dir_name));
-    }
-
-    // Handle **/*.ext patterns (match extension anywhere)
-    if pattern.starts_with("**/*.") {
-        let ext = &pattern[5..];
-        return path.ends_with(&format!(".{}", ext));
-    }
-
-    // Handle **/something patterns (match at end)
-    if pattern.starts_with("**/") {
-        let suffix = &pattern[3..];
-        return path.ends_with(suffix) || path.ends_with(&format!("/{}", suffix));
-    }
-
-    // Handle something/** patterns (match at start)
-    if pattern.ends_with("/**") {
-        let prefix = &pattern[..pattern.len() - 3];
-        return path.starts_with(prefix) || path.contains(&format!("/{}", prefix));
-    }
-
-    // Handle simple * patterns (*.ext)
-    if pattern.starts_with("*.") {
-        let ext = &pattern[2..];
-        return path.ends_with(&format!(".{}", ext));
-    }
-
-    // Exact match or path component match
-    path == pattern
-        || path.ends_with(&format!("/{}", pattern))
-        || path.contains(&format!("/{}/", pattern))
 }
 
 #[cfg(test)]
@@ -393,38 +368,97 @@ mod tests {
         let mut config = IndexerConfig::default();
         config.ignore_patterns = vec!["**/*.log".to_string(), "**/temp/**".to_string()];
 
-        assert!(matches_ignore_pattern(
-            Path::new("/project/debug.log"),
+        assert!(matches_ignore_pattern(Path::new("debug.log"), &config));
+        assert!(matches_ignore_pattern(Path::new("temp/cache.txt"), &config));
+        assert!(!matches_ignore_pattern(Path::new("src/main.rs"), &config));
+    }
+
+    #[test]
+    fn events_inside_the_workspace_are_judged_relative_to_it() {
+        let config = IndexerConfig::default();
+        let watched = vec![PathBuf::from("/home/andy/build/myapp")];
+
+        // A workspace stored under a directory named like a build output still gets
+        // events for its own files.
+        assert!(is_watched_path(
+            Path::new("/home/andy/build/myapp/src/main.rs"),
+            &watched,
             &config
         ));
-        assert!(matches_ignore_pattern(
-            Path::new("/project/temp/cache.txt"),
-            &config
-        ));
-        assert!(!matches_ignore_pattern(
-            Path::new("/project/src/main.rs"),
+
+        // Its own build output is still excluded.
+        assert!(!is_watched_path(
+            Path::new("/home/andy/build/myapp/dist/bundle.js"),
+            &watched,
             &config
         ));
     }
 
     #[test]
-    fn test_glob_match_patterns() {
-        // **/dir/** patterns
-        assert!(glob_match(
-            "**/node_modules/**",
-            "/project/node_modules/pkg/index.js"
+    fn a_dotted_ancestor_does_not_silence_the_watch() {
+        let config = IndexerConfig::default();
+        let watched = vec![PathBuf::from("/home/andy/.local/src/myapp")];
+
+        assert!(is_watched_path(
+            Path::new("/home/andy/.local/src/myapp/src/main.rs"),
+            &watched,
+            &config
         ));
-        assert!(!glob_match("**/node_modules/**", "/project/src/main.rs"));
 
-        // **/*.ext patterns
-        assert!(glob_match("**/*.log", "/var/logs/app.log"));
-        assert!(!glob_match("**/*.log", "/var/logs/app.txt"));
+        // Hidden directories inside the workspace are still skipped.
+        assert!(!is_watched_path(
+            Path::new("/home/andy/.local/src/myapp/.git/index"),
+            &watched,
+            &config
+        ));
+    }
 
-        // *.ext patterns
-        assert!(glob_match("*.pyc", "module.pyc"));
-        assert!(!glob_match("*.pyc", "module.py"));
+    #[test]
+    fn paths_outside_every_watch_root_are_ignored() {
+        let config = IndexerConfig::default();
+        let watched = vec![PathBuf::from("/home/andy/src/myapp")];
 
-        // Exact/component match
-        assert!(glob_match("Cargo.lock", "/project/Cargo.lock"));
+        assert!(!is_watched_path(
+            Path::new("/home/andy/src/other/main.rs"),
+            &watched,
+            &config
+        ));
+    }
+
+    #[test]
+    fn symlink_discovery_skips_pruned_and_hidden_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // The target a real symlink points at
+        let shared = root.join("shared");
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+
+        // A symlink we should find, and two we should never walk far enough to see
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(shared.join("lib"), root.join("src/lib")).unwrap();
+            symlink(shared.join("lib"), root.join("node_modules/pkg/lib")).unwrap();
+            symlink(shared.join("lib"), root.join(".git/objects/lib")).unwrap();
+        }
+
+        let targets = find_symlink_targets(root, &IndexerConfig::default());
+
+        #[cfg(unix)]
+        {
+            let expected = std::fs::canonicalize(shared.join("lib")).unwrap();
+            assert_eq!(
+                targets,
+                vec![expected],
+                "only symlinks in walked directories should be watched"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = targets;
     }
 }

@@ -9,6 +9,12 @@ pub enum YgrepError {
     #[error("Index error: {0}")]
     Index(#[from] tantivy::TantivyError),
 
+    #[error(
+        "Index is already being written by another ygrep process \
+         (an index build, `ygrep watch`, or the dashboard). Try again once it finishes."
+    )]
+    IndexLocked,
+
     #[error("Query parse error: {0}")]
     QueryParse(#[from] tantivy::query::QueryParserError),
 

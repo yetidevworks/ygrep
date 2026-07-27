@@ -230,7 +230,7 @@ fn load_gitignore(root: &Path) -> Option<Gitignore> {
 ///
 /// Derived from `**/<segments>/**` ignore patterns so that pruning always follows the
 /// configured patterns instead of a separate hardcoded list that could drift from them.
-fn prune_suffixes(patterns: &[String]) -> Vec<String> {
+pub(crate) fn prune_suffixes(patterns: &[String]) -> Vec<String> {
     patterns
         .iter()
         .filter_map(|pattern| {
@@ -248,7 +248,7 @@ fn prune_suffixes(patterns: &[String]) -> Vec<String> {
 ///
 /// Compared against the root-relative path so directories above the workspace can't
 /// prune the tree the caller asked to index.
-fn is_pruned_dir(root: &Path, path: &Path, suffixes: &[String]) -> bool {
+pub(crate) fn is_pruned_dir(root: &Path, path: &Path, suffixes: &[String]) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let path_str = relative.to_string_lossy().replace('\\', "/");
 
@@ -267,7 +267,7 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
 }
 
 /// Simple glob matching for ignore patterns (for files)
-fn glob_match(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
     // Handle **/dir/** patterns (match dir anywhere in path)
     if pattern.starts_with("**/") && pattern.ends_with("/**") {
         let dir_name = &pattern[3..pattern.len() - 3];

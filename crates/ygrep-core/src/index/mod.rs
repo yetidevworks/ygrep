@@ -37,6 +37,49 @@ pub fn segment_count(index_path: &Path) -> Option<usize> {
         .map(|segments| segments.len())
 }
 
+/// Whether an index has accumulated enough segments to be worth compacting.
+///
+/// Cheap enough to call after every watch-mode commit: it reads one small metadata file
+/// and never opens the index.
+pub fn compaction_due(index_path: &Path, threshold: usize) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+
+    segment_count(index_path)
+        .map(|segments| segments > threshold)
+        .unwrap_or(false)
+}
+
+/// Compact an index once it has accumulated more segments than `threshold`.
+///
+/// Editing a file leaves its previous document behind as a tombstone in the old segment,
+/// and watch mode commits with merging disabled, so segments only ever accumulate.
+/// Returns `None` when compaction wasn't due or couldn't run — an index that stayed
+/// fragmented is merely larger than it needs to be, never a reason to fail the caller.
+///
+/// The caller must not be holding a writer on this index: compaction opens its own.
+pub fn auto_compact(index_path: &Path, threshold: usize) -> Option<CompactStats> {
+    if !compaction_due(index_path, threshold) {
+        return None;
+    }
+
+    match compact_index(index_path) {
+        Ok(stats) => {
+            tracing::debug!(
+                "Auto-compacted {} -> {} segments",
+                stats.segments_before,
+                stats.segments_after
+            );
+            Some(stats)
+        }
+        Err(e) => {
+            tracing::warn!("Auto-compaction failed for {}: {e}", index_path.display());
+            None
+        }
+    }
+}
+
 pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     let index = tantivy::Index::open_in_dir(index_path)?;
     register_tokenizers(index.tokenizers());
@@ -52,7 +95,8 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     drop(searcher);
     drop(reader);
 
-    let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> = index.writer(50_000_000)?;
+    let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+        writer::open_index_writer(&index, 50_000_000)?;
     if segment_ids.len() > 1 {
         writer.merge(&segment_ids).wait()?;
     }
@@ -65,7 +109,8 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
 
     // A fresh writer now that the index is quiesced, purely to collect what the merges
     // superseded.
-    let writer: tantivy::IndexWriter<tantivy::TantivyDocument> = index.writer(50_000_000)?;
+    let writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+        writer::open_index_writer(&index, 50_000_000)?;
     writer.garbage_collect_files().wait()?;
     writer.wait_merging_threads()?;
 

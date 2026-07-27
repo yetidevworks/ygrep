@@ -83,6 +83,17 @@ fn refresh_if_needed(
         return Ok(workspace);
     }
 
+    // Another process is already building this index. Starting a second build would put
+    // two writers on one index, so search what we have and say why.
+    if let Some(running) = progress::indexing_in_progress(&index_path) {
+        eprintln!(
+            "Index is being rebuilt for {} (running {}); searching the current index.",
+            workspace_path.display(),
+            progress::format_duration(running.elapsed())
+        );
+        return Ok(workspace);
+    }
+
     let mut may_rebuild =
         !no_auto_index && config.search.auto_index && progress::index_dir_writable(&index_path);
 
@@ -111,6 +122,10 @@ fn refresh_if_needed(
     } else {
         eprintln!("Index is out of date, refreshing...");
     }
+
+    // Claim the build before releasing the index, so a search starting in the same
+    // moment sees it and searches instead of opening a second writer.
+    let _progress = progress::IndexingGuard::start(&index_path);
 
     // Release the index before reindexing so the writer isn't blocked by our reader.
     drop(workspace);

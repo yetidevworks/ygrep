@@ -54,14 +54,17 @@ pub fn run(workspace_path: &Path) -> Result<()> {
 
     watcher.start().context("Failed to start file watcher")?;
 
-    let indexer = workspace
+    let mut indexer = workspace
         .create_watch_indexer()
         .context("Failed to create indexer")?;
+
+    let index_path = workspace.index_path().to_path_buf();
+    let compact_threshold = workspace.indexer_config().auto_compact_segments;
 
     // Create tokio runtime for async event handling
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
 
-    rt.block_on(async {
+    rt.block_on(async move {
         let mut changed_count = 0u64;
         let mut deleted_count = 0u64;
         let mut error_count = 0u64;
@@ -129,6 +132,28 @@ pub fn run(workspace_path: &Path) -> Result<()> {
                 if let Err(e) = workspace.commit_indexer(&indexer) {
                     error_count += 1;
                     eprintln!("  [!] Commit error: {}", e);
+                }
+
+                // Watch commits never merge, so a long-running watch leaves thousands of
+                // segments behind. Compaction needs the writer lock the indexer holds, so
+                // release it, compact, and take a fresh one.
+                if ygrep_core::index::compaction_due(&index_path, compact_threshold) {
+                    drop(indexer);
+                    if let Some(stats) =
+                        ygrep_core::index::auto_compact(&index_path, compact_threshold)
+                    {
+                        eprintln!(
+                            "  [*] Compacted {} segments into {}",
+                            stats.segments_before, stats.segments_after
+                        );
+                    }
+                    indexer = match workspace.create_watch_indexer() {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            eprintln!("  [!] Failed to reopen indexer after compaction: {}", e);
+                            break;
+                        }
+                    };
                 }
             }
 

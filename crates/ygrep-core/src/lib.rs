@@ -177,15 +177,12 @@ impl Workspace {
             }
         }
 
-        // Clean up stale lockfiles that may block readers on macOS (issue #7).
-        // Tantivy's reader acquires META_LOCK via flock(); on macOS Intel this can
-        // fail with EPERM if a stale lockfile inode still has an unreleased flock.
-        // Removing the file forces the next acquire_lock() to create a fresh inode.
-        // Read-only opens use no-op locks instead, so stale lockfiles can't block them.
-        if mode == OpenMode::Write {
-            let _ = std::fs::remove_file(index_path.join(".tantivy-meta.lock"));
-            let _ = std::fs::remove_file(index_path.join(".tantivy-writer.lock"));
-        }
+        // Lockfiles are deliberately left alone here. The writer lock is what stops two
+        // processes from writing one index at once, so deleting it lets a second writer
+        // start alongside a live one and corrupt the index between them. Contention is
+        // reported instead, when a writer is actually opened. The macOS stale META_LOCK
+        // workaround (issue #7) lives in the reader retry, which only clears the lockfile
+        // after an acquire has already failed.
 
         let index = if tantivy_exists {
             if mode == OpenMode::ReadOnly {
@@ -496,15 +493,14 @@ impl Workspace {
 
     /// Build a map of all indexed files: relative_path -> (mtime, doc_id)
     /// Uses fast fields for efficient columnar reads, skipping chunk documents.
-    /// Returns an empty map if the index is empty or unreadable.
-    pub fn build_indexed_files_map(&self) -> HashMap<String, (u64, String)> {
+    ///
+    /// Errors rather than returning an empty map when the index can't be read: an
+    /// incremental pass reads this to decide what changed, so an empty map on a
+    /// momentary lock failure re-indexes every file and deletes nothing.
+    pub fn build_indexed_files_map(&self) -> Result<HashMap<String, (u64, String)>> {
         let mut map = HashMap::new();
 
-        let reader = match self.index.reader() {
-            Ok(r) => r,
-            Err(_) => return map,
-        };
-
+        let reader = search::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
         for segment_reader in searcher.segment_readers() {
@@ -577,14 +573,14 @@ impl Workspace {
             }
         }
 
-        map
+        Ok(map)
     }
 
     /// Incremental index: only re-index files that changed since last index
     #[allow(unused_variables)]
     pub fn index_incremental_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
         // Build map of currently indexed files
-        let mut indexed_map = self.build_indexed_files_map();
+        let mut indexed_map = self.build_indexed_files_map()?;
 
         // Create indexer (does NOT clear vector index)
         let indexer =
@@ -913,7 +909,8 @@ impl Workspace {
 
         let term = Term::from_field_text(path_field, &relative_path);
 
-        let mut writer = self.index.writer::<tantivy::TantivyDocument>(50_000_000)?;
+        let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+            index::writer::open_index_writer(&self.index, 50_000_000)?;
         writer.delete_term(term);
         writer.commit()?;
 
@@ -1194,6 +1191,43 @@ mod tests {
 
         let workspace = Workspace::create(temp_dir.path())?;
         assert!(workspace.root().exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_a_workspace_leaves_a_live_writer_lock_alone() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("hello.rs"), "fn hello() {}").unwrap();
+
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+        config.indexer.ignore_patterns = vec![];
+
+        let workspace = Workspace::create_with_config(&workspace_dir, config.clone())?;
+        workspace.index_all()?;
+        let index_path = workspace.index_path().to_path_buf();
+
+        // Hold a writer, the way `ygrep watch` does
+        let indexer = workspace.create_watch_indexer()?;
+        let lock = index_path.join(".tantivy-writer.lock");
+        assert!(lock.exists(), "the held writer must have a lockfile");
+
+        // A second open must not clear the lock out from under the first writer
+        let second = Workspace::open_with_config(&workspace_dir, config)?;
+        assert!(
+            lock.exists(),
+            "opening a workspace must not delete the lock"
+        );
+        assert!(
+            matches!(second.create_watch_indexer(), Err(YgrepError::IndexLocked)),
+            "a second writer must report contention"
+        );
+
+        // The original writer is still usable
+        indexer.commit()?;
 
         Ok(())
     }

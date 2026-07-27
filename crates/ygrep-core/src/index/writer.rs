@@ -14,6 +14,27 @@ use crate::config::IndexerConfig;
 use crate::embeddings::{EmbeddingCache, EmbeddingModel};
 use crate::error::{Result, YgrepError};
 
+/// Default writer heap for a full index build
+const WRITER_HEAP_BYTES: usize = 50_000_000;
+
+/// Open an index writer, reporting a held lock as contention rather than a raw error.
+///
+/// Tantivy's writer lock is what keeps two processes from writing the same index at
+/// once, so a busy lock means another build, watch, or dashboard session owns it. The
+/// caller has to back off: stealing the lock puts two live writers on one index.
+pub(crate) fn open_index_writer(index: &Index, heap_size: usize) -> Result<IndexWriter> {
+    index.writer(heap_size).map_err(|e| {
+        if matches!(
+            e,
+            tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _)
+        ) {
+            YgrepError::IndexLocked
+        } else {
+            e.into()
+        }
+    })
+}
+
 /// Handles indexing of files and content
 pub struct Indexer {
     config: IndexerConfig,
@@ -37,7 +58,7 @@ pub struct Indexer {
 impl Indexer {
     /// Create a new indexer for a workspace (text search only)
     pub fn new(config: IndexerConfig, index: Index, workspace_root: &Path) -> Result<Self> {
-        let writer = index.writer(50_000_000)?; // 50MB heap
+        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
         let schema = index.schema();
         let fields = SchemaFields::new(&schema);
 
@@ -64,7 +85,7 @@ impl Indexer {
         index: Index,
         workspace_root: &Path,
     ) -> Result<Self> {
-        let writer = index.writer(50_000_000)?;
+        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         let schema = index.schema();
         let fields = SchemaFields::new(&schema);
@@ -96,7 +117,7 @@ impl Indexer {
         embedding_model: Arc<EmbeddingModel>,
         embedding_cache: Arc<EmbeddingCache>,
     ) -> Result<Self> {
-        let writer = index.writer(50_000_000)?; // 50MB heap
+        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
         let schema = index.schema();
         let fields = SchemaFields::new(&schema);
 
@@ -127,11 +148,9 @@ impl Indexer {
         path: &Path,
         index_chunks: bool,
     ) -> Result<(String, String)> {
-        // Read file content
-        let content = std::fs::read_to_string(path)?;
+        // Check the size before reading: a multi-gigabyte file rejected after
+        // read_to_string has already cost us its full size in RAM.
         let metadata = std::fs::metadata(path)?;
-
-        // Check file size
         let size = metadata.len();
         if size > self.config.max_file_size {
             return Err(YgrepError::FileTooLarge {
@@ -140,6 +159,8 @@ impl Indexer {
                 max: self.config.max_file_size,
             });
         }
+
+        let content = std::fs::read_to_string(path)?;
 
         // Generate content hash for deduplication and doc_id
         let content_hash = xxh3_64(content.as_bytes());
@@ -415,6 +436,63 @@ mod tests {
             result,
             Err(crate::error::YgrepError::FileTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn an_oversize_file_is_rejected_before_it_is_read() {
+        let temp_dir = tempdir().unwrap();
+
+        let index_path = temp_dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let schema = build_document_schema();
+        let index = Index::create_in_dir(&index_path, schema).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let config = IndexerConfig {
+            max_file_size: 10,
+            ..Default::default()
+        };
+        let indexer = Indexer::new(config, index, temp_dir.path()).unwrap();
+
+        // Not valid UTF-8, so reading it first would fail with an IO error instead of
+        // reporting the size — which is how we know the size check ran first.
+        let binary = temp_dir.path().join("blob.rs");
+        std::fs::write(&binary, [0xffu8; 4096]).unwrap();
+
+        assert!(matches!(
+            indexer.index_file(&binary),
+            Err(crate::error::YgrepError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_second_writer_reports_contention_instead_of_stealing_the_lock() {
+        let temp_dir = tempdir().unwrap();
+        let (first, index_path) = create_test_indexer(temp_dir.path());
+
+        let index = Index::open_in_dir(&index_path).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+
+        let second = Indexer::new(IndexerConfig::default(), index, temp_dir.path());
+        assert!(
+            matches!(second, Err(crate::error::YgrepError::IndexLocked)),
+            "a second writer must back off, not take the lock"
+        );
+
+        // The lockfile the first writer holds must still be there, and that writer must
+        // still work.
+        assert!(index_path.join(".tantivy-writer.lock").exists());
+
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").unwrap();
+        first.index_file(&test_file).unwrap();
+        first.commit().unwrap();
+
+        // Once the first writer is gone the lock is free again.
+        drop(first);
+        let index = Index::open_in_dir(&index_path).unwrap();
+        crate::index::register_tokenizers(index.tokenizers());
+        assert!(Indexer::new(IndexerConfig::default(), index, temp_dir.path()).is_ok());
     }
 
     #[test]

@@ -663,6 +663,8 @@ async fn watcher_task(
     log_tx: crate::LogSender,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    let log_tx_for_compaction = log_tx.clone();
+
     // Open workspace and create watcher (blocking)
     let result = tokio::task::spawn_blocking({
         let workspace_path = workspace_path.clone();
@@ -689,7 +691,7 @@ async fn watcher_task(
     })
     .await;
 
-    let (workspace, mut watcher, indexer) = match result {
+    let (workspace, mut watcher, mut indexer) = match result {
         Ok(Ok((ws, w, idx))) => (ws, w, idx),
         Ok(Err(e)) => {
             let _ = event_tx.send((hash, WatchEvent::Error(e)));
@@ -700,6 +702,9 @@ async fn watcher_task(
             return;
         }
     };
+
+    let index_path = workspace.index_path().to_path_buf();
+    let compact_threshold = workspace.indexer_config().auto_compact_segments;
 
     // Event loop: process file events until told to stop
     // Events are batched — we drain all queued events, then commit once.
@@ -753,6 +758,33 @@ async fn watcher_task(
                 if needs_commit {
                     if let Err(e) = workspace.commit_indexer(&indexer) {
                         let _ = event_tx.send((hash.clone(), WatchEvent::Error(format!("commit: {}", e))));
+                    }
+
+                    // Watch commits never merge, so segments only accumulate while a
+                    // workspace stays watched. Compaction needs the writer lock the
+                    // indexer holds, so release it, compact, and take a fresh one.
+                    if crate::index::compaction_due(&index_path, compact_threshold) {
+                        drop(indexer);
+                        let compacted = tokio::task::spawn_blocking({
+                            let index_path = index_path.clone();
+                            move || crate::index::auto_compact(&index_path, compact_threshold)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(stats) = compacted {
+                            let _ = log_tx_for_compaction.send(format!(
+                                "compacted {} segments into {}",
+                                stats.segments_before, stats.segments_after
+                            ));
+                        }
+                        indexer = match workspace.create_watch_indexer() {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                let _ = event_tx.send((hash.clone(), WatchEvent::Error(format!("indexer: {}", e))));
+                                break;
+                            }
+                        };
                     }
                 }
             }

@@ -8,13 +8,15 @@ pub use hybrid::HybridSearcher;
 pub use results::{MatchType, SearchHit, SearchResult};
 pub use searcher::{SearchFilters, Searcher};
 
-use tantivy::{Index, IndexReader};
+use tantivy::{Directory, Index, IndexReader};
 
 /// Open an IndexReader with retry-and-backoff for META_LOCK contention (issue #7).
 ///
 /// Tantivy's `index.reader()` acquires an exclusive flock on `.tantivy-meta.lock`.
 /// On macOS this can transiently fail with EPERM when `ygrep watch` is committing
-/// concurrently.  We retry up to 3 times with exponential backoff (100/200/400 ms).
+/// concurrently.  We retry up to 3 times with exponential backoff (100/200/400 ms),
+/// clearing the lockfile before the last attempt in case its inode is holding a flock
+/// nobody owns any more.
 ///
 /// If the error is a permission issue (e.g. sandboxed `~/Library/Application Support`),
 /// we fail immediately with a helpful message suggesting `XDG_DATA_HOME`.
@@ -41,6 +43,14 @@ pub(crate) fn open_reader_with_retry(index: &Index) -> crate::error::Result<Inde
                         attempt + 1,
                         wait_ms
                     );
+                    // Last chance: a lockfile inode left behind by a dead process can
+                    // keep failing acquire forever. Only after every ordinary retry has
+                    // failed, so a lock a live process is holding stays put.
+                    if attempt == 2 {
+                        let _ = index
+                            .directory()
+                            .delete(std::path::Path::new(".tantivy-meta.lock"));
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                     last_err = Some(e);
                 } else {
