@@ -6,6 +6,7 @@
 //! runs on a worker thread that reports back through [`OpMessage`]. Every result lands in
 //! the one status line, so a failed action reads as `✗ …` instead of tearing the TUI down.
 
+mod demo;
 mod stats;
 mod ui;
 
@@ -205,6 +206,11 @@ pub struct App {
     pub data_dir: PathBuf,
     /// Actions in flight, used to pick the tick rate.
     pub busy: usize,
+    /// Demo mode: fabricated data, simulated actions, nothing real behind any of it.
+    pub demo: bool,
+    demo_seed: u64,
+    demo_ticks: u64,
+    demo_pending: Vec<(Instant, demo::DemoOp)>,
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<ManagerCommand>>,
     ops_tx: mpsc::Sender<OpMessage>,
     ops_rx: mpsc::Receiver<OpMessage>,
@@ -255,6 +261,10 @@ impl App {
             stats: None,
             data_dir,
             busy: 0,
+            demo: false,
+            demo_seed: 0x9e37_79b9_7f4a_7c15,
+            demo_ticks: 0,
+            demo_pending: Vec::new(),
             cmd_tx,
             ops_tx,
             ops_rx,
@@ -395,6 +405,11 @@ impl App {
 
     /// Poll-timeout work: rescan the registry, tail the service log, poll telemetry.
     fn on_tick(&mut self) {
+        if self.demo {
+            // Demo mode reads nothing: the tick moves the fabricated data instead.
+            self.demo_tick();
+            return;
+        }
         if !self.refreshing && self.last_refresh.elapsed() >= REGISTRY_REFRESH {
             self.spawn_scan();
         }
@@ -432,6 +447,9 @@ impl App {
     /// The registry walk sizes every index directory and the service report shells out to
     /// launchctl/systemctl, so neither belongs on the drawing thread.
     fn spawn_scan(&mut self) {
+        if self.demo {
+            return;
+        }
         self.refreshing = true;
         self.last_refresh = Instant::now();
         let tx = self.ops_tx.clone();
@@ -524,6 +542,9 @@ impl App {
     fn tail_service_log(&mut self) {
         use std::io::{Read, Seek, SeekFrom};
 
+        if self.demo {
+            return;
+        }
         let path = service::log_path_in(&self.data_dir);
         let Ok(mut file) = std::fs::File::open(&path) else {
             return;
@@ -554,8 +575,12 @@ impl App {
         }
     }
 
-    /// Drain results from the worker threads.
+    /// Drain results from the worker threads, or from the simulated ones in demo mode.
     fn drain_ops(&mut self) {
+        if self.demo {
+            self.drain_demo(false);
+            return;
+        }
         while let Ok(msg) = self.ops_rx.try_recv() {
             match msg {
                 OpMessage::Scan {
@@ -710,6 +735,10 @@ impl App {
             ));
             return;
         }
+        if self.demo {
+            self.demo_toggle_watch(&hash, watching);
+            return;
+        }
         self.send(ManagerCommand::SetWatch {
             hash,
             enabled: !watching,
@@ -742,12 +771,26 @@ impl App {
             return;
         }
 
-        if let Err(e) = registry::set_watch_flag(&path, enable) {
-            self.act("watch flag", Err(e.to_string()));
-            return;
+        if !self.demo {
+            if let Err(e) = registry::set_watch_flag(&path, enable) {
+                self.act("watch flag", Err(e.to_string()));
+                return;
+            }
         }
         if let Some(row) = self.row_mut(&hash) {
             row.watch = enable;
+        }
+        if self.demo {
+            self.note(format!(
+                "✓ watch {} for {name}{}",
+                if enable { "on" } else { "off" },
+                if self.service_running {
+                    " — the service picks it up in ≤30s"
+                } else {
+                    ""
+                }
+            ));
+            return;
         }
 
         if self.service_running {
@@ -788,6 +831,11 @@ impl App {
         }
         if self.watched_by_service(&hash) {
             self.note("✗ watched by service — turn watch off first or let auto-refresh handle it");
+            return;
+        }
+        if self.demo {
+            // No watcher to pause and no index to open: answer as if the work ran.
+            self.demo_launch(op, &hash);
             return;
         }
         if watching {
@@ -849,6 +897,10 @@ impl App {
         let Some(path) = self.row(&hash).map(|row| row.index_path.clone()) else {
             return;
         };
+        if self.demo {
+            self.demo_remove(hash);
+            return;
+        }
         self.resume_watch.remove(&hash);
         self.deferred.remove(&hash);
         self.send(ManagerCommand::RemoveIndex(hash.clone()));
@@ -876,6 +928,10 @@ impl App {
     fn open_workspace(&mut self) {
         let Some(row) = self.selected() else { return };
         let (path, display) = (row.workspace.clone(), row.display.clone());
+        if self.demo {
+            self.note(format!("✓ opened {display}"));
+            return;
+        }
         if !path.exists() {
             self.note("✗ the workspace is gone");
             return;
@@ -893,6 +949,10 @@ impl App {
 
     /// Run a service action on a worker thread.
     fn run_service_action(&mut self, index: usize) {
+        if self.demo {
+            self.demo_service_action(index);
+            return;
+        }
         let Some((action, _)) = SERVICE_ACTIONS.get(index) else {
             return;
         };
@@ -945,14 +1005,30 @@ fn starts_watching(row: &IndexRow, auto_recent: bool) -> bool {
             .unwrap_or(false)
 }
 
-/// Launch the TUI. Requires a terminal on both ends.
-pub fn run() -> Result<()> {
+/// Fail before touching the terminal when either end is not one.
+fn require_terminal() -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         return Err(anyhow!(
             "The ygrep TUI needs an interactive terminal.\n\
              Try `ygrep indexes list`, `ygrep status` or `ygrep service status` instead."
         ));
     }
+    Ok(())
+}
+
+/// Leave the alternate screen even when the TUI panics.
+fn install_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
+}
+
+/// Launch the TUI. Requires a terminal on both ends.
+pub fn run() -> Result<()> {
+    require_terminal()?;
 
     let config = Config::load();
     let data_dir = registry::data_dir(&config)?;
@@ -1007,12 +1083,7 @@ pub fn run() -> Result<()> {
         manager.run().await;
     });
 
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(info);
-    }));
+    install_panic_hook();
 
     let mut terminal = setup_terminal()?;
     let result = run_loop(&mut terminal, &mut app, &mut event_rx);
@@ -1024,6 +1095,23 @@ pub fn run() -> Result<()> {
     result
 }
 
+/// Launch the TUI on the demo dataset: the same screens and keys, nothing real behind
+/// them. Maintainer tooling for screenshots, reached only through `--demo`.
+pub fn run_demo() -> Result<()> {
+    require_terminal()?;
+
+    let mut app = demo::demo_app();
+    // Nothing sends on this channel in demo mode; the loop just polls an empty one.
+    let (_events_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ManagerEvent>();
+
+    install_panic_hook();
+
+    let mut terminal = setup_terminal()?;
+    let result = run_loop(&mut terminal, &mut app, &mut event_rx);
+    restore_terminal(&mut terminal)?;
+    result
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -1032,7 +1120,8 @@ fn run_loop(
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        let tick = if app.stats.is_some() || app.busy > 0 {
+        // Demo mode always runs at the busy rate: its liveliness comes off the tick.
+        let tick = if app.demo || app.stats.is_some() || app.busy > 0 {
             TICK_BUSY
         } else {
             TICK_IDLE
@@ -1143,7 +1232,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.note(format!("activity {state}"));
         }
         KeyCode::Char('t') => {
-            app.stats = Some(stats::StatsView::open(&app.data_dir));
+            app.stats = Some(if app.demo {
+                stats::StatsView::synthetic()
+            } else {
+                stats::StatsView::open(&app.data_dir)
+            });
         }
         KeyCode::Char('S') => app.service_menu = Some(0),
         KeyCode::Char('/') => app.filter_input = true,

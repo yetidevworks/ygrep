@@ -37,7 +37,22 @@ pub struct StatsView {
     offset: u64,
     pub filter: String,
     pub filter_input: bool,
+    /// Newest second demo mode has already fabricated traffic for.
+    demo_second: i64,
+    demo_seed: u64,
 }
+
+/// The query mix both the snapshot and demo mode draw from: `(query, mode, ms, hits)`.
+const DEMO_QUERIES: [(&str, &str, u64, usize); 8] = [
+    ("fn main", "literal", 12, 8),
+    ("WatchManager", "literal", 41, 22),
+    ("->get(", "regex", 96, 3),
+    ("how does watching work", "hybrid", 220, 14),
+    ("IndexLocked", "literal", 7, 2),
+    ("segment_count", "literal", 19, 6),
+    ("telemetry", "literal", 33, 11),
+    ("::compact_index", "literal", 61, 0),
+];
 
 impl StatsView {
     /// Open the view, seeded with whatever the log already holds.
@@ -48,6 +63,8 @@ impl StatsView {
             offset: tail.offset,
             filter: String::new(),
             filter_input: false,
+            demo_second: 0,
+            demo_seed: DEMO_SEED,
         };
         view.ingest(tail.events);
         view
@@ -81,21 +98,7 @@ impl StatsView {
     /// A fabricated few minutes of traffic, so the snapshot exercises real scaling.
     pub fn synthetic() -> Self {
         let now = Utc::now().timestamp();
-        let queries = [
-            ("fn main", "literal", 12u64, 8usize),
-            ("WatchManager", "literal", 41, 22),
-            ("->get(", "regex", 96, 3),
-            ("how does watching work", "hybrid", 220, 14),
-            ("IndexLocked", "literal", 7, 2),
-            ("segment_count", "literal", 19, 6),
-            ("telemetry", "literal", 33, 11),
-            ("::compact_index", "literal", 61, 0),
-        ];
-        let workspaces = [
-            super::synthetic_hash(0),
-            super::synthetic_hash(1),
-            super::synthetic_hash(3),
-        ];
+        let workspaces = demo_workspaces();
 
         // Repeats give the top-N bars something to rank; the wave keeps the sparkline
         // from rendering as one flat block.
@@ -108,7 +111,7 @@ impl StatsView {
             let wave = (second as f64 / 23.0).sin() * 4.0 + 4.5;
             let count = (wave.max(0.0) as u64) + (second as u64 % 3);
             for _ in 0..count {
-                let (q, mode, ms, hits) = queries[picks[n % picks.len()]];
+                let (q, mode, ms, hits) = DEMO_QUERIES[picks[n % picks.len()]];
                 events.push_back(QueryEvent {
                     ts: now - (299 - second),
                     ws: workspaces[ws_picks[n % ws_picks.len()]].clone(),
@@ -126,8 +129,63 @@ impl StatsView {
             offset: 0,
             filter: String::new(),
             filter_input: false,
+            demo_second: now,
+            demo_seed: DEMO_SEED,
         }
     }
+
+    /// Fabricate the traffic for every second that has passed since the last call, so
+    /// the sparkline and the tail keep moving with no telemetry file behind them.
+    pub fn demo_tick(&mut self) {
+        let now = Utc::now().timestamp();
+        if self.demo_second == 0 || self.demo_second > now {
+            self.demo_second = now;
+            return;
+        }
+        let workspaces = demo_workspaces();
+        while self.demo_second < now {
+            self.demo_second += 1;
+            let wave = (self.demo_second as f64 / 19.0).sin() * 4.0 + 4.5;
+            let count = wave.max(0.0) as u64 + demo_rand(&mut self.demo_seed) % 3;
+            for _ in 0..count {
+                let n = demo_rand(&mut self.demo_seed) as usize;
+                let (q, mode, ms, hits) = DEMO_QUERIES[n % DEMO_QUERIES.len()];
+                if self.events.len() >= MAX_EVENTS {
+                    self.events.pop_front();
+                }
+                self.events.push_back(QueryEvent {
+                    ts: self.demo_second,
+                    ws: workspaces[n % workspaces.len()].clone(),
+                    q: q.to_string(),
+                    ms: ms + (n as u64 % 7) * 3,
+                    hits,
+                    mode: mode.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Seed for the fabricated query mix.
+const DEMO_SEED: u64 = 0x2545_f491_4f6c_dd1d;
+
+/// The synthetic workspaces queries are attributed to.
+fn demo_workspaces() -> [String; 3] {
+    [
+        super::synthetic_hash(0),
+        super::synthetic_hash(1),
+        super::synthetic_hash(3),
+    ]
+}
+
+/// xorshift64*, matching the dashboard's own drift generator.
+fn demo_rand(seed: &mut u64) -> u64 {
+    let mut x = *seed;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *seed = x;
+    x.wrapping_mul(0x2545_f491_4f6c_dd1d)
 }
 
 /// Everything the panels need, computed from the filtered events in one pass.

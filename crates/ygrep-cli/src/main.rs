@@ -182,7 +182,11 @@ pub enum Commands {
     /// Interactive TUI for indexes, watching and the background service
     ///
     /// Same screen bare `ygrep` opens on a terminal.
-    Dashboard,
+    Dashboard {
+        /// Run on curated fake data, touching no index, service or telemetry
+        #[arg(long, hide = true)]
+        demo: bool,
+    },
 
     /// Render one TUI frame with synthetic data as plain text (layout testing)
     #[command(hide = true)]
@@ -450,8 +454,12 @@ fn main() -> Result<()> {
             ServiceCommand::Run => commands::service::run()?,
             ServiceCommand::Log { lines, follow } => commands::service::log(lines, follow)?,
         },
-        Some(Commands::Dashboard) => {
-            commands::tui::run()?;
+        Some(Commands::Dashboard { demo }) => {
+            if demo {
+                commands::tui::run_demo()?;
+            } else {
+                commands::tui::run()?;
+            }
         }
         Some(Commands::TuiSnapshot {
             width,
