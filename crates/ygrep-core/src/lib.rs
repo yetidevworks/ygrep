@@ -1191,8 +1191,14 @@ mod tests {
         // Create a test file
         std::fs::write(temp_dir.path().join("test.rs"), "fn main() {}").unwrap();
 
-        let workspace = Workspace::create(temp_dir.path())?;
+        // Keep the index inside the temp directory: with the default config this test
+        // left a stray index behind in the real data directory on every run.
+        let mut config = Config::default();
+        config.indexer.data_dir = temp_dir.path().join("data");
+
+        let workspace = Workspace::create_with_config(temp_dir.path(), config)?;
         assert!(workspace.root().exists());
+        assert!(workspace.index_path().starts_with(temp_dir.path()));
 
         Ok(())
     }
