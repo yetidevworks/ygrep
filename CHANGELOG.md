@@ -5,6 +5,14 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.2] - 2026-07-27
+
+### Fixed
+- **`indexes remove <path>` could delete the workspace instead of the index** ([#13](https://github.com/yetidevworks/ygrep/issues/13)) — passing an absolute path (e.g. `ygrep indexes remove ~/Developer`) made `remove` resolve to the workspace directory itself and delete it, leaving the real index in place. `Path::join` discards its base when given an absolute path, so the hash lookup `indexes_dir.join(identifier)` resolved straight to the caller's own directory. Identifiers are now only treated as a hash when they are a single path component, and every index deletion is checked against the canonicalized index directory before anything is removed. `..` traversal and symlinks pointing outside the index directory are rejected for the same reason
+
+### Added
+- **`--dry-run` and `--yes` for `indexes remove` and `indexes clean`** — `--dry-run` prints the resolved index directory and size without deleting anything. Both commands now prompt for confirmation when run interactively; `--yes` skips the prompt, and non-interactive runs are unaffected
+
 ## [3.3.1] - 2026-07-16
 
 ### Fixed
@@ -320,6 +328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.3.2]: https://github.com/yetidevworks/ygrep/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/yetidevworks/ygrep/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/yetidevworks/ygrep/compare/v3.2.4...v3.3.0
 [3.2.4]: https://github.com/yetidevworks/ygrep/compare/v3.2.3...v3.2.4

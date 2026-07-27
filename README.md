@@ -151,7 +151,13 @@ ygrep indexes list                 # List all indexes with sizes and type
 ygrep indexes clean                # Remove orphaned indexes (freed disk space)
 ygrep indexes remove <hash>        # Remove specific index by hash
 ygrep indexes remove /path/to/dir  # Remove index by workspace path
+ygrep indexes remove <hash> --dry-run  # Show what would be removed, delete nothing
+ygrep indexes remove <hash> --yes      # Skip the confirmation prompt
 ```
+
+`remove` and `clean` only ever delete inside ygrep's own index directory — the
+workspace you point them at is never touched. Both prompt for confirmation when run
+interactively; pass `--yes` in scripts, or `--dry-run` to preview.
 
 Example output:
 ```

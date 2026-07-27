@@ -180,11 +180,24 @@ pub enum IndexesCommand {
     /// List all indexes with size and type (text/semantic)
     List,
     /// Remove orphaned indexes for workspaces that no longer exist
-    Clean,
+    Clean {
+        /// Show what would be removed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Remove a specific index by hash or workspace path
     Remove {
         /// Index hash (from `ygrep indexes list`) or workspace path
         identifier: String,
+        /// Show what would be removed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Compact an index by merging segments and collecting stale files
     Compact {
@@ -306,8 +319,12 @@ fn main() -> Result<()> {
         },
         Some(Commands::Indexes(cmd)) => match cmd {
             IndexesCommand::List => commands::indexes::list()?,
-            IndexesCommand::Clean => commands::indexes::clean()?,
-            IndexesCommand::Remove { identifier } => commands::indexes::remove(&identifier)?,
+            IndexesCommand::Clean { dry_run, yes } => commands::indexes::clean(dry_run, yes)?,
+            IndexesCommand::Remove {
+                identifier,
+                dry_run,
+                yes,
+            } => commands::indexes::remove(&identifier, dry_run, yes)?,
             IndexesCommand::Compact { identifier } => {
                 commands::indexes::compact(identifier.as_deref())?
             }

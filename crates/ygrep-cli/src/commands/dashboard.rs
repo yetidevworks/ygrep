@@ -409,7 +409,7 @@ impl App {
                     if let Ok(indexes_dir) = super::indexes::get_indexes_dir() {
                         let index_path = indexes_dir.join(&hash);
                         if index_path.exists() {
-                            let _ = std::fs::remove_dir_all(&index_path);
+                            let _ = super::indexes::remove_index_dir(&indexes_dir, &index_path);
                         }
                     }
                     // Tell manager to clean up watchers and remove from tracking
