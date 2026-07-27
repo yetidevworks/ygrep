@@ -4,8 +4,13 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 
 ![ygrep screenshot](ygrep-screenshot.png)
 
+*The management TUI, captured before 4.0.0 added the service panel and the new key
+bindings; the panel layout is otherwise current.*
+
 ## Features
 
+- **Management TUI** - Bare `ygrep` on a terminal opens a dashboard for every index, the background service, and live activity
+- **Background service** - Watches every index you flag, from login, without a terminal open
 - **Literal text matching** - Works like grep by default, special characters included (`$variable`, `{% block`, `->get(`, `@decorator`)
 - **Regex support** - Use `-r` flag for regex patterns (`fn\s+main`, `TODO|FIXME`)
 - **Code-aware tokenizer** - Preserves `$`, `@`, `#` as part of tokens (essential for PHP, Shell, Python, etc.)
@@ -17,8 +22,8 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 - **Incremental indexing** - Only re-indexes changed files based on mtime; no-op runs complete in ~10ms
 - **Compact indexes** - Generated assets are skipped and the doc store is zstd-compressed, roughly halving index size
 - **Non-blocking AI hooks** - Background indexing on session start, never slows down your AI tool
-- **Interactive dashboard** - TUI for managing indexes, toggling watchers, and viewing live activity
-- **File watching** - Incremental index updates on file changes
+- **File watching** - Incremental index updates on file changes, per-index and remembered across runs
+- **Query stats** - Every search is recorded locally so the TUI can show query rate, latency and misses
 - **Optional semantic search** - HNSW vector index with local semantic model (all-MiniLM-L6-v2)
 - **Symlink handling** - Follows symlinks with cycle detection
 - **AI-optimized output** - Clean, minimal output with file paths and line numbers
@@ -201,8 +206,25 @@ ygrep indexes source code, not build output or generated assets. Excluded by def
 - **Binary and media files** - images, fonts, video, archives, documents, databases
 - **Generated text** - bundled JavaScript, minified CSS, and compact data blobs
 
-That last category is detected by shape rather than filename, since bundled output is
-rarely named `*.min.js`. Any file whose average line length exceeds
+Dotfiles are no longer skipped wholesale. `.gitignore`, `.editorconfig`, `.env`,
+`.eslintrc` and the rest of the recognised names are indexed, as are the source
+directories `.github`, `.gitlab`, `.circleci`, `.devcontainer`, `.husky` and
+`.changeset` — so `.github/workflows/*.yml` is searchable. Every other dot-directory is
+still pruned, since it holds cache, credentials or tool state, and a hidden file whose
+name isn't recognised is still left alone rather than sniffed.
+
+When `indexer.respect_gitignore` is on, ignore rules are read the way git reads them:
+nested `.gitignore` files, `.git/info/exclude`, and the global excludes file, not just
+the one at the workspace root. They apply in a checkout with no `.git` of its own too, so
+a worktree or a vendored copy is filtered the same way:
+
+```toml
+[indexer]
+respect_gitignore = false   # default: ygrep's own ignore_patterns only
+```
+
+That last category is detected by how the file reads rather than by its name, since
+bundled output is rarely called `*.min.js`. Any file whose average line length exceeds
 `indexer.max_avg_line_length` (default 400 bytes) is treated as generated:
 
 ```toml
@@ -322,6 +344,58 @@ ygrep watch /path/to/project       # Watch specific directory
 ```
 
 File watching automatically uses the same mode (text or semantic) as the original index.
+It holds the terminal for as long as you want the index current, which is why the watch
+flag and the background service exist: flag the workspaces worth watching and the service
+keeps them current in the background from login onwards.
+
+```bash
+ygrep indexes watch on                # Watch the current workspace's index
+ygrep indexes watch off               # Stop watching it
+ygrep indexes watch <hash|path> on    # Name an index instead
+```
+
+The flag lives in the index's own metadata, so it survives re-indexing, upgrades and
+reboots, and `ygrep indexes list` marks the indexes carrying it. The TUI toggles the same
+flag with `w`, and a running service picks the change up on its next rescan without being
+restarted.
+
+### Background Service
+
+The service watches every watch-enabled index, in one process, starting at login. It is a
+user-level launchd agent on macOS and a systemd user unit on Linux — no root, no daemon
+config to write:
+
+```bash
+ygrep service install              # Install and start it
+ygrep service status               # Installed? running? what is it watching?
+ygrep service start                # Start / stop / restart the installed service
+ygrep service stop
+ygrep service restart
+ygrep service log                  # Tail the service log (-f to follow)
+ygrep service uninstall            # Stop it and remove the definition
+```
+
+`ygrep service status` reports whether the definition is installed, whether the process is
+running, its pid, and how many indexes it is watching. Logs go to
+`<data_dir>/logs/service.log`, capped at 5 MB with one old generation kept.
+
+The service re-reads the index registry every 30 seconds, so a watch flag toggled in the
+TUI or from another terminal takes effect within that window, and an index built after the
+service started is picked up without a restart. A single-instance lock in the data
+directory keeps a second copy from starting, and on SIGTERM or Ctrl-C it stops its
+watchers and compacts the indexes that need it rather than exiting mid-write.
+
+```toml
+[service]
+registry_rescan_secs = 30   # how often the registry is re-read
+log_max_size_mb = 5         # rotate the log past this size
+```
+
+Re-run `ygrep service install` after the binary moves — a `cargo install`, a Homebrew
+upgrade — so the service definition points at the new path.
+
+`ygrep service run` is the foreground loop the service definition invokes. It works by
+hand for debugging, but the installed service is the supported way to run it.
 
 ### Status
 
@@ -339,6 +413,8 @@ ygrep indexes remove <hash>        # Remove specific index by hash
 ygrep indexes remove /path/to/dir  # Remove index by workspace path
 ygrep indexes remove <hash> --dry-run  # Show what would be removed, delete nothing
 ygrep indexes remove <hash> --yes      # Skip the confirmation prompt
+ygrep indexes compact [<hash|path>]    # Merge segments and reclaim deleted documents
+ygrep indexes watch <hash|path> on|off # Watch this index from the background service
 ```
 
 `remove` and `clean` only ever delete inside ygrep's own index directory — the
@@ -356,30 +432,79 @@ c4f2ba4712ed98e7  23.7 MB  [semantic]
   /path/to/another-project
 ```
 
-### Dashboard
+### Management TUI
 
-Interactive TUI for monitoring and managing all your indexes in one place:
+Run `ygrep` with no query and no subcommand on a terminal and it opens the management
+dashboard instead of printing help:
 
 ```bash
-ygrep dashboard
+ygrep                              # Management TUI
+ygrep dashboard                    # Same screen, explicitly
 ```
 
-The dashboard shows a table of all indexes with workspace path, size, file count, last indexed time, and watch state. Below the table is a live activity log showing real-time file indexing events.
+Piping and scripting are unaffected: unless both stdin and stdout are terminals, bare
+`ygrep` prints help as it always has, so `ygrep | head`, `ygrep > file` and CI invocations
+never open a TUI or block waiting for a keypress.
 
-**Key bindings:**
+Three stacked panels, plus a title bar carrying the version, the service state and the
+total index count and size:
+
+- **Indexes** - one row per index: watch state (● watching, ◐ sleeping, ○ idle, ✗ error),
+  workspace path, size on disk, file count, segment count, a semantic badge, when it was
+  last indexed, changes per minute while watching, and `[w]` when the persisted watch flag
+  is on. Sort with `1`-`4`, filter with `/`.
+- **Service** - installed, running, pid, uptime, how many indexes it is watching, when it
+  last rescanned the registry, and the log path.
+- **Activity** - a live tail of what the watchers are doing: files indexed and removed,
+  workspaces going to sleep and waking, compaction notices, errors.
+
+Press `t` for the query stats view: queries per second as a sparkline, total queries,
+average and slowest query time, how many returned nothing, the most-run queries and
+busiest workspaces as bars, and a live tail of recent searches with their timing and hit
+count. `/` filters the tail, `esc` goes back.
+
+**Key bindings** (`?` shows the same list in the TUI):
 
 | Key | Action |
 |-----|--------|
-| `j/k` or `↑/↓` | Navigate entries |
-| `w` | Toggle watch (off/active) |
-| `r` | Re-index workspace |
-| `d` | Delete index (with confirmation) |
-| `s` | Cycle sort column (Name, Size, Files, Indexed, Watch) |
-| `S` | Toggle sort order (ascending/descending) |
-| `/` | Filter by workspace name |
-| `Tab` | Switch focus between table and activity log |
+| `↑/↓` or `j/k` | Move, and scroll the focused panel |
+| `Tab` | Switch focus between Indexes and Activity |
+| `1`-`4` | Sort by name / size / age / files (again reverses) |
+| `/` | Filter indexes by path |
+| `Enter` | Start or stop watching for this session |
+| `w` | Toggle the persisted watch flag the service reads |
+| `i` | Re-index the selected workspace |
+| `c` | Compact the selected index |
+| `R` or `Del` | Remove the selected index (confirmation required) |
+| `o` | Open the workspace in the file manager |
+| `g` | Follow or pause the activity panel |
+| `t` | Query stats: rate, top queries, live tail |
+| `S` | Service menu: install, start, stop, restart |
 | `?` | Help overlay |
-| `q` | Quit |
+| `q` or `Esc` | Quit |
+
+Re-indexing and compaction run in the background, so a big workspace never freezes the
+screen, and an operation that fails reports on the status line rather than tearing the TUI
+down.
+
+### Query Stats
+
+Every search appends one JSON line to `<data_dir>/telemetry/queries.jsonl`: a timestamp,
+the index hash of the workspace, the query text truncated to 200 characters, how long the
+query took, how many hits it returned, and whether it ran as a literal, regex or hybrid
+search. That file is what the TUI's stats view reads.
+
+It never leaves the machine. There is no upload, no network call and no identifier beyond
+the workspace hash already used to name the index directory. The log rotates at 5 MB and
+one old generation is kept, so it cannot grow without bound. Writing it is best-effort: a
+search that found what you asked for never fails because a log line couldn't be written.
+
+Turn it off and the stats view stays empty:
+
+```toml
+[output]
+telemetry = false
+```
 
 ### Updating
 
@@ -533,12 +658,13 @@ and 10 for queries, each version indexing into its own data directory:
 
 | Workload | Corpus | 3.5.1 | 4.0.0 |
 |---|---|---|---|
-| No-op `ygrep index` | 8.5k files, 11 MB | 595 ms | **185 ms** |
-| No-op `ygrep index` | 44.8k files, 350 MB | 3.50 s | **0.90 s** |
-| Full build | 8.5k files, 11 MB | 902 ms | **447 ms** |
-| Full build | 44.8k files, 350 MB | 10.2 s | 11.7 s |
-| `<<<` literal query | 44.8k files, 350 MB | 202 ms | **53 ms** |
-| `-e c malloc` query | 44.8k files, 350 MB | 23 ms, 61 hits | **15 ms, 100 hits** |
+| No-op `ygrep index` | 8.5k files, 11 MB | 615 ms | **249 ms** |
+| No-op `ygrep index` | 44.8k files, 350 MB | 3.45 s | **0.84 s** |
+| Full build | 8.5k files, 11 MB | 892 ms | **433 ms** |
+| Full build | 44.8k files, 350 MB | 10.2 s | 11.1 s |
+| `<<<` literal query | 44.8k files, 350 MB | 197 ms | **45 ms** |
+| `->` literal query | 44.8k files, 350 MB | 14.6 ms | **10.5 ms** |
+| `-e c malloc` query | 44.8k files, 350 MB | 25 ms, 61 hits | **13 ms, 100 hits** |
 
 An unchanged tree is now decided from the directory metadata the walk already carries,
 rather than re-reading and re-stat-ing every file, so repeat runs cost a fraction of what
@@ -549,20 +675,21 @@ query fills its page instead of returning whatever survived truncation - that la
 returns 39 results 3.5.1 dropped.
 
 Two costs came with it, both from walking in parallel. On a 350 MB tree the build is
-already saturated by Tantivy's own indexing threads, so the parallel walk adds up to 14%
-build time, and interleaving unrelated files into the doc store's 64 KB compression
-blocks costs 13% more disk (203 MB vs 179 MB). Peak build memory rose from 501 MB to
-536 MB. Restoring the sequential walk gives back all three, and the incremental win is
-unaffected:
+already saturated by Tantivy's own indexing threads, so the parallel walk adds 9% build
+time, and interleaving unrelated files into the doc store's 64 KB compression blocks
+costs 12% more disk (202 MB vs 180 MB). Restoring the sequential walk gives back both,
+and the incremental win is unaffected:
 
 ```toml
 [indexer]
 threads = 1   # 0 = one per core
 ```
 
-Multi-word literal queries that ask for more results than exist also cost more, because
-4.0.0 retries with a deeper candidate pool instead of returning short: a two-word query
-with 84 matches went from 111 ms to 227 ms at `-n 100`, and from 9 ms to 7 ms at `-n 20`.
+A multi-word literal query asking for more results than exist still costs more, since it
+always escalates to a deeper candidate pool: a two-word query with 84 matches takes
+138 ms at `-n 100` against 113 ms, and 7 ms at `-n 20` against 9 ms. Most of that gap is
+the larger doc store - the same query against an index built with `threads = 1` takes
+120 ms.
 
 Full tables and the script that produced them are in `benchmark/compare-3.5-vs-4.0/`.
 
@@ -595,6 +722,40 @@ cargo install --path crates/ygrep-cli   # Install to ~/.cargo/bin/
 Index data stored in:
 - macOS: `~/Library/Application Support/ygrep/indexes/`
 - Linux: `~/.local/share/ygrep/indexes/`
+
+Configuration is read from the first of these that exists: `./.ygrep.toml`,
+`$XDG_CONFIG_HOME/ygrep/config.toml`, `~/.config/ygrep/config.toml`. Every key has a
+default, so a config file only needs the ones you want to change.
+
+```toml
+[indexer]
+threads = 0                     # walk and index workers, 0 = one per core (max 8)
+writer_heap_mb = 50             # tantivy writer heap for a full build
+max_file_size = 10485760        # skip files larger than this
+max_avg_line_length = 400       # skip generated files, 0 indexes everything
+docstore_compression_level = 6  # zstd level, or 0 for LZ4
+auto_compact_segments = 16      # compact past this many segments, 0 disables
+respect_gitignore = false       # honour .gitignore, nested files included
+follow_symlinks = true
+
+[search]
+auto_index = true               # build a text index when searching an unindexed workspace
+default_limit = 10
+max_limit = 100
+
+[service]
+registry_rescan_secs = 30       # how often the service re-reads the index registry
+log_max_size_mb = 5             # rotate the service log past this size
+
+[output]
+telemetry = true                # record queries locally for the TUI stats view
+```
+
+`indexer.threads` controls the parallel walk. On a large tree that Tantivy's own indexing
+threads already saturate, `threads = 1` builds a slightly smaller index in slightly less
+time — see [Performance](#performance). `writer_heap_mb` is the heap a full build gives
+the writer; watchers and single-file indexers always use Tantivy's 15 MB minimum, so
+raising it costs nothing while idle.
 
 ## Upgrading
 
