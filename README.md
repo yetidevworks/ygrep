@@ -13,7 +13,9 @@ A fast, local, indexed code search tool optimized for AI coding assistants. Writ
 - **Multi-word AND queries** - `"campaign sending"` returns results where all terms appear in the file, not just exact adjacent phrases
 - **Filename search** - Search matches file paths too, not just content
 - **Fast indexed search** - Tantivy-powered BM25 ranking, instant results
+- **Automatic indexing** - Searching an unindexed workspace builds the index and runs the query; nothing to set up
 - **Incremental indexing** - Only re-indexes changed files based on mtime; no-op runs complete in ~10ms
+- **Compact indexes** - Generated assets are skipped and the doc store is zstd-compressed, roughly halving index size
 - **Non-blocking AI hooks** - Background indexing on session start, never slows down your AI tool
 - **Interactive dashboard** - TUI for managing indexes, toggling watchers, and viewing live activity
 - **File watching** - Incremental index updates on file changes
@@ -53,14 +55,7 @@ ygrep install opencode       # OpenCode
 ygrep install codex          # Codex
 ```
 
-### 2. Index your project
-
-```bash
-ygrep index                    # Fast text-only index
-ygrep index --semantic         # With semantic search (better natural language queries)
-```
-
-### 3. Search
+### 2. Search
 
 ```bash
 ygrep "search query"         # Shorthand
@@ -68,6 +63,14 @@ ygrep search "search query"  # Explicit
 ```
 
 That's it! The AI tool will now use ygrep for code searches.
+
+The first search in a workspace builds a text index automatically, so there is no
+separate setup step. Build one ahead of time, or opt into semantic search, with:
+
+```bash
+ygrep index                    # Fast text-only index
+ygrep index --semantic         # With semantic search (better natural language queries)
+```
 
 ## Usage
 
@@ -120,9 +123,107 @@ ygrep index --rebuild              # Force full rebuild from scratch
 ygrep index --semantic             # Build semantic index (sticky - remembered)
 ygrep index --text                 # Build text-only index (sticky - remembered)
 ygrep index /path/to/project       # Index specific directory
+ygrep index --dry-run              # Report what would be indexed, build nothing
 ```
 
 Indexing is **incremental by default** - only files with changed modification times are re-indexed. A no-op run (nothing changed) completes in ~10ms. Use `--rebuild` to force a full re-index.
+
+#### Automatic indexing
+
+Searching a workspace that has no index builds a text-only index, then runs the query:
+
+```console
+$ ygrep "compute_haystack"
+No index for /path/to/project, building one (text-only)...
+Indexing complete in 0.11s
+# 1 results (text)
+...
+```
+
+Semantic indexes are never built implicitly, since that downloads a model and takes
+minutes. Run `ygrep index --semantic` when you want one.
+
+Control it with `--no-auto-index` for a single run, or turn it off permanently:
+
+```toml
+[search]
+auto_index = false
+```
+
+If the index directory is readable but not writable (a sandboxed process consuming a
+centrally-maintained index), ygrep reports how to build the index rather than failing
+to write one.
+
+While a build is running, other searches report progress instead of claiming the
+workspace is unindexed:
+
+```console
+$ ygrep "some query"
+Index is being built for /path/to/project (running 1m 35s).
+Retry the search shortly, or run `ygrep index` to build it in the foreground.
+```
+
+Searches against an index older than a day print a one-line reminder to stderr. This is
+a timestamp comparison, not a directory scan, so it costs nothing.
+
+#### What gets indexed
+
+ygrep indexes source code, not build output or generated assets. Excluded by default:
+
+- **Dependencies** - `node_modules`, `vendor`, `Pods`, `Carthage`, `.venv`
+- **Build output** - `target`, `build`, `dist`, `out`, `bin`, `obj`, `DerivedData`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`
+- **Compiled artifacts** - `*.a`, `*.rlib`, `*.rmeta`, `*.o`, `*.so`, `*.dylib`, `*.dSYM`, `*.xcarchive`
+- **Binary and media files** - images, fonts, video, archives, documents, databases
+- **Generated text** - bundled JavaScript, minified CSS, and compact data blobs
+
+That last category is detected by shape rather than filename, since bundled output is
+rarely named `*.min.js`. Any file whose average line length exceeds
+`indexer.max_avg_line_length` (default 400 bytes) is treated as generated:
+
+```toml
+[indexer]
+max_avg_line_length = 400   # set to 0 to index everything
+```
+
+Use `ygrep index --dry-run` to see exactly what would be indexed:
+
+```console
+$ ygrep index --dry-run
+Would index /path/to/project (3009 files, 35.97 MB)
+
+By extension:
+  json            499 files    21.30 MB
+  php             941 files     5.67 MB
+  yaml            251 files     3.35 MB
+
+Largest files:
+   566.96 KB  assets/editor.js
+   446.52 KB  tests/fixtures/tokens.json
+```
+
+#### Index size
+
+Indexes are roughly half the size they were in 3.3.x. Two changes account for it:
+generated assets are no longer indexed, and the doc store is compressed with zstd
+instead of LZ4. Measured on real projects:
+
+| Project | 3.3.x | 3.4.0 | Change |
+|---|---|---|---|
+| php-project-1 (5.1k files) | 38.0 MB | 23.2 MB | **-39%** |
+| php-project-2 (3.0k files) | 28.0 MB | 13.3 MB | **-53%** |
+| php-project-3 (1.1k files) | 6.7 MB | 3.8 MB | **-43%** |
+| swift-project-1 (374 files) | 3.1 MB | 2.0 MB | **-37%** |
+| rust-project-1 (90 files) | 968 KB | 747 KB | **-23%** |
+
+Projects with generated assets checked in gain the most. A pure source tree like
+rust-project-1 gains only from compression, since nothing was being wrongly indexed.
+
+Indexes shrink more than the excluded bytes alone would suggest, because minified files
+tokenize badly and inflate the term dictionary and position lists out of proportion to
+their size.
+
+Existing indexes keep working and are rebuilt into the new format on the next
+`ygrep index` run.
 
 The `--semantic` and `--text` flags are **sticky** - once set, subsequent `ygrep index` commands (without flags) will remember and use the same mode. This also applies to `ygrep watch`.
 
@@ -153,16 +254,7 @@ ygrep indexes remove <hash>        # Remove specific index by hash
 ygrep indexes remove /path/to/dir  # Remove index by workspace path
 ygrep indexes remove <hash> --dry-run  # Show what would be removed, delete nothing
 ygrep indexes remove <hash> --yes      # Skip the confirmation prompt
-ygrep index --dry-run              # Report what would be indexed, build nothing
 ```
-
-Searching a workspace with no index builds a text-only index automatically, then runs
-the query. Pass `--no-auto-index` (or set `search.auto_index = false`) to get the old
-behaviour of failing with instructions. Semantic indexes are never built implicitly.
-
-Generated assets are skipped by default: files whose average line length exceeds
-`indexer.max_avg_line_length` (400 bytes) are treated as bundled or minified output.
-Set it to `0` to index everything.
 
 `remove` and `clean` only ever delete inside ygrep's own index directory — the
 workspace you point them at is never touched. Both prompt for confirmation when run

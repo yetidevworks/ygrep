@@ -202,7 +202,7 @@ impl Workspace {
                         // Remove corrupted index and create fresh
                         std::fs::remove_dir_all(&index_path)?;
                         std::fs::create_dir_all(&index_path)?;
-                        Index::create_in_dir(&index_path, schema)?
+                        create_index(&index_path, schema)?
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -216,7 +216,7 @@ impl Workspace {
         } else {
             // Create directory only when explicitly creating the index
             std::fs::create_dir_all(&index_path)?;
-            Index::create_in_dir(&index_path, schema)?
+            create_index(&index_path, schema)?
         };
 
         // Register our custom code tokenizer
@@ -1144,6 +1144,17 @@ pub struct IndexStats {
     pub unique_paths: usize,
     pub unchanged: usize,
     pub removed: usize,
+}
+
+/// Create a new Tantivy index with ygrep's doc store settings.
+///
+/// Always go through here rather than `Index::create_in_dir`, so every index ygrep
+/// writes gets the same compression settings.
+fn create_index(index_path: &Path, schema: tantivy::schema::Schema) -> Result<Index> {
+    Ok(Index::builder()
+        .schema(schema)
+        .settings(index::index_settings())
+        .create_in_dir(index_path)?)
 }
 
 /// Hash a path to create a unique identifier

@@ -8,8 +8,8 @@ use std::path::Path;
 
 pub use readonly_dir::ReadOnlyDirectory;
 pub use schema::{
-    build_document_schema, fields, register_tokenizers, SchemaFields, CODE_TOKENIZER,
-    SCHEMA_VERSION,
+    build_document_schema, fields, index_settings, register_tokenizers, SchemaFields,
+    CODE_TOKENIZER, SCHEMA_VERSION,
 };
 #[cfg(feature = "embeddings")]
 pub use vector::VectorIndex;

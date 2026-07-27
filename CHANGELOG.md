@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Index freshness note** — `search` and `status` mention when an index is more than a day old. This is a timestamp comparison, not a tree walk, so it costs nothing
 - **`ygrep index --dry-run`** — report the files, extensions, and largest entries that would be indexed, without building anything. Useful for tuning `ignore_patterns` and confirming generated assets are excluded
 
+### Changed
+- **Doc store compressed with zstd instead of LZ4** — stored file content is about half of an index, and zstd compresses code roughly 40% smaller than LZ4 at Tantivy's block granularity, with a larger 64 KB block size for a few points more. Decompression is ~19% slower (761 MB/s vs 938 MB/s measured), which a query never notices because it touches only a handful of blocks. Combined with the exclusion work, indexes are roughly half their previous size: 38.0 MB to 23.2 MB and 28.0 MB to 13.3 MB on two real projects. Existing indexes stay readable and are rebuilt into the new format on the next `ygrep index` (schema version 5 to 6)
+
 ### Fixed
 - **Workspaces under a directory named like a build output indexed nothing** — ignore patterns were matched against the absolute path, so a project at `~/build/myapp` or anywhere below a `tmp`, `cache`, `dist`, `var`, or `log` directory silently indexed zero files. Patterns now match relative to the workspace root
 - **Hidden workspace roots indexed nothing** — `ygrep index ~/.config/something` silently produced an empty index because the hidden-file check was applied to the workspace root itself

@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Search & Indexing
-tantivy = "0.22"
+tantivy = { version = "0.22", features = ["zstd-compression"] }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 hnsw_rs = "0.3"
 lru = "0.12"

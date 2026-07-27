@@ -5,7 +5,28 @@ use tantivy::schema::{
 use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerManager};
 
 /// Schema version - increment when schema changes require reindexing
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
+
+/// Index settings applied when creating a new index.
+///
+/// Tantivy defaults the doc store to LZ4. Stored file content is about half of a ygrep
+/// index, and zstd compresses code roughly 40% smaller than LZ4 at Tantivy's block
+/// granularity. Decompression is only ~19% slower and a query touches a handful of
+/// blocks, so the trade lands firmly on the side of disk space.
+///
+/// The larger block size buys a further few percent: blocks compress better with more
+/// context, and a block is cheap to decompress relative to the rest of a query.
+pub fn index_settings() -> tantivy::IndexSettings {
+    use tantivy::store::{Compressor, ZstdCompressor};
+
+    tantivy::IndexSettings {
+        docstore_compression: Compressor::Zstd(ZstdCompressor {
+            compression_level: Some(3),
+        }),
+        docstore_blocksize: 65_536,
+        ..Default::default()
+    }
+}
 
 /// Name of our custom code tokenizer
 pub const CODE_TOKENIZER: &str = "code";
@@ -292,6 +313,38 @@ mod tests {
             tokens.push(stream.token().text.clone());
         }
         tokens
+    }
+
+    #[test]
+    fn index_settings_use_zstd_for_the_doc_store() {
+        use tantivy::store::Compressor;
+
+        let settings = index_settings();
+
+        assert!(
+            matches!(settings.docstore_compression, Compressor::Zstd(_)),
+            "doc store must be zstd, got {:?}",
+            settings.docstore_compression
+        );
+        assert_eq!(settings.docstore_blocksize, 65_536);
+    }
+
+    #[test]
+    fn a_created_index_carries_the_doc_store_settings() {
+        use tantivy::store::Compressor;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let index = tantivy::Index::builder()
+            .schema(build_document_schema())
+            .settings(index_settings())
+            .create_in_dir(dir.path())
+            .unwrap();
+
+        assert!(matches!(
+            index.settings().docstore_compression,
+            Compressor::Zstd(_)
+        ));
     }
 
     #[test]
