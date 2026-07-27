@@ -55,6 +55,11 @@ pub struct IndexerConfig {
     /// Takes effect when an index is next built with `--rebuild`.
     pub docstore_compression_level: i32,
 
+    /// Compact the index once it exceeds this many segments (0 disables).
+    /// Editing files leaves deleted documents behind in their old segments; without
+    /// this the index grows without bound even though the code doesn't.
+    pub auto_compact_segments: usize,
+
     /// Follow symlinks
     pub follow_symlinks: bool,
 
@@ -150,6 +155,7 @@ impl Default for IndexerConfig {
             include_extensions: vec![],
             max_avg_line_length: 400,
             docstore_compression_level: crate::index::schema::DEFAULT_DOCSTORE_COMPRESSION_LEVEL,
+            auto_compact_segments: 16,
             ignore_patterns: vec![
                 // Package managers & dependencies
                 "**/node_modules/**".into(),

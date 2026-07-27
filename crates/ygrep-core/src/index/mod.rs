@@ -22,6 +22,21 @@ pub struct CompactStats {
     pub segments_after: usize,
 }
 
+/// Count the segments in an index by reading Tantivy's metadata.
+///
+/// Deliberately avoids opening the index: this runs after every index build to decide
+/// whether compaction is due, so it has to cost a single small file read.
+///
+/// Returns `None` when the index has no readable metadata yet.
+pub fn segment_count(index_path: &Path) -> Option<usize> {
+    let json = std::fs::read_to_string(index_path.join("meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&json).ok()?;
+
+    meta.get("segments")?
+        .as_array()
+        .map(|segments| segments.len())
+}
+
 pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     let index = tantivy::Index::open_in_dir(index_path)?;
     register_tokenizers(index.tokenizers());
@@ -58,6 +73,49 @@ mod tests {
     use super::*;
     use tantivy::doc;
     use tempfile::tempdir;
+
+    #[test]
+    fn segment_count_reads_metadata_without_opening_the_index() -> crate::Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let schema = build_document_schema();
+        let index = tantivy::Index::create_in_dir(temp_dir.path(), schema.clone())?;
+        register_tokenizers(index.tokenizers());
+        let fields = SchemaFields::new(&schema);
+
+        // A fresh index has no segments yet.
+        assert_eq!(segment_count(temp_dir.path()), Some(0));
+
+        // Each separate writer commit produces its own segment.
+        for i in 0..3 {
+            let mut writer = index.writer(50_000_000)?;
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            writer.add_document(doc!(
+                fields.doc_id => format!("doc-{i}"),
+                fields.path => format!("src/{i}.rs"),
+                fields.filepath.unwrap() => format!("src/{i}.rs"),
+                fields.workspace => "/test",
+                fields.content => format!("fn seg_{i}() {{}}"),
+                fields.mtime => 0u64,
+                fields.size => 0u64,
+                fields.extension => "rs",
+                fields.line_start => 0u64,
+                fields.line_end => 0u64,
+                fields.chunk_id => "",
+                fields.parent_doc => "",
+            ))?;
+            writer.commit()?;
+        }
+
+        assert_eq!(segment_count(temp_dir.path()), Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn segment_count_is_none_without_metadata() {
+        let temp_dir = tempdir().unwrap();
+        assert_eq!(segment_count(temp_dir.path()), None);
+    }
 
     #[test]
     fn test_compact_index_merges_segments() -> crate::Result<()> {

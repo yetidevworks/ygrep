@@ -253,6 +253,36 @@ their size.
 Existing indexes keep working and are rebuilt into the new format the next time you
 search or index.
 
+#### Compaction
+
+Editing a file leaves its previous document behind as a tombstone in the segment that
+held it. Tantivy schedules merges to reclaim that space, but they run on background
+threads that don't outlive a short `ygrep index` process, so an index that is only ever
+updated incrementally grows even though the code doesn't.
+
+ygrep compacts an index once it passes `indexer.auto_compact_segments`:
+
+```toml
+[indexer]
+auto_compact_segments = 16   # 0 disables
+```
+
+Measured on a 749-file workspace over 20 rounds of editing 35 files each, with the code
+itself growing by 60 KB:
+
+| | Index | Segments |
+|---|---|---|
+| Without compaction | 2.22 MB → **6.30 MB** | 3 → 52 |
+| With compaction | 2.22 MB → **2.81 MB** | 3 → 9 |
+
+Growth was previously linear with no ceiling; it now oscillates in a band and stays
+there. Segments cost search time too: that index searched in 24.5 ms at 32 segments
+versus 21.6 ms at 1.
+
+Compaction takes under half a second on a 5k-file index, so it runs occasionally rather
+than slowing every build. `ygrep indexes list` marks any index carrying reclaimable
+space, and `ygrep indexes compact` forces the pass by hand.
+
 The doc store compression level is tunable. Higher levels build a smaller index more
 slowly; search speed is unaffected either way, since a query decompresses only the few
 blocks holding its results:

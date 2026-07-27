@@ -3,6 +3,12 @@ use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+/// Segment count above which `indexes list` reports an index as worth compacting.
+///
+/// Matches the default `auto_compact_segments`, so an index only appears here when
+/// auto-compaction is disabled or hasn't run since the segments accumulated.
+const COMPACTABLE_SEGMENTS: usize = 16;
+
 /// Get the indexes directory with the same resolution as Workspace::open_internal():
 /// 1. Auto-detect: .ygrep/ in CWD
 /// 2. Relative data_dir in config: resolve against CWD
@@ -304,15 +310,23 @@ pub fn list() -> Result<()> {
 
         let orphan_marker = if info.orphaned { " [orphaned]" } else { "" };
 
+        // Accumulated segments mean reclaimable space, so say so rather than letting
+        // the index quietly carry garbage.
+        let segment_marker = match ygrep_core::index::segment_count(&info.path) {
+            Some(n) if n > COMPACTABLE_SEGMENTS => format!(" [{} segments, compactable]", n),
+            _ => String::new(),
+        };
+
         // Line 1: number, size, type, files, time
         println!(
-            "  {:>2}. {:>width$}  {}  {}  {}{}",
+            "  {:>2}. {:>width$}  {}  {}  {}{}{}",
             i + 1,
             size_str,
             index_type,
             files_str,
             time_str,
             orphan_marker,
+            segment_marker,
             width = size_width,
         );
         // Line 2: workspace path and hash

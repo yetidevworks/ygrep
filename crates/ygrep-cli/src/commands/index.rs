@@ -182,6 +182,8 @@ fn run_with_verbosity(
         eprintln!("(converting to text-only index)");
     }
 
+    let config = Config::load();
+
     // Create or open workspace for indexing
     let mut workspace = Workspace::create(workspace_path).context("Failed to create workspace")?;
 
@@ -216,17 +218,25 @@ fn run_with_verbosity(
             .context("Failed to index workspace")?
     };
 
+    let index_path = workspace.index_path().to_path_buf();
+
+    // Reclaim accumulated garbage before reporting the size, so what we print is what
+    // the index actually costs on disk.
+    drop(workspace);
+    let compacted = auto_compact(&index_path, config.indexer.auto_compact_segments, quiet);
+
     let elapsed = start.elapsed();
-    let index_size = dir_size(workspace.index_path());
+    let index_size = dir_size(&index_path);
 
     let index_type = if with_embeddings { "semantic" } else { "text" };
 
     if quiet {
         eprintln!(
-            "Indexed {} files in {:.2}s ({}).",
+            "Indexed {} files in {:.2}s ({}{}).",
             stats.indexed,
             elapsed.as_secs_f64(),
-            format_size(index_size)
+            format_size(index_size),
+            if compacted { ", compacted" } else { "" }
         );
         return Ok(());
     }
@@ -248,9 +258,53 @@ fn run_with_verbosity(
     eprintln!("  Errors: {}", stats.errors);
     eprintln!("  Index size: {}", format_size(index_size));
     eprintln!();
-    eprintln!("Index stored at: {}", workspace.index_path().display());
+    eprintln!("Index stored at: {}", index_path.display());
 
     Ok(())
+}
+
+/// Compact an index once it has accumulated more segments than `threshold`.
+///
+/// Editing a file leaves its previous document behind as a tombstone in the old
+/// segment. Tantivy schedules merges to clean that up, but they run on background
+/// threads and `ygrep index` exits before they finish, so nothing is ever reclaimed:
+/// a workspace under normal editing grows several times larger than its content.
+///
+/// Compaction is cheap (under half a second on a 5k-file index), so it can run
+/// occasionally rather than taxing every build with a merge wait.
+///
+/// Never fatal: an index that couldn't be compacted is merely larger than it needs to
+/// be, which is no reason to fail the indexing run that just succeeded.
+fn auto_compact(index_path: &Path, threshold: usize, quiet: bool) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+
+    let Some(segments) = ygrep_core::index::segment_count(index_path) else {
+        return false;
+    };
+    if segments <= threshold {
+        return false;
+    }
+
+    if !quiet {
+        eprintln!("(compacting {} segments)", segments);
+    }
+
+    match ygrep_core::index::compact_index(index_path) {
+        Ok(stats) => {
+            tracing::debug!(
+                "Auto-compacted {} -> {} segments",
+                stats.segments_before,
+                stats.segments_after
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Auto-compaction failed for {}: {e}", index_path.display());
+            false
+        }
+    }
 }
 
 fn dir_size(path: &Path) -> u64 {

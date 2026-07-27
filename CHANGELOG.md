@@ -5,6 +5,15 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-27
+
+### Fixed
+- **Indexes grew without bound as you edited files** — editing a file leaves its previous document behind as a tombstone in the old segment. Tantivy schedules merges to reclaim that space, but they run on background threads and `ygrep index` exits before they finish, so nothing was ever collected. Measured on a 749-file workspace over 20 rounds of editing 35 files each: the index grew from 2.22 MB / 3 segments to **6.30 MB / 52 segments**, a 2.8x increase, while the code itself grew by 60 KB. Growth was linear with no ceiling. Indexes are now compacted once they exceed `indexer.auto_compact_segments` (default 16, 0 disables), which holds the same workload at 2.5-3.2 MB indefinitely. Compaction costs under half a second on a 5k-file index, so it runs occasionally rather than taxing every build with a merge wait
+
+### Added
+- **`indexer.auto_compact_segments`** — segment count above which an index is compacted after indexing. Accumulated segments cost search time as well as disk: the churned index above searched in 24.5 ms at 32 segments versus 21.6 ms at 1
+- **Segment reporting in `ygrep indexes list`** — indexes carrying reclaimable garbage are marked `[N segments, compactable]` rather than silently growing
+
 ## [3.4.0] - 2026-07-27
 
 ### Added
@@ -348,6 +357,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.5.0]: https://github.com/yetidevworks/ygrep/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/yetidevworks/ygrep/compare/v3.3.2...v3.4.0
 [3.3.2]: https://github.com/yetidevworks/ygrep/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/yetidevworks/ygrep/compare/v3.3.0...v3.3.1
