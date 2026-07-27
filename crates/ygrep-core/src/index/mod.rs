@@ -56,8 +56,22 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     if segment_ids.len() > 1 {
         writer.merge(&segment_ids).wait()?;
     }
+
+    // Let every merge thread finish before collecting anything, including merges an
+    // earlier commit in this process scheduled. Collecting while one is still in flight
+    // drops its output files from `.managed.json` without deleting them, stranding them
+    // on disk where no later garbage collection will ever look again.
+    writer.wait_merging_threads()?;
+
+    // A fresh writer now that the index is quiesced, purely to collect what the merges
+    // superseded.
+    let writer: tantivy::IndexWriter<tantivy::TantivyDocument> = index.writer(50_000_000)?;
     writer.garbage_collect_files().wait()?;
     writer.wait_merging_threads()?;
+
+    // Recover anything stranded by a previous run. Tantivy only deletes files it still
+    // manages, so files orphaned this way are invisible to it forever.
+    remove_orphaned_segment_files(index_path)?;
 
     let reader = index.reader()?;
     let segments_after = reader.searcher().segment_readers().len();
@@ -66,6 +80,79 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
         segments_before,
         segments_after,
     })
+}
+
+/// Delete segment files that no live segment refers to.
+///
+/// Every segment file is named `<segment-id>.<ext>`. Any such file whose id is absent
+/// from `meta.json` belongs to a segment that has been merged away, so it holds no
+/// reachable data. Only called with the writer lock released and the index settled.
+fn remove_orphaned_segment_files(index_path: &Path) -> crate::Result<u64> {
+    const SEGMENT_EXTENSIONS: &[&str] = &[
+        "store",
+        "pos",
+        "idx",
+        "term",
+        "fast",
+        "fieldnorm",
+        "del",
+        "positions",
+    ];
+
+    let Some(meta) = std::fs::read_to_string(index_path.join("meta.json"))
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    else {
+        return Ok(0);
+    };
+
+    // Segment ids appear hyphenated in meta.json and unhyphenated in filenames.
+    let live: std::collections::HashSet<String> = meta
+        .get("segments")
+        .and_then(|s| s.as_array())
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(|s| s.get("segment_id")?.as_str())
+                .map(|id| id.replace('-', "").to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut reclaimed = 0u64;
+
+    for entry in std::fs::read_dir(index_path)?.flatten() {
+        let path = entry.path();
+
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !SEGMENT_EXTENSIONS.contains(&extension) {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Segment ids are 32 hex characters; anything else isn't ours to delete.
+        if stem.len() != 32 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        if live.contains(&stem.to_lowercase()) {
+            continue;
+        }
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::debug!("Removed orphaned segment file {}", path.display());
+                reclaimed += size;
+            }
+            Err(e) => tracing::warn!("Could not remove {}: {e}", path.display()),
+        }
+    }
+
+    Ok(reclaimed)
 }
 
 #[cfg(test)]
@@ -107,6 +194,68 @@ mod tests {
         }
 
         assert_eq!(segment_count(temp_dir.path()), Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_removes_orphaned_segment_files_and_keeps_live_data() -> crate::Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let schema = build_document_schema();
+        let index = tantivy::Index::create_in_dir(temp_dir.path(), schema.clone())?;
+        register_tokenizers(index.tokenizers());
+        let fields = SchemaFields::new(&schema);
+
+        for i in 0..3 {
+            let mut writer = index.writer(50_000_000)?;
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            writer.add_document(doc!(
+                fields.doc_id => format!("doc-{i}"),
+                fields.path => format!("src/{i}.rs"),
+                fields.filepath.unwrap() => format!("src/{i}.rs"),
+                fields.workspace => "/test",
+                fields.content => format!("fn orphan_{i}() {{}}"),
+                fields.mtime => 0u64,
+                fields.size => 0u64,
+                fields.extension => "rs",
+                fields.line_start => 0u64,
+                fields.line_end => 0u64,
+                fields.chunk_id => "",
+                fields.parent_doc => "",
+            ))?;
+            writer.commit()?;
+        }
+
+        // A merge that left its inputs behind: files named like a segment, referenced by
+        // nothing. Tantivy's own collection can't see these once they leave .managed.json.
+        let orphan = temp_dir
+            .path()
+            .join("ffffffffffffffffffffffffffffffff.store");
+        std::fs::write(&orphan, vec![0u8; 4096])?;
+        let orphan_term = temp_dir
+            .path()
+            .join("ffffffffffffffffffffffffffffffff.term");
+        std::fs::write(&orphan_term, vec![0u8; 2048])?;
+
+        // A file that merely looks similar must survive.
+        let bystander = temp_dir.path().join("notasegment.store");
+        std::fs::write(&bystander, b"keep me")?;
+
+        compact_index(temp_dir.path())?;
+
+        assert!(!orphan.exists(), "orphaned segment file must be removed");
+        assert!(
+            !orphan_term.exists(),
+            "all orphan extensions must be removed"
+        );
+        assert!(bystander.exists(), "non-segment files must be left alone");
+
+        // The documents themselves must still be there.
+        let index = tantivy::Index::open_in_dir(temp_dir.path())?;
+        register_tokenizers(index.tokenizers());
+        let searcher = index.reader()?.searcher();
+        let count = searcher.search(&tantivy::query::AllQuery, &tantivy::collector::Count)?;
+        assert_eq!(count, 3, "compaction must not lose documents");
 
         Ok(())
     }

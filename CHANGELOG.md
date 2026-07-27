@@ -5,6 +5,11 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.1] - 2026-07-27
+
+### Fixed
+- **Auto-compaction could strand segment files on disk** — compaction garbage-collected while merge threads scheduled by the preceding commit were still running. Tantivy drops those files from `.managed.json` without deleting them, so they were left on disk permanently invisible to any later collection. In 3.5.0 this made a compaction triggered right after indexing *grow* an index rather than shrink it: 2.68 MB became 2.91 MB while 30 segments merged into 1, with 1.5 MB stranded. Compaction now waits for every merge thread to finish before collecting, and sweeps segment files that no live segment refers to, which also recovers space already stranded by 3.5.0. The same workload now goes from 2.94 MB to 1.52 MB. Only reachable through auto-compaction, so manually-run `ygrep indexes compact` was never affected
+
 ## [3.5.0] - 2026-07-27
 
 ### Fixed
@@ -357,6 +362,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.5.1]: https://github.com/yetidevworks/ygrep/compare/v3.5.0...v3.5.1
 [3.5.0]: https://github.com/yetidevworks/ygrep/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/yetidevworks/ygrep/compare/v3.3.2...v3.4.0
 [3.3.2]: https://github.com/yetidevworks/ygrep/compare/v3.3.1...v3.3.2
