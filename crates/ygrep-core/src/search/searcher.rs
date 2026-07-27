@@ -856,15 +856,19 @@ impl PathPattern {
     ///
     /// Only segments with a separator on both sides qualify: the pattern matches
     /// anywhere in the path, so a leading `lib/` also matches `mylib/`, and a segment
-    /// next to a wildcard is only part of a name.
+    /// next to a wildcard is only part of a name. `**/` is the exception that looks like
+    /// a separator and isn't — it matches the empty string too, so `**/tests/` also
+    /// matches `contests/`, whose path carries no `tests` term.
     fn anchors(&self) -> Vec<&str> {
         let segments: Vec<&str> = self.pattern.split('/').collect();
         if segments.len() < 3 {
             return Vec::new();
         }
-        segments[1..segments.len() - 1]
-            .iter()
-            .copied()
+        segments
+            .windows(2)
+            .take(segments.len() - 2)
+            .filter(|pair| pair[0] != "**")
+            .map(|pair| pair[1])
             .filter(|segment| {
                 !segment.is_empty() && !segment.contains('*') && !segment.contains('?')
             })
@@ -1868,6 +1872,58 @@ mod tests {
             vec!["plugins", "tests"]
         );
         assert!(PathPattern::new("utils").anchors().is_empty());
+    }
+
+    #[test]
+    fn a_segment_after_a_double_star_is_not_an_anchor() {
+        // `**/` matches the empty string, so `**/tests/` also matches `contests/`, whose
+        // path has no `tests` term to look up. Anchoring on it would push a real match
+        // out of the candidate set.
+        assert!(PathPattern::new("**/tests/").matches("contests/foo.rs"));
+        assert!(PathPattern::new("**/tests/").anchors().is_empty());
+
+        // A single `*` still ends at a real separator, so the next segment is complete.
+        assert_eq!(PathPattern::new("*/tests/").anchors(), vec!["tests"]);
+        assert_eq!(
+            PathPattern::new("src/**/tests/helpers/").anchors(),
+            vec!["helpers"]
+        );
+    }
+
+    #[test]
+    fn a_double_star_path_filter_keeps_every_match() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "inner",
+            "src/tests/handler.rs",
+            "fn handler() {}",
+            "rs",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "partial",
+            "contests/handler.rs",
+            "fn handler() {}",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: None,
+            paths: Some(vec!["**/tests/".to_string()]),
+        };
+        let result =
+            searcher.search_filtered("handler", None, filters, false, false, None, None, false)?;
+
+        assert_eq!(result.hits.len(), 2, "{:?}", result.hits);
+
+        Ok(())
     }
 
     #[test]

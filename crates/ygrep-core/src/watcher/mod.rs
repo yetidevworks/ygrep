@@ -234,9 +234,32 @@ fn is_watched_path(path: &Path, watched_paths: &[PathBuf], config: &IndexerConfi
     !is_hidden(relative) && !is_ignored_dir(relative) && !matches_ignore_pattern(relative, config)
 }
 
-/// Check if a path is hidden (starts with .)
+/// Whether a path lives in a hidden directory the walk never descends into.
+///
+/// The walk indexes `.github/workflows/*.yml`, `.gitignore` and the other dotfiles
+/// listed in [`crate::fs::classify`], so rejecting every dotted path here would leave
+/// them indexed once and never updated again. Directories follow the walk's allowlist;
+/// the final component is a file name, which the classifier judges for itself.
 fn is_hidden(path: &Path) -> bool {
-    path.components().any(|c| is_hidden_name(c.as_os_str()))
+    let mut components = path.components().peekable();
+
+    while let Some(component) = components.next() {
+        let name = component.as_os_str();
+        if !is_hidden_name(name) {
+            continue;
+        }
+        if components.peek().is_none() {
+            return false;
+        }
+        if !name
+            .to_str()
+            .is_some_and(|name| crate::fs::classify::TEXT_DOT_DIRS.contains(&name))
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Check if a single path component is hidden (starts with .)
@@ -339,21 +362,45 @@ mod tests {
 
     #[test]
     fn test_is_hidden() {
-        assert!(is_hidden(Path::new("/foo/.git/config")));
-        assert!(is_hidden(Path::new("/foo/.hidden")));
-        assert!(!is_hidden(Path::new("/foo/bar/baz.rs")));
+        assert!(is_hidden(Path::new("foo/.git/config")));
+        assert!(!is_hidden(Path::new("foo/bar/baz.rs")));
     }
 
     #[test]
     fn test_is_hidden_root_not_hidden() {
         // A path with no hidden components
-        assert!(!is_hidden(Path::new("/usr/local/bin")));
+        assert!(!is_hidden(Path::new("usr/local/bin")));
     }
 
     #[test]
     fn test_is_hidden_nested_in_hidden() {
         // File nested inside a hidden directory
-        assert!(is_hidden(Path::new("/project/.cache/data/file.txt")));
+        assert!(is_hidden(Path::new("project/.cache/data/file.txt")));
+    }
+
+    #[test]
+    fn the_dotfiles_the_walk_indexes_are_also_watched() {
+        let config = IndexerConfig::default();
+        let watched = vec![PathBuf::from("/home/andy/src/myapp")];
+
+        // Indexed by the walk since 4.0, so edits to them have to reach the index too.
+        for path in [
+            "/home/andy/src/myapp/.gitignore",
+            "/home/andy/src/myapp/.github/workflows/ci.yml",
+        ] {
+            assert!(
+                is_watched_path(Path::new(path), &watched, &config),
+                "{path} must produce watch events"
+            );
+        }
+
+        // A dotfile the walk never indexes still reaches the classifier, which drops it,
+        // but a hidden directory of machine state is filtered out here.
+        assert!(!is_watched_path(
+            Path::new("/home/andy/src/myapp/.cache/blob"),
+            &watched,
+            &config
+        ));
     }
 
     #[test]
