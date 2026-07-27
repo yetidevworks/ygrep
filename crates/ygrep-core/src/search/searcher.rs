@@ -1,12 +1,44 @@
+use memchr::memchr2;
 use regex::RegexBuilder;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use tantivy::{collector::TopDocs, query::QueryParser, Index, TantivyDocument};
+use tantivy::collector::TopDocs;
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption};
+use tantivy::{Index, TantivyDocument, Term};
 
 use super::results::{MatchType, SearchHit, SearchResult};
 use crate::config::SearchConfig;
 use crate::error::Result;
-use crate::index::schema::SchemaFields;
+use crate::index::schema::{SchemaFields, CODE_TOKENIZER};
+
+/// How many candidates to pull from Tantivy, as a multiple of the result limit.
+///
+/// The literal filter runs on the stored text, so a query whose best-scoring documents
+/// don't contain the literal needs a deeper pool to fill the page. Starting small keeps
+/// the common case — where the first handful of candidates already match — cheap, and
+/// the second pass only runs when the first came up short. Its ceiling is above what a
+/// single fixed pass used to fetch, so nothing that used to be found gets lost.
+const LITERAL_FETCH_MULTIPLIERS: [usize; 2] = [5, 100];
+
+/// Same idea for regex searches, which reject candidates more often.
+const REGEX_FETCH_MULTIPLIERS: [usize; 2] = [10, 200];
+
+/// Documents below this count are scanned on the calling thread.
+const MIN_PARALLEL_SCAN_DOCS: u64 = 4_096;
+
+/// Smallest document range worth handing to its own thread.
+const MIN_SCAN_CHUNK: usize = 2_048;
+
+/// Doc-store blocks each scan worker keeps decompressed.
+const STORE_CACHE_BLOCKS: usize = 8;
+
+/// How often a scan worker checks whether the ranges ahead of it filled the page.
+const QUOTA_CHECK_INTERVAL: usize = 64;
+
+/// File and line range a hit covers, used to drop duplicates
+type HitKey = (String, u64, u64);
 
 /// Search engine for querying the index
 pub struct Searcher {
@@ -37,6 +69,25 @@ impl Searcher {
         context_before: Option<usize>,
         context_after: Option<usize>,
     ) -> Result<SearchResult> {
+        self.search_literal(
+            query,
+            limit,
+            case_sensitive,
+            context_before,
+            context_after,
+            &CompiledFilters::default(),
+        )
+    }
+
+    fn search_literal(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+        filters: &CompiledFilters,
+    ) -> Result<SearchResult> {
         let start = Instant::now();
         let limit = limit
             .unwrap_or(self.config.default_limit)
@@ -49,13 +100,6 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Build query parser for content and filepath fields
-        let mut query_fields = vec![self.fields.content];
-        if let Some(fp) = self.fields.filepath {
-            query_fields.push(fp);
-        }
-        let query_parser = QueryParser::for_index(&self.index, query_fields);
-
         // Extract alphanumeric words for Tantivy query (it can't search special chars)
         // Then we'll post-filter for exact literal match
         let search_terms: Vec<&str> = query
@@ -63,79 +107,82 @@ impl Searcher {
             .filter(|s| !s.is_empty())
             .collect();
 
-        // Build results
-        let mut hits = Vec::with_capacity(limit);
-        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
-
-        // Prepare query for matching
-        let query_normalized = if case_sensitive {
-            query.to_string()
-        } else {
-            query.to_lowercase()
-        };
+        // Prepare query for matching. Snippet selection stays case-insensitive even
+        // when the document filter isn't, so both forms are kept.
+        let query_lower = query.to_lowercase();
+        let query_normalized: &str = if case_sensitive { query } else { &query_lower };
         let query_terms: Vec<&str> = query_normalized.split_whitespace().collect();
-        let is_multi_word = query_terms.len() > 1;
+        let lowered_terms: Vec<&str> = query_lower.split_whitespace().collect();
+        let matcher = LiteralMatcher {
+            normalized: query_normalized,
+            terms: &query_terms,
+            is_multi_word: query_terms.len() > 1,
+            case_sensitive,
+            lowered: &query_lower,
+            lowered_terms: &lowered_terms,
+        };
 
-        if search_terms.is_empty() {
+        let hits = if search_terms.is_empty() {
             // Punctuation-only literals such as "->", "{%", or "::" have no
             // useful index terms. Scan stored docs so literal search still
             // behaves like grep.
-            'segments: for segment_reader in searcher.segment_readers() {
-                let store_reader = segment_reader.get_store_reader(8)?;
-                for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+            self.scan_documents(&searcher, limit, |doc, seen| {
+                self.literal_hit_from_doc(
+                    doc,
+                    1.0,
+                    1.0,
+                    &matcher,
+                    context_before,
+                    context_after,
+                    seen,
+                    filters,
+                )
+            })?
+        } else {
+            let tantivy_query_str = search_terms.join(" ");
+            let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
+            let tantivy_query = self.with_filters(parsed, filters);
+
+            let mut hits = Vec::new();
+            let mut fetched = 0usize;
+            for multiplier in LITERAL_FETCH_MULTIPLIERS {
+                let fetch_limit = limit.saturating_mul(multiplier);
+                if fetch_limit <= fetched {
+                    break;
+                }
+                let top_docs =
+                    searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+                let candidates = top_docs.len();
+                let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
+
+                hits = Vec::with_capacity(limit);
+                let mut seen: HashSet<HitKey> = HashSet::new();
+                for (score, doc_address) in top_docs {
                     if hits.len() >= limit {
-                        break 'segments;
+                        break;
                     }
+                    let doc = searcher.doc(doc_address)?;
                     if let Some(hit) = self.literal_hit_from_doc(
-                        &doc?,
-                        1.0,
-                        1.0,
-                        query,
-                        &query_normalized,
-                        &query_terms,
-                        is_multi_word,
-                        case_sensitive,
+                        &doc,
+                        score,
+                        max_score,
+                        &matcher,
                         context_before,
                         context_after,
                         &mut seen,
+                        filters,
                     ) {
                         hits.push(hit);
                     }
                 }
-            }
-        } else {
-            // Search for the extracted terms
-            let tantivy_query_str = search_terms.join(" ");
-            let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
 
-            // Fetch more results since we'll filter them down
-            let fetch_limit = limit.saturating_mul(50);
-            let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
-            let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
-
-            for (score, doc_address) in top_docs {
-                if hits.len() >= limit {
+                if hits.len() >= limit || candidates < fetch_limit {
                     break;
                 }
-
-                let doc = searcher.doc(doc_address)?;
-                if let Some(hit) = self.literal_hit_from_doc(
-                    &doc,
-                    score,
-                    max_score,
-                    query,
-                    &query_normalized,
-                    &query_terms,
-                    is_multi_word,
-                    case_sensitive,
-                    context_before,
-                    context_after,
-                    &mut seen,
-                ) {
-                    hits.push(hit);
-                }
+                fetched = fetch_limit;
             }
-        }
+            hits
+        };
 
         let query_time_ms = start.elapsed().as_millis() as u64;
         let text_hits = hits.len();
@@ -150,6 +197,7 @@ impl Searcher {
     }
 
     /// Search with filters
+    #[allow(clippy::too_many_arguments)]
     pub fn search_filtered(
         &self,
         query: &str,
@@ -174,82 +222,44 @@ impl Searcher {
             });
         }
 
-        // Use regex search if requested
-        let mut result = if use_regex {
-            self.search_regex(
-                query,
-                Some(requested_limit.saturating_mul(2)),
-                case_sensitive,
-                context_before,
-                context_after,
-            )?
-        } else {
-            self.search(
-                query,
-                Some(requested_limit.saturating_mul(2)),
-                case_sensitive,
-                context_before,
-                context_after,
-            )?
-        };
+        // Filters run while candidates are being collected rather than on the finished
+        // page. Trimming afterwards used to throw away everything the filter rejected
+        // and return short — often empty — result sets for queries with plenty of
+        // matching files.
+        let compiled = CompiledFilters::compile(&filters);
 
-        let pre_filter_count = result.hits.len();
         if verbose {
             eprintln!(
                 "[verbose] search mode: {}",
                 if use_regex { "regex" } else { "text" }
             );
-            eprintln!("[verbose] matches before filtering: {}", pre_filter_count);
-        }
-
-        // Apply filters
-        if let Some(ref extensions) = filters.extensions {
-            result.hits.retain(|hit| {
-                if let Some(ext) = std::path::Path::new(&hit.path).extension() {
-                    extensions
-                        .iter()
-                        .any(|e| e.eq_ignore_ascii_case(&ext.to_string_lossy()))
-                } else {
-                    false
-                }
-            });
-            if verbose {
-                eprintln!(
-                    "[verbose] after extension filter ({}): {}",
-                    extensions.join(", "),
-                    result.hits.len()
-                );
+            if let Some(ref extensions) = filters.extensions {
+                eprintln!("[verbose] extension filter: {}", extensions.join(", "));
+            }
+            if let Some(ref paths) = filters.paths {
+                eprintln!("[verbose] path filter: {}", paths.join(", "));
             }
         }
 
-        if let Some(ref paths) = filters.paths {
-            result
-                .hits
-                .retain(|hit| paths.iter().any(|p| path_matches(p, &hit.path)));
-            if verbose {
-                eprintln!(
-                    "[verbose] after path filter ({}): {}",
-                    paths.join(", "),
-                    result.hits.len()
-                );
-            }
-        }
-
-        // Re-limit
-        result.hits.truncate(requested_limit);
-        result.total = result.hits.len();
-
-        // Fix text_hits/semantic_hits to reflect post-filter counts (issue #10)
-        result.text_hits = result
-            .hits
-            .iter()
-            .filter(|h| matches!(h.match_type, MatchType::Text | MatchType::Hybrid))
-            .count();
-        result.semantic_hits = result
-            .hits
-            .iter()
-            .filter(|h| matches!(h.match_type, MatchType::Semantic | MatchType::Hybrid))
-            .count();
+        let result = if use_regex {
+            self.search_regex_filtered(
+                query,
+                Some(requested_limit),
+                case_sensitive,
+                context_before,
+                context_after,
+                &compiled,
+            )?
+        } else {
+            self.search_literal(
+                query,
+                Some(requested_limit),
+                case_sensitive,
+                context_before,
+                context_after,
+                &compiled,
+            )?
+        };
 
         if verbose {
             eprintln!("[verbose] final results: {}", result.total);
@@ -266,6 +276,25 @@ impl Searcher {
         case_sensitive: bool,
         context_before: Option<usize>,
         context_after: Option<usize>,
+    ) -> Result<SearchResult> {
+        self.search_regex_filtered(
+            pattern,
+            limit,
+            case_sensitive,
+            context_before,
+            context_after,
+            &CompiledFilters::default(),
+        )
+    }
+
+    fn search_regex_filtered(
+        &self,
+        pattern: &str,
+        limit: Option<usize>,
+        case_sensitive: bool,
+        context_before: Option<usize>,
+        context_after: Option<usize>,
+        filters: &CompiledFilters,
     ) -> Result<SearchResult> {
         let start = Instant::now();
         let limit = limit
@@ -294,13 +323,6 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Build query parser for content and filepath fields
-        let mut query_fields = vec![self.fields.content];
-        if let Some(fp) = self.fields.filepath {
-            query_fields.push(fp);
-        }
-        let query_parser = QueryParser::for_index(&self.index, query_fields);
-
         // Extract alphanumeric words from the regex pattern for Tantivy pre-filter
         // This is a rough heuristic - we extract literal parts from the regex
         let search_terms: Vec<&str> = pattern
@@ -308,61 +330,67 @@ impl Searcher {
             .filter(|s| !s.is_empty() && s.len() > 1) // Skip single chars (likely regex syntax)
             .collect();
 
-        // Build results by applying regex filter
-        let mut hits = Vec::with_capacity(limit);
-        let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
-
         // If we have searchable terms, use Tantivy to narrow down candidates.
         // Otherwise scan stored docs so regexes like "^#" or punctuation-only
         // expressions are exhaustive instead of capped by an arbitrary TopDocs size.
-        if !search_terms.is_empty() {
-            let tantivy_query_str = search_terms.join(" ");
-            let (tantivy_query, _errors) = query_parser.parse_query_lenient(&tantivy_query_str);
-
-            // Fetch many candidates since regex might be selective
-            let fetch_limit = limit.saturating_mul(100);
-            let candidates = searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
-            let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
-
-            for (score, doc_address) in candidates {
-                if hits.len() >= limit {
-                    break;
-                }
-
-                let doc = searcher.doc(doc_address)?;
-                if let Some(hit) = self.regex_hit_from_doc(
-                    &doc,
+        let hits = if search_terms.is_empty() {
+            self.scan_documents(&searcher, limit, |doc, seen| {
+                self.regex_hit_from_doc(
+                    doc,
                     &regex,
-                    score,
-                    max_score,
+                    1.0,
+                    1.0,
                     context_before,
                     context_after,
-                    &mut seen,
-                ) {
-                    hits.push(hit);
-                }
-            }
+                    seen,
+                    filters,
+                )
+            })?
         } else {
-            'segments: for segment_reader in searcher.segment_readers() {
-                let store_reader = segment_reader.get_store_reader(8)?;
-                for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+            let tantivy_query_str = search_terms.join(" ");
+            let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
+            let tantivy_query = self.with_filters(parsed, filters);
+
+            let mut hits = Vec::new();
+            let mut fetched = 0usize;
+            for multiplier in REGEX_FETCH_MULTIPLIERS {
+                let fetch_limit = limit.saturating_mul(multiplier);
+                if fetch_limit <= fetched {
+                    break;
+                }
+                let candidates =
+                    searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+                let candidate_count = candidates.len();
+                let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
+
+                hits = Vec::with_capacity(limit);
+                let mut seen: HashSet<HitKey> = HashSet::new();
+                for (score, doc_address) in candidates {
                     if hits.len() >= limit {
-                        break 'segments;
+                        break;
                     }
+                    let doc = searcher.doc(doc_address)?;
                     if let Some(hit) = self.regex_hit_from_doc(
-                        &doc?,
+                        &doc,
                         &regex,
-                        1.0,
-                        1.0,
+                        score,
+                        max_score,
                         context_before,
                         context_after,
                         &mut seen,
+                        filters,
                     ) {
                         hits.push(hit);
                     }
                 }
+
+                if hits.len() >= limit || candidate_count < fetch_limit {
+                    break;
+                }
+                fetched = fetch_limit;
             }
-        }
+            hits
+        };
 
         let query_time_ms = start.elapsed().as_millis() as u64;
         let text_hits = hits.len();
@@ -376,50 +404,229 @@ impl Searcher {
         })
     }
 
+    /// Query parser covering the content and file path fields
+    fn query_parser(&self) -> QueryParser {
+        let mut query_fields = vec![self.fields.content];
+        if let Some(fp) = self.fields.filepath {
+            query_fields.push(fp);
+        }
+        QueryParser::for_index(&self.index, query_fields)
+    }
+
+    /// Combine the parsed query with the index-side part of the filters.
+    ///
+    /// The filter clauses contribute nothing to the score, so ranking within the
+    /// filtered set matches what an unfiltered search would have produced.
+    fn with_filters(&self, main: Box<dyn Query>, filters: &CompiledFilters) -> Box<dyn Query> {
+        match self.filter_query(filters) {
+            Some(filter) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, main),
+                (
+                    Occur::Must,
+                    Box::new(BoostQuery::new(filter, 0.0)) as Box<dyn Query>,
+                ),
+            ])),
+            None => main,
+        }
+    }
+
+    /// Build the part of a filter that the index can answer.
+    ///
+    /// The file path is indexed with the code tokenizer, which splits on punctuation
+    /// and lowercases, so `src/main.rs` carries the terms `src`, `main` and `rs`. That
+    /// makes an extension a term lookup, and complete directory names inside a path
+    /// pattern likewise. Both narrow the candidate set to a superset of what the
+    /// pattern matching would keep, so the exact check still runs on every hit.
+    fn filter_query(&self, filters: &CompiledFilters) -> Option<Box<dyn Query>> {
+        let filepath = self.fields.filepath?;
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        if !filters.extensions.is_empty() {
+            let mut alternatives = Vec::new();
+            for extension in &filters.extensions {
+                let terms = self.filepath_terms(filepath, extension);
+                if terms.is_empty() {
+                    alternatives.clear();
+                    break;
+                }
+                alternatives.push(all_of(terms));
+            }
+            if let Some(query) = any_of(alternatives) {
+                clauses.push((Occur::Must, query));
+            }
+        }
+
+        if !filters.paths.is_empty() {
+            let mut alternatives = Vec::new();
+            for pattern in &filters.paths {
+                let mut terms = Vec::new();
+                for anchor in pattern.anchors() {
+                    terms.extend(self.filepath_terms(filepath, anchor));
+                }
+                if terms.is_empty() {
+                    alternatives.clear();
+                    break;
+                }
+                alternatives.push(all_of(terms));
+            }
+            if let Some(query) = any_of(alternatives) {
+                clauses.push((Occur::Must, query));
+            }
+        }
+
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(Box::new(BooleanQuery::new(clauses)))
+        }
+    }
+
+    /// Terms the code tokenizer produces for a fragment of a path
+    fn filepath_terms(&self, field: Field, text: &str) -> Vec<Term> {
+        let Some(mut analyzer) = self.index.tokenizers().get(CODE_TOKENIZER) else {
+            return Vec::new();
+        };
+        let mut terms = Vec::new();
+        let mut stream = analyzer.token_stream(text);
+        while stream.advance() {
+            terms.push(Term::from_field_text(field, &stream.token().text));
+        }
+        terms
+    }
+
+    /// Walk every stored document, handing the live ones to `make_hit`.
+    ///
+    /// Punctuation-only queries have no index terms to narrow candidates with, so the
+    /// whole doc store has to be decompressed. Splitting it into contiguous document
+    /// ranges spreads that across cores while keeping the order a serial walk produced:
+    /// ranges are merged back in document order and only then trimmed to the limit.
+    ///
+    /// A range only contributes once the ranges ahead of it come up short, so each one
+    /// watches their running totals and stops as soon as they have the page covered.
+    /// That keeps a query like `->`, which matches almost every file, as cheap as the
+    /// serial walk that stopped at the first handful of documents.
+    fn scan_documents<F>(
+        &self,
+        searcher: &tantivy::Searcher,
+        limit: usize,
+        make_hit: F,
+    ) -> Result<Vec<SearchHit>>
+    where
+        F: Fn(&TantivyDocument, &mut HashSet<HitKey>) -> Option<SearchHit> + Sync,
+    {
+        let units = scan_units(searcher);
+        let found: Vec<AtomicUsize> = units.iter().map(|_| AtomicUsize::new(0)).collect();
+
+        let run = |position: usize, unit: &ScanUnit| -> Result<Vec<SearchHit>> {
+            let segment = &searcher.segment_readers()[unit.segment];
+            let store = segment.get_store_reader(STORE_CACHE_BLOCKS)?;
+            let alive = segment.alive_bitset();
+            let mut seen: HashSet<HitKey> = HashSet::new();
+            let mut hits = Vec::new();
+
+            for (examined, doc_id) in (unit.start..unit.end).enumerate() {
+                if hits.len() >= limit {
+                    break;
+                }
+                if examined % QUOTA_CHECK_INTERVAL == 0
+                    && found[..position]
+                        .iter()
+                        .map(|count| count.load(Ordering::Relaxed))
+                        .sum::<usize>()
+                        >= limit
+                {
+                    break;
+                }
+                if alive
+                    .map(|bitset| !bitset.is_alive(doc_id))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let doc: TantivyDocument = store.get(doc_id)?;
+                if let Some(hit) = make_hit(&doc, &mut seen) {
+                    hits.push(hit);
+                    found[position].store(hits.len(), Ordering::Relaxed);
+                }
+            }
+
+            Ok(hits)
+        };
+
+        let collected: Vec<Result<Vec<SearchHit>>> = if units.len() > 1 {
+            let run = &run;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = units
+                    .iter()
+                    .enumerate()
+                    .map(|(position, unit)| scope.spawn(move || run(position, unit)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| match handle.join() {
+                        Ok(result) => result,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    })
+                    .collect()
+            })
+        } else {
+            units
+                .iter()
+                .enumerate()
+                .map(|(position, unit)| run(position, unit))
+                .collect()
+        };
+
+        let mut seen: HashSet<HitKey> = HashSet::new();
+        let mut hits = Vec::with_capacity(limit);
+        for unit_hits in collected {
+            for hit in unit_hits? {
+                if hits.len() >= limit {
+                    return Ok(hits);
+                }
+                if seen.insert((hit.path.clone(), hit.line_start, hit.line_end)) {
+                    hits.push(hit);
+                }
+            }
+        }
+
+        Ok(hits)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn literal_hit_from_doc(
         &self,
         doc: &TantivyDocument,
         score: f32,
         max_score: f32,
-        query: &str,
-        query_normalized: &str,
-        query_terms: &[&str],
-        is_multi_word: bool,
-        case_sensitive: bool,
+        matcher: &LiteralMatcher<'_>,
         context_before: Option<usize>,
         context_after: Option<usize>,
-        seen: &mut HashSet<(String, u64, u64)>,
+        seen: &mut HashSet<HitKey>,
+        filters: &CompiledFilters,
     ) -> Option<SearchHit> {
-        let path = extract_text(doc, self.fields.path).unwrap_or_default();
-        let doc_id = extract_text(doc, self.fields.doc_id).unwrap_or_default();
-        let content = extract_text(doc, self.fields.content).unwrap_or_default();
-        let line_start = extract_u64(doc, self.fields.line_start).unwrap_or(1);
-        let chunk_id = extract_text(doc, self.fields.chunk_id).unwrap_or_default();
+        let path = extract_str(doc, self.fields.path).unwrap_or_default();
+        if !filters.matches(path) {
+            return None;
+        }
 
-        let content_normalized = if case_sensitive {
-            content.clone()
-        } else {
-            content.to_lowercase()
-        };
+        let content = extract_str(doc, self.fields.content).unwrap_or_default();
+        let line_start = extract_u64(doc, self.fields.line_start).unwrap_or(1);
 
         // Check if path matches the query (filename search)
-        let path_normalized = if case_sensitive {
-            path.clone()
-        } else {
-            path.to_lowercase()
-        };
-        let path_match = !query_terms.is_empty()
-            && query_terms
+        let path_match = !matcher.terms.is_empty()
+            && matcher
+                .terms
                 .iter()
-                .all(|term| path_normalized.contains(term));
+                .all(|term| matcher.contains(path, term));
 
         // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
-        let exact_match = content_normalized.contains(query_normalized);
-        let and_match = is_multi_word
-            && query_terms
+        let exact_match = matcher.contains(content, matcher.normalized);
+        let and_match = matcher.is_multi_word
+            && matcher
+                .terms
                 .iter()
-                .all(|term| content_normalized.contains(term));
+                .all(|term| matcher.contains(content, term));
         if !exact_match && !and_match && !path_match {
             return None;
         }
@@ -435,7 +642,7 @@ impl Searcher {
         let is_content_match = exact_match || and_match;
 
         let (snippet, snippet_offset, snippet_line_count, match_line_offset) = if is_content_match {
-            create_relevant_snippet(&content, query, 10, context_before, context_after)
+            create_relevant_snippet(content, matcher, 10, context_before, context_after)
         } else {
             // Path-only match: show first few lines
             let lines: Vec<&str> = content.lines().take(10).collect();
@@ -450,24 +657,28 @@ impl Searcher {
         let match_line_in_snippet = match_line_offset.saturating_sub(snippet_offset);
 
         // Deduplicate: skip if we already have a hit for the same file and line range
-        let key = (path.clone(), actual_line_start, actual_line_end);
+        let key = (path.to_string(), actual_line_start, actual_line_end);
         if !seen.insert(key) {
             return None;
         }
 
+        let chunk_id = extract_str(doc, self.fields.chunk_id).unwrap_or_default();
         Some(SearchHit {
-            path,
+            path: path.to_string(),
             line_start: actual_line_start,
             line_end: actual_line_end,
             snippet,
             score: normalized_score,
             is_chunk: !chunk_id.is_empty(),
-            doc_id,
+            doc_id: extract_str(doc, self.fields.doc_id)
+                .unwrap_or_default()
+                .to_string(),
             match_type: MatchType::Text,
             match_line_in_snippet,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn regex_hit_from_doc(
         &self,
         doc: &TantivyDocument,
@@ -476,16 +687,19 @@ impl Searcher {
         max_score: f32,
         context_before: Option<usize>,
         context_after: Option<usize>,
-        seen: &mut HashSet<(String, u64, u64)>,
+        seen: &mut HashSet<HitKey>,
+        filters: &CompiledFilters,
     ) -> Option<SearchHit> {
-        let path = extract_text(doc, self.fields.path).unwrap_or_default();
-        let doc_id = extract_text(doc, self.fields.doc_id).unwrap_or_default();
-        let content = extract_text(doc, self.fields.content).unwrap_or_default();
+        let path = extract_str(doc, self.fields.path).unwrap_or_default();
+        if !filters.matches(path) {
+            return None;
+        }
+
+        let content = extract_str(doc, self.fields.content).unwrap_or_default();
         let line_start = extract_u64(doc, self.fields.line_start).unwrap_or(1);
-        let chunk_id = extract_text(doc, self.fields.chunk_id).unwrap_or_default();
 
         // REGEX FILTER: Only include if content matches the regex
-        if !regex.is_match(&content) {
+        if !regex.is_match(content) {
             return None;
         }
 
@@ -498,7 +712,7 @@ impl Searcher {
 
         // Create snippet showing lines that match the regex
         let (snippet, snippet_offset, snippet_line_count, match_line_offset) =
-            create_regex_snippet(&content, regex, 10, context_before, context_after);
+            create_regex_snippet(content, regex, 10, context_before, context_after);
 
         // Adjust line numbers to reflect where the snippet is in the file
         let actual_line_start = line_start + snippet_offset as u64;
@@ -506,19 +720,22 @@ impl Searcher {
         let match_line_in_snippet = match_line_offset.saturating_sub(snippet_offset);
 
         // Deduplicate: skip if we already have a hit for the same file and line range
-        let key = (path.clone(), actual_line_start, actual_line_end);
+        let key = (path.to_string(), actual_line_start, actual_line_end);
         if !seen.insert(key) {
             return None;
         }
 
+        let chunk_id = extract_str(doc, self.fields.chunk_id).unwrap_or_default();
         Some(SearchHit {
-            path,
+            path: path.to_string(),
             line_start: actual_line_start,
             line_end: actual_line_end,
             snippet,
             score: normalized_score,
             is_chunk: !chunk_id.is_empty(),
-            doc_id,
+            doc_id: extract_str(doc, self.fields.doc_id)
+                .unwrap_or_default()
+                .to_string(),
             match_type: MatchType::Text,
             match_line_in_snippet,
         })
@@ -534,6 +751,193 @@ pub struct SearchFilters {
     pub paths: Option<Vec<String>>,
 }
 
+/// The parts of a literal query every candidate document is tested against
+struct LiteralMatcher<'a> {
+    /// Query as it is compared against document text
+    normalized: &'a str,
+    /// Words of `normalized`
+    terms: &'a [&'a str],
+    is_multi_word: bool,
+    case_sensitive: bool,
+    /// Lowercased query, used for picking the snippet line, which stays
+    /// case-insensitive even when the document filter isn't
+    lowered: &'a str,
+    /// Words of `lowered`
+    lowered_terms: &'a [&'a str],
+}
+
+impl LiteralMatcher<'_> {
+    fn contains(&self, haystack: &str, needle: &str) -> bool {
+        if self.case_sensitive {
+            haystack.contains(needle)
+        } else {
+            contains_lowered(haystack, needle)
+        }
+    }
+}
+
+/// Path and extension filters, compiled once per search.
+///
+/// Globs used to be turned into a regex inside the retain closure, so every pattern was
+/// recompiled for every hit it was tested against.
+#[derive(Default)]
+struct CompiledFilters {
+    extensions: Vec<String>,
+    paths: Vec<PathPattern>,
+}
+
+impl CompiledFilters {
+    fn compile(filters: &SearchFilters) -> Self {
+        Self {
+            extensions: filters.extensions.clone().unwrap_or_default(),
+            paths: filters
+                .paths
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|pattern| PathPattern::new(pattern))
+                .collect(),
+        }
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        if !self.extensions.is_empty() {
+            let matched = match std::path::Path::new(path).extension() {
+                Some(ext) => self
+                    .extensions
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&ext.to_string_lossy())),
+                None => false,
+            };
+            if !matched {
+                return false;
+            }
+        }
+
+        if !self.paths.is_empty() && !self.paths.iter().any(|p| p.matches(path)) {
+            return false;
+        }
+
+        true
+    }
+}
+
+/// A `-p` pattern with its glob regex already compiled
+struct PathPattern {
+    pattern: String,
+    glob: Option<regex::Regex>,
+}
+
+impl PathPattern {
+    fn new(pattern: &str) -> Self {
+        let glob = if pattern.contains('*') || pattern.contains('?') {
+            glob_to_regex(pattern).ok()
+        } else {
+            None
+        };
+        Self {
+            pattern: pattern.to_string(),
+            glob,
+        }
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        if self.pattern.contains('*') || self.pattern.contains('?') {
+            self.glob
+                .as_ref()
+                .map(|re| re.is_match(path))
+                .unwrap_or(false)
+        } else {
+            path.starts_with(&self.pattern) || path.contains(&self.pattern)
+        }
+    }
+
+    /// Directory names a matching path is guaranteed to contain in full.
+    ///
+    /// Only segments with a separator on both sides qualify: the pattern matches
+    /// anywhere in the path, so a leading `lib/` also matches `mylib/`, and a segment
+    /// next to a wildcard is only part of a name.
+    fn anchors(&self) -> Vec<&str> {
+        let segments: Vec<&str> = self.pattern.split('/').collect();
+        if segments.len() < 3 {
+            return Vec::new();
+        }
+        segments[1..segments.len() - 1]
+            .iter()
+            .copied()
+            .filter(|segment| {
+                !segment.is_empty() && !segment.contains('*') && !segment.contains('?')
+            })
+            .collect()
+    }
+}
+
+/// A contiguous run of document ids inside one segment
+struct ScanUnit {
+    segment: usize,
+    start: u32,
+    end: u32,
+}
+
+/// Split the stored documents into runs, one per worker
+fn scan_units(searcher: &tantivy::Searcher) -> Vec<ScanUnit> {
+    let segments = searcher.segment_readers();
+    let total: u64 = segments.iter().map(|s| s.max_doc() as u64).sum();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let chunk = if total <= MIN_PARALLEL_SCAN_DOCS || workers <= 1 {
+        usize::MAX
+    } else {
+        ((total as usize).div_ceil(workers)).max(MIN_SCAN_CHUNK)
+    };
+
+    let mut units = Vec::new();
+    for (segment, reader) in segments.iter().enumerate() {
+        let max_doc = reader.max_doc();
+        let mut start = 0u32;
+        while start < max_doc {
+            let end = (start as usize).saturating_add(chunk).min(max_doc as usize) as u32;
+            units.push(ScanUnit {
+                segment,
+                start,
+                end,
+            });
+            start = end;
+        }
+    }
+    units
+}
+
+/// Require every term
+fn all_of(terms: Vec<Term>) -> Box<dyn Query> {
+    let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+        .into_iter()
+        .map(|term| {
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+            )
+        })
+        .collect();
+    Box::new(BooleanQuery::new(clauses))
+}
+
+/// Require at least one alternative
+fn any_of(mut alternatives: Vec<Box<dyn Query>>) -> Option<Box<dyn Query>> {
+    match alternatives.len() {
+        0 => None,
+        1 => alternatives.pop(),
+        _ => Some(Box::new(BooleanQuery::new(
+            alternatives
+                .into_iter()
+                .map(|query| (Occur::Should, query))
+                .collect(),
+        ))),
+    }
+}
+
 fn empty_result(start: Instant) -> SearchResult {
     SearchResult {
         total: 0,
@@ -544,11 +948,14 @@ fn empty_result(start: Instant) -> SearchResult {
     }
 }
 
-/// Extract text value from a document
-fn extract_text(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) -> Option<String> {
+/// Borrow a text value from a document.
+///
+/// The document already owns its stored text, so matching against a borrow avoids
+/// copying every candidate's file content just to look at it.
+fn extract_str(doc: &TantivyDocument, field: tantivy::schema::Field) -> Option<&str> {
     doc.get_first(field).and_then(|v| {
         if let tantivy::schema::OwnedValue::Str(s) = v {
-            Some(s.to_string())
+            Some(s.as_str())
         } else {
             None
         }
@@ -566,29 +973,68 @@ fn extract_u64(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) ->
     })
 }
 
+/// Case-insensitive substring test against an already-lowercased needle.
+///
+/// Lowercasing a whole file to run one `contains` was the single biggest allocation in
+/// a search. Text that is entirely ASCII — nearly all source code — folds case a byte
+/// at a time instead, and only genuinely non-ASCII text falls back to a lowercased copy.
+fn contains_lowered(haystack: &str, needle_lower: &str) -> bool {
+    if haystack.is_ascii() {
+        contains_ascii_ignore_case(haystack.as_bytes(), needle_lower.as_bytes())
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
+}
+
+/// Substring search over ASCII bytes, ignoring case. `needle` must already be lowercase.
+fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    let first = needle[0];
+    let first_upper = first.to_ascii_uppercase();
+    let last_start = haystack.len() - needle.len() + 1;
+    let mut offset = 0;
+
+    while offset < last_start {
+        let Some(found) = memchr2(first, first_upper, &haystack[offset..last_start]) else {
+            return false;
+        };
+        let at = offset + found;
+        if haystack[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        offset = at + 1;
+    }
+
+    false
+}
+
 /// Create a snippet showing lines relevant to the query
 /// Returns (snippet, snippet_offset, line_count, match_line_offset)
 /// - snippet_offset: 0-based line index where snippet starts in the chunk
 /// - match_line_offset: 0-based line index of the actual match in the chunk
 fn create_relevant_snippet(
     content: &str,
-    query: &str,
+    matcher: &LiteralMatcher<'_>,
     max_lines: usize,
     ctx_before: Option<usize>,
     ctx_after: Option<usize>,
 ) -> (String, usize, usize, usize) {
     let lines: Vec<&str> = content.lines().collect();
-    let query_lower = query.to_lowercase();
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    let query_terms = matcher.lowered_terms;
 
     // Find lines that contain any query term
     let mut matching_indices: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let line_lower = line.to_lowercase();
         let matches = if query_terms.is_empty() {
-            !query_lower.is_empty() && line_lower.contains(&query_lower)
+            !matcher.lowered.is_empty() && contains_lowered(line, matcher.lowered)
         } else {
-            query_terms.iter().any(|term| line_lower.contains(term))
+            query_terms.iter().any(|term| contains_lowered(line, term))
         };
         if matches {
             matching_indices.push(i);
@@ -612,10 +1058,9 @@ fn create_relevant_snippet(
         let mut best_line = matching_indices[0];
         let mut best_count = 0;
         for &idx in &matching_indices {
-            let line_lower = lines[idx].to_lowercase();
             let count = query_terms
                 .iter()
-                .filter(|t| line_lower.contains(*t))
+                .filter(|t| contains_lowered(lines[idx], t))
                 .count();
             if count > best_count {
                 best_count = count;
@@ -690,14 +1135,9 @@ fn create_regex_snippet(
 ///   - `**` matches any characters including `/`
 ///   - `?` matches any single character except `/`
 /// - Otherwise, falls back to prefix/contains matching.
+#[cfg(test)]
 fn path_matches(pattern: &str, path: &str) -> bool {
-    if pattern.contains('*') || pattern.contains('?') {
-        glob_to_regex(pattern)
-            .map(|re| re.is_match(path))
-            .unwrap_or(false)
-    } else {
-        path.starts_with(pattern) || path.contains(pattern)
-    }
+    PathPattern::new(pattern).matches(path)
 }
 
 /// Convert a glob pattern to a compiled regex.
@@ -782,6 +1222,50 @@ mod tests {
         writer.commit().unwrap();
     }
 
+    /// Helper: add many documents through a single writer
+    fn add_docs(index: &Index, fields: &SchemaFields, docs: &[(String, String, String, String)]) {
+        let mut writer = index.writer(50_000_000).unwrap();
+        for (doc_id, path, content, ext) in docs {
+            writer
+                .add_document(doc!(
+                    fields.doc_id => doc_id.as_str(),
+                    fields.path => path.as_str(),
+                    fields.filepath.unwrap() => path.as_str(),
+                    fields.workspace => "/test",
+                    fields.content => content.as_str(),
+                    fields.mtime => 0u64,
+                    fields.size => content.len() as u64,
+                    fields.extension => ext.as_str(),
+                    fields.line_start => 1u64,
+                    fields.line_end => content.lines().count() as u64,
+                    fields.chunk_id => "",
+                    fields.parent_doc => ""
+                ))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+    }
+
+    /// Helper: build a batch of documents from a naming pattern
+    fn batch(
+        count: usize,
+        prefix: &str,
+        path: impl Fn(usize) -> String,
+        content: &str,
+        ext: &str,
+    ) -> Vec<(String, String, String, String)> {
+        (0..count)
+            .map(|i| {
+                (
+                    format!("{prefix}-{i}"),
+                    path(i),
+                    content.to_string(),
+                    ext.to_string(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn test_basic_search() -> Result<()> {
         let temp_dir = tempdir().unwrap();
@@ -825,6 +1309,53 @@ mod tests {
         let result = searcher.search("HELLO", None, false, None, None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/lib.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_case_sensitive_search_respects_case() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/lib.rs",
+            "fn greet() { println!(\"Hello World\"); }",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        assert_eq!(
+            searcher.search("Hello", None, true, None, None)?.hits.len(),
+            1
+        );
+        assert!(searcher.search("hello", None, true, None, None)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_ascii_content_matches_case_insensitively() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "src/greet.rs",
+            "let greeting = \"CAFÉ Ünicode\";",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search("café", None, false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
 
         Ok(())
     }
@@ -877,20 +1408,57 @@ mod tests {
     }
 
     #[test]
+    fn test_punctuation_scan_is_exhaustive_across_many_documents() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        // Enough documents that the scan splits into parallel ranges
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                6_000,
+                "nonmatch",
+                |i| format!("src/file_{i}.rs"),
+                "fn main() {}",
+                "rs",
+            ),
+        );
+        add_doc(
+            &index,
+            &fields,
+            "match",
+            "src/client.php",
+            "$client->get('/api/users');",
+            "php",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let result = searcher.search("->", Some(5), false, None, None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/client.php");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_regex_without_index_terms_scans_all_documents() -> Result<()> {
         let temp_dir = tempdir().unwrap();
         let (index, fields) = create_test_index(temp_dir.path());
 
-        for i in 0..120 {
-            add_doc(
-                &index,
-                &fields,
-                &format!("nonmatch-{i}"),
-                &format!("src/file_{i}.rs"),
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                120,
+                "nonmatch",
+                |i| format!("src/file_{i}.rs"),
                 "fn main() {}",
                 "rs",
-            );
-        }
+            ),
+        );
         add_doc(
             &index,
             &fields,
@@ -1006,6 +1574,226 @@ mod tests {
     }
 
     #[test]
+    fn test_extension_filter_survives_a_crowd_of_other_extensions() -> Result<()> {
+        // The filter used to run after the result page was cut to size, so a query whose
+        // top matches were all the wrong extension returned nothing at all.
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                500,
+                "php",
+                |i| format!("src/handler_{i}.php"),
+                "function handler() { handler(); handler(); }",
+                "php",
+            ),
+        );
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                5,
+                "rs",
+                |i| format!("src/handler_{i}.rs"),
+                "fn handler() {}",
+                "rs",
+            ),
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: Some(vec!["rs".to_string()]),
+            paths: None,
+        };
+        let result = searcher.search_filtered(
+            "handler",
+            Some(10),
+            filters,
+            false,
+            false,
+            None,
+            None,
+            false,
+        )?;
+
+        assert_eq!(result.hits.len(), 5);
+        assert!(result.hits.iter().all(|h| h.path.ends_with(".rs")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extension_filter_matches_uppercase_extensions() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "test1",
+            "docs/README.MD",
+            "handler notes",
+            "MD",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: Some(vec!["md".to_string()]),
+            paths: None,
+        };
+        let result =
+            searcher.search_filtered("handler", None, filters, false, false, None, None, false)?;
+
+        assert_eq!(result.hits.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_path_filter_survives_a_crowd_of_other_paths() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                500,
+                "vendor",
+                |i| format!("vendor/pkg/handler_{i}.php"),
+                "function handler() { handler(); handler(); }",
+                "php",
+            ),
+        );
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                3,
+                "app",
+                |i| format!("app/http/handler_{i}.php"),
+                "function handler() {}",
+                "php",
+            ),
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: None,
+            paths: Some(vec!["app/http/".to_string()]),
+        };
+        let result = searcher.search_filtered(
+            "handler",
+            Some(10),
+            filters,
+            false,
+            false,
+            None,
+            None,
+            false,
+        )?;
+
+        assert_eq!(result.hits.len(), 3);
+        assert!(result.hits.iter().all(|h| h.path.starts_with("app/http/")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extension_filter_on_punctuation_query() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "php",
+            "src/client.php",
+            "$client->get('/api');",
+            "php",
+        );
+        add_doc(
+            &index,
+            &fields,
+            "rs",
+            "src/client.rs",
+            "let x = a -> b;",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: Some(vec!["rs".to_string()]),
+            paths: None,
+        };
+        let result =
+            searcher.search_filtered("->", None, filters, false, false, None, None, false)?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/client.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_regex_search_with_extension_filter() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                200,
+                "php",
+                |i| format!("src/handler_{i}.php"),
+                "function handler() { handler(); }",
+                "php",
+            ),
+        );
+        add_doc(
+            &index,
+            &fields,
+            "rs",
+            "src/handler.rs",
+            "fn handler() {}",
+            "rs",
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+
+        let filters = SearchFilters {
+            extensions: Some(vec!["rs".to_string()]),
+            paths: None,
+        };
+        let result = searcher.search_filtered(
+            "handler",
+            Some(5),
+            filters,
+            true,
+            false,
+            None,
+            None,
+            false,
+        )?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "src/handler.rs");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_search_path_filter() -> Result<()> {
         let temp_dir = tempdir().unwrap();
         let (index, fields) = create_test_index(temp_dir.path());
@@ -1067,6 +1855,30 @@ mod tests {
         assert!(path_matches("SRC/*/tests/", "src/api/tests/foo.rs"));
         // Plain prefix matching is case-sensitive (existing behavior)
         assert!(!path_matches("SRC/", "src/main.rs"));
+    }
+
+    #[test]
+    fn test_path_anchors_skip_partial_segments() {
+        // A leading segment can be the tail of a longer directory name
+        assert!(PathPattern::new("lib/").anchors().is_empty());
+        // Wildcards leave only part of a name behind
+        assert_eq!(PathPattern::new("src/ma*n/tests/").anchors(), vec!["tests"]);
+        assert_eq!(
+            PathPattern::new("user/plugins/*/tests/").anchors(),
+            vec!["plugins", "tests"]
+        );
+        assert!(PathPattern::new("utils").anchors().is_empty());
+    }
+
+    #[test]
+    fn test_contains_ascii_ignore_case() {
+        assert!(contains_ascii_ignore_case(b"Hello World", b"hello"));
+        assert!(contains_ascii_ignore_case(b"Hello World", b"world"));
+        assert!(contains_ascii_ignore_case(b"aAaB", b"aab"));
+        assert!(!contains_ascii_ignore_case(b"Hello", b"goodbye"));
+        assert!(!contains_ascii_ignore_case(b"hi", b"longer"));
+        assert!(contains_ascii_ignore_case(b"anything", b""));
+        assert!(contains_ascii_ignore_case(b"->get(", b"->get("));
     }
 
     #[test]

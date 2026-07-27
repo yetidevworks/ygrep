@@ -43,6 +43,7 @@ notify-debouncer-full = { workspace = true }
 ignore = { workspace = true }
 
 # Utils
+memchr = { workspace = true }
 parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
 dirs = { workspace = true }
