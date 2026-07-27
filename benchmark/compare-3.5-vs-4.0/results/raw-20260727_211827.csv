@@ -1,0 +1,100 @@
+metric,corpus,variant,label,median_ms,min_ms,max_ms,query_time_ms,hits,runs
+build_cold,ygrep,old,"full build (cold)",186.82,181.18,193.83,-1,-1,3
+build_cold,ygrep,new,"full build (cold)",207.84,186.37,210.56,-1,-1,3
+build_rebuild,ygrep,old,"rebuild",234.67,199.22,241.60,-1,-1,3
+build_rebuild,ygrep,new,"rebuild",209.37,209.35,221.14,-1,-1,3
+build_noop,ygrep,old,"no-op incremental",18.96,18.81,19.11,-1,-1,10
+build_noop,ygrep,new,"no-op incremental",18.04,17.82,20.10,-1,-1,10
+index_disk,ygrep,old,"612K / 4 segments / 72 files",0,0,0,-1,-1,1
+index_disk,ygrep,new,"616K / 4 segments / 76 files",0,0,0,-1,-1,1
+query,ygrep,old,"common word",9.09,8.49,9.36,3.0,44,10
+query,ygrep,new,"common word",8.80,8.42,9.22,3.0,45,10
+query,ygrep,old,"rare identifier",6.29,5.99,6.59,0.0,2,10
+query,ygrep,new,"rare identifier",6.31,5.77,6.61,0.0,2,10
+query,ygrep,old,"two-word phrase",9.26,8.62,9.77,3.0,33,10
+query,ygrep,new,"two-word phrase",9.67,9.18,9.91,3.0,35,10
+query,ygrep,old,"punctuation ->",9.43,9.05,9.49,3.0,51,10
+query,ygrep,new,"punctuation ->",7.57,7.32,8.14,2.0,52,10
+query,ygrep,old,"punctuation <<<",7.90,7.32,8.54,2.0,4,10
+query,ygrep,new,"punctuation <<<",7.22,6.92,7.77,1.0,4,10
+query,ygrep,old,"regex",8.38,8.34,8.82,2.0,6,10
+query,ygrep,new,"regex",7.81,7.22,8.56,2.0,6,10
+query,ygrep,old,"ext filter (-e rs)",7.43,7.12,7.92,1.0,6,10
+query,ygrep,new,"ext filter (-e rs)",6.81,6.58,7.31,1.0,6,10
+query,ygrep,old,"path filter (-p crates/ygrep-core/)",9.37,8.91,9.45,3.0,18,10
+query,ygrep,new,"path filter (-p crates/ygrep-core/)",7.54,7.07,7.89,2.0,18,10
+filter_hits,ygrep,old,"ext filter (-e rs) -n 20",7.87,7.87,7.87,1.0,6,1
+filter_hits,ygrep,new,"ext filter (-e rs) -n 20",8.15,8.15,8.15,1.0,6,1
+filter_hits,ygrep,old,"ext filter (-e rs) -n 100",8.24,8.24,8.24,1.0,6,1
+filter_hits,ygrep,new,"ext filter (-e rs) -n 100",8.16,8.16,8.16,1.0,6,1
+filter_hits,ygrep,old,"path filter (-p crates/ygrep-core/) -n 20",9.89,9.89,9.89,3.0,16,1
+filter_hits,ygrep,new,"path filter (-p crates/ygrep-core/) -n 20",8.41,8.41,8.41,2.0,18,1
+filter_hits,ygrep,old,"path filter (-p crates/ygrep-core/) -n 100",10.17,10.17,10.17,3.0,18,1
+filter_hits,ygrep,new,"path filter (-p crates/ygrep-core/) -n 100",8.43,8.43,8.43,2.0,18,1
+build_cold,grav-learn,old,"full build (cold)",891.67,884.83,902.74,-1,-1,3
+build_cold,grav-learn,new,"full build (cold)",432.94,426.55,434.00,-1,-1,3
+build_rebuild,grav-learn,old,"rebuild",885.86,882.05,972.66,-1,-1,3
+build_rebuild,grav-learn,new,"rebuild",425.37,420.61,426.49,-1,-1,3
+build_noop,grav-learn,old,"no-op incremental",614.59,601.76,636.41,-1,-1,10
+build_noop,grav-learn,new,"no-op incremental",249.43,238.90,257.10,-1,-1,10
+index_disk,grav-learn,old,"8.1M / 6 segments / 8489 files",0,0,0,-1,-1,1
+index_disk,grav-learn,new,"8.1M / 6 segments / 8517 files",0,0,0,-1,-1,1
+query,grav-learn,old,"common word",10.94,10.48,11.57,5.0,100,10
+query,grav-learn,new,"common word",10.09,9.86,10.55,4.0,100,10
+query,grav-learn,old,"rare identifier",7.90,7.46,8.11,2.0,12,10
+query,grav-learn,new,"rare identifier",7.80,7.21,8.21,2.0,12,10
+query,grav-learn,old,"two-word phrase",29.83,28.96,30.88,23.0,91,10
+query,grav-learn,new,"two-word phrase",34.02,33.37,35.45,28.0,91,10
+query,grav-learn,old,"punctuation ->",16.39,16.25,16.68,10.0,100,10
+query,grav-learn,new,"punctuation ->",12.03,11.74,12.40,6.0,100,10
+query,grav-learn,old,"punctuation <<<",29.27,28.39,31.08,23.0,3,10
+query,grav-learn,new,"punctuation <<<",11.89,11.69,12.43,6.0,3,10
+query,grav-learn,old,"regex",16.50,16.08,17.41,10.0,100,10
+query,grav-learn,new,"regex",16.19,16.03,16.46,10.0,100,10
+query,grav-learn,old,"ext filter (-e md)",10.29,9.99,10.67,4.0,20,10
+query,grav-learn,new,"ext filter (-e md)",10.75,10.41,11.13,5.0,100,10
+query,grav-learn,old,"path filter (-p pages/)",10.95,10.26,11.24,5.0,52,10
+query,grav-learn,new,"path filter (-p pages/)",12.66,12.13,13.24,6.0,100,10
+filter_hits,grav-learn,old,"ext filter (-e md) -n 20",9.29,9.29,9.29,2.0,7,1
+filter_hits,grav-learn,new,"ext filter (-e md) -n 20",8.03,8.03,8.03,1.0,20,1
+filter_hits,grav-learn,old,"ext filter (-e md) -n 100",11.93,11.93,11.93,5.0,20,1
+filter_hits,grav-learn,new,"ext filter (-e md) -n 100",12.13,12.13,12.13,5.0,100,1
+filter_hits,grav-learn,old,"path filter (-p pages/) -n 20",9.69,9.69,9.69,3.0,13,1
+filter_hits,grav-learn,new,"path filter (-p pages/) -n 20",9.71,9.71,9.71,3.0,20,1
+filter_hits,grav-learn,old,"path filter (-p pages/) -n 100",12.27,12.27,12.27,5.0,52,1
+filter_hits,grav-learn,new,"path filter (-p pages/) -n 100",12.99,12.99,12.99,6.0,100,1
+build_cold,github,old,"full build (cold)",10160.96,9777.53,10393.40,-1,-1,3
+build_cold,github,new,"full build (cold)",11087.36,10867.37,11270.25,-1,-1,3
+build_rebuild,github,old,"rebuild",10582.19,9980.25,11401.95,-1,-1,3
+build_rebuild,github,new,"rebuild",11598.51,11305.94,11948.96,-1,-1,3
+build_noop,github,old,"no-op incremental",3451.13,3418.95,3539.84,-1,-1,10
+build_noop,github,new,"no-op incremental",841.73,833.65,862.09,-1,-1,10
+index_disk,github,old,"180M / 1 segments / 44285 files",0,0,0,-1,-1,1
+index_disk,github,new,"202M / 1 segments / 44761 files",0,0,0,-1,-1,1
+query,github,old,"common word",16.63,15.86,17.06,10.0,100,10
+query,github,new,"common word",14.48,14.22,15.24,8.0,100,10
+query,github,old,"rare identifier",8.09,7.16,8.64,2.0,10,10
+query,github,new,"rare identifier",7.21,6.82,7.39,1.0,10,10
+query,github,old,"two-word phrase",120.96,119.68,122.60,113.0,84,10
+query,github,new,"two-word phrase",145.04,142.45,146.59,138.0,84,10
+query,github,old,"punctuation ->",14.58,14.14,14.89,8.0,100,10
+query,github,new,"punctuation ->",10.53,9.93,11.82,4.0,100,10
+query,github,old,"punctuation <<<",196.75,196.06,197.54,190.0,100,10
+query,github,new,"punctuation <<<",45.36,41.36,47.01,38.0,100,10
+query,github,old,"regex",41.55,41.10,42.72,35.0,100,10
+query,github,new,"regex",51.88,51.34,52.66,45.0,100,10
+query,github,old,"ext filter (-e c)",24.60,24.27,25.52,18.0,61,10
+query,github,new,"ext filter (-e c)",13.27,12.81,13.57,7.0,100,10
+query,github,old,"path filter (-p Marlin/)",18.74,18.28,19.22,12.0,89,10
+query,github,new,"path filter (-p Marlin/)",14.84,14.28,15.07,9.0,100,10
+filter_hits,github,old,"ext filter (-e c) -n 20",9.00,9.00,9.00,2.0,20,1
+filter_hits,github,new,"ext filter (-e c) -n 20",7.68,7.68,7.68,1.0,20,1
+filter_hits,github,old,"ext filter (-e c) -n 100",25.94,25.94,25.94,19.0,61,1
+filter_hits,github,new,"ext filter (-e c) -n 100",14.49,14.49,14.49,8.0,100,1
+filter_hits,github,old,"path filter (-p Marlin/) -n 20",15.93,15.93,15.93,9.0,20,1
+filter_hits,github,new,"path filter (-p Marlin/) -n 20",9.23,9.23,9.23,3.0,20,1
+filter_hits,github,old,"path filter (-p Marlin/) -n 100",18.66,18.66,18.66,12.0,89,1
+filter_hits,github,new,"path filter (-p Marlin/) -n 100",16.23,16.23,16.23,9.0,100,1
+peak_rss,github,old,"peak RSS MB",506,506,506,-1,-1,1
+peak_rss,github,new,"peak RSS MB",504,504,504,-1,-1,1
+peak_rss,github,new-threads1,"peak RSS MB",498,498,498,-1,-1,1

@@ -1,0 +1,110 @@
+ygrep 3.5.1 vs 4.0.0
+old:  /tmp/ygrep-baseline/target/release/ygrep
+new:  /Users/rhuk/Projects/yetidevworks/ygrep/target/release/ygrep
+host: Apple M4 Max, Darwin 25.5.0
+work: /tmp/ygrep-bench
+csv:  /Users/rhuk/Projects/yetidevworks/ygrep/benchmark/compare-3.5-vs-4.0/results/raw-20260727_211827.csv
+build runs: 3 (+1 warmup)   query runs: 10 (+2 warmup)
+
+== corpus: ygrep (/Users/rhuk/Projects/yetidevworks/ygrep)
+   dry-run (old): Would index /Users/rhuk/Projects/yetidevworks/ygrep (72 files, 759.33 KB)
+   dry-run (new): Would index /Users/rhuk/Projects/yetidevworks/ygrep (76 files, 780.10 KB)
+
+-- indexing
+workload                          3.5.1        4.0.0      delta
+full build (cold)              186.82ms     207.84ms     +11.3%
+rebuild                        234.67ms     209.37ms     -10.8%
+no-op incremental               18.96ms      18.04ms      -4.9%
+
+-- index on disk
+   old: 612K on disk, 4 segments, 72 files
+   new: 616K on disk, 4 segments, 76 files
+
+-- queries (median wall / tool-reported query_time_ms / hits)
+query                                                 3.5.1                  4.0.0      delta
+common word                            9.09ms / 3.0ms / 44h   8.80ms / 3.0ms / 45h      -3.2%
+rare identifier                         6.29ms / 0.0ms / 2h    6.31ms / 0.0ms / 2h      +0.3%
+two-word phrase                        9.26ms / 3.0ms / 33h   9.67ms / 3.0ms / 35h      +4.4%
+punctuation ->                         9.43ms / 3.0ms / 51h   7.57ms / 2.0ms / 52h     -19.7%
+punctuation <<<                         7.90ms / 2.0ms / 4h    7.22ms / 1.0ms / 4h      -8.6%
+regex                                   8.38ms / 2.0ms / 6h    7.81ms / 2.0ms / 6h      -6.8%
+ext filter (-e rs)                      7.43ms / 1.0ms / 6h    6.81ms / 1.0ms / 6h      -8.3%
+path filter (-p crates/ygrep-core/)    9.37ms / 3.0ms / 18h   7.54ms / 2.0ms / 18h     -19.5%
+
+-- filtered result counts
+query                                   limit        3.5.1        4.0.0
+ext filter (-e rs)                         20       6 hits       6 hits
+ext filter (-e rs)                        100       6 hits       6 hits
+path filter (-p crates/ygrep-core/)        20      16 hits      18 hits
+path filter (-p crates/ygrep-core/)       100      18 hits      18 hits
+
+== corpus: grav-learn (/Users/rhuk/Projects/grav/grav-learn)
+   dry-run (old): Would index /Users/rhuk/Projects/grav/grav-learn (8489 files, 11.05 MB)
+   dry-run (new): Would index /Users/rhuk/Projects/grav/grav-learn (8517 files, 11.06 MB)
+
+-- indexing
+workload                          3.5.1        4.0.0      delta
+full build (cold)              891.67ms     432.94ms     -51.4%
+rebuild                        885.86ms     425.37ms     -52.0%
+no-op incremental              614.59ms     249.43ms     -59.4%
+
+-- index on disk
+   old: 8.1M on disk, 6 segments, 8489 files
+   new: 8.1M on disk, 6 segments, 8517 files
+
+-- queries (median wall / tool-reported query_time_ms / hits)
+query                                                 3.5.1                  4.0.0      delta
+common word                          10.94ms / 5.0ms / 100h 10.09ms / 4.0ms / 100h      -7.8%
+rare identifier                        7.90ms / 2.0ms / 12h   7.80ms / 2.0ms / 12h      -1.3%
+two-word phrase                      29.83ms / 23.0ms / 91h 34.02ms / 28.0ms / 91h     +14.0%
+punctuation ->                       16.39ms / 10.0ms / 100h 12.03ms / 6.0ms / 100h     -26.6%
+punctuation <<<                       29.27ms / 23.0ms / 3h   11.89ms / 6.0ms / 3h     -59.4%
+regex                                16.50ms / 10.0ms / 100h 16.19ms / 10.0ms / 100h      -1.9%
+ext filter (-e md)                    10.29ms / 4.0ms / 20h 10.75ms / 5.0ms / 100h      +4.5%
+path filter (-p pages/)               10.95ms / 5.0ms / 52h 12.66ms / 6.0ms / 100h     +15.6%
+
+-- filtered result counts
+query                                   limit        3.5.1        4.0.0
+ext filter (-e md)                         20       7 hits      20 hits
+ext filter (-e md)                        100      20 hits     100 hits
+path filter (-p pages/)                    20      13 hits      20 hits
+path filter (-p pages/)                   100      52 hits     100 hits
+
+== corpus: github (/Users/rhuk/Projects/github)
+   dry-run (old): Would index /Users/rhuk/Projects/github (44338 files, 350.29 MB)
+   dry-run (new): Would index /Users/rhuk/Projects/github (44814 files, 350.68 MB)
+
+-- indexing
+workload                          3.5.1        4.0.0      delta
+full build (cold)            10160.96ms   11087.36ms      +9.1%
+rebuild                      10582.19ms   11598.51ms      +9.6%
+no-op incremental             3451.13ms     841.73ms     -75.6%
+
+-- index on disk
+   old: 180M on disk, 1 segments, 44285 files
+   new: 202M on disk, 1 segments, 44761 files
+
+-- queries (median wall / tool-reported query_time_ms / hits)
+query                                                 3.5.1                  4.0.0      delta
+common word                          16.63ms / 10.0ms / 100h 14.48ms / 8.0ms / 100h     -12.9%
+rare identifier                        8.09ms / 2.0ms / 10h   7.21ms / 1.0ms / 10h     -10.9%
+two-word phrase                      120.96ms / 113.0ms / 84h 145.04ms / 138.0ms / 84h     +19.9%
+punctuation ->                       14.58ms / 8.0ms / 100h 10.53ms / 4.0ms / 100h     -27.8%
+punctuation <<<                      196.75ms / 190.0ms / 100h 45.36ms / 38.0ms / 100h     -76.9%
+regex                                41.55ms / 35.0ms / 100h 51.88ms / 45.0ms / 100h     +24.9%
+ext filter (-e c)                    24.60ms / 18.0ms / 61h 13.27ms / 7.0ms / 100h     -46.1%
+path filter (-p Marlin/)             18.74ms / 12.0ms / 89h 14.84ms / 9.0ms / 100h     -20.8%
+
+-- filtered result counts
+query                                   limit        3.5.1        4.0.0
+ext filter (-e c)                          20      20 hits      20 hits
+ext filter (-e c)                         100      61 hits     100 hits
+path filter (-p Marlin/)                   20      20 hits      20 hits
+path filter (-p Marlin/)                  100      89 hits     100 hits
+
+== peak RSS, full build on github
+   3.5.1:                     506 MB
+   4.0.0:                     504 MB  (-0.4%)
+   4.0.0 (indexer.threads=1): 498 MB  (-1.6%)
+
+raw results: /Users/rhuk/Projects/yetidevworks/ygrep/benchmark/compare-3.5-vs-4.0/results/raw-20260727_211827.csv
