@@ -43,6 +43,9 @@ struct WorkspaceState {
 pub struct WatchManager {
     /// Per-workspace state keyed by hash
     workspaces: HashMap<String, WorkspaceState>,
+    /// Start watching a workspace that was indexed within [`AUTO_WATCH_THRESHOLD`].
+    /// The dashboard wants that; the background service follows the persisted flag only.
+    auto_watch_recent: bool,
     /// Channel to receive commands from the TUI
     cmd_rx: mpsc::UnboundedReceiver<ManagerCommand>,
     /// Channel to send events to the TUI
@@ -66,6 +69,7 @@ impl WatchManager {
 
         let manager = Self {
             workspaces: HashMap::new(),
+            auto_watch_recent: true,
             cmd_rx,
             event_tx,
             file_event_rx,
@@ -73,6 +77,14 @@ impl WatchManager {
         };
 
         (manager, cmd_tx, event_rx)
+    }
+
+    /// Decide whether a recently indexed workspace starts watching on its own.
+    ///
+    /// The background service turns this off: it watches exactly what the persisted flag
+    /// says, so nothing starts watching a workspace the user never asked for.
+    pub fn set_auto_watch_recent(&mut self, enabled: bool) {
+        self.auto_watch_recent = enabled;
     }
 
     /// Register a workspace.
@@ -89,18 +101,31 @@ impl WatchManager {
         indexed_at: Option<chrono::DateTime<chrono::Utc>>,
         watch: bool,
     ) {
-        let recently_indexed = indexed_at
-            .map(|dt| {
-                let age = chrono::Utc::now().signed_duration_since(dt);
-                age.num_seconds() < AUTO_WATCH_THRESHOLD.as_secs() as i64
-            })
-            .unwrap_or(false);
-        let should_auto_watch = (watch || recently_indexed) && workspace_path.exists();
-
-        let state = WorkspaceState {
-            hash: hash.clone(),
+        self.apply_registration(WorkspaceRegistration {
+            hash,
             workspace_path,
             semantic,
+            indexed_at,
+            watch,
+        });
+    }
+
+    /// Record a workspace and return true when it should start watching immediately.
+    fn apply_registration(&mut self, reg: WorkspaceRegistration) -> bool {
+        let recently_indexed = self.auto_watch_recent
+            && reg
+                .indexed_at
+                .map(|dt| {
+                    let age = chrono::Utc::now().signed_duration_since(dt);
+                    age.num_seconds() < AUTO_WATCH_THRESHOLD.as_secs() as i64
+                })
+                .unwrap_or(false);
+        let should_auto_watch = (reg.watch || recently_indexed) && reg.workspace_path.exists();
+
+        let state = WorkspaceState {
+            hash: reg.hash.clone(),
+            workspace_path: reg.workspace_path,
+            semantic: reg.semantic,
             watch_state: if should_auto_watch {
                 WatchState::Active
             } else {
@@ -113,11 +138,12 @@ impl WatchManager {
             },
             watcher_handle: None,
             watcher_stop_tx: None,
-            indexed_at,
+            indexed_at: reg.indexed_at,
             last_sleep_poll: None,
         };
 
-        self.workspaces.insert(hash, state);
+        self.workspaces.insert(reg.hash, state);
+        should_auto_watch
     }
 
     /// Run the manager event loop. This should be spawned as a tokio task.
@@ -145,6 +171,12 @@ impl WatchManager {
                     match cmd {
                         ManagerCommand::ToggleWatch(hash) => {
                             self.handle_toggle(&hash);
+                        }
+                        ManagerCommand::SetWatch { hash, enabled } => {
+                            self.set_watch(&hash, enabled);
+                        }
+                        ManagerCommand::Register(reg) => {
+                            self.handle_register(reg);
                         }
                         ManagerCommand::Reindex(hash) => {
                             self.handle_reindex(&hash);
@@ -247,33 +279,62 @@ impl WatchManager {
             None => return,
         };
 
-        match current_state {
-            WatchState::Off => {
-                // Off -> Active
-                if let Some(ws) = self.workspaces.get_mut(hash) {
-                    ws.watch_state = WatchState::Active;
-                    ws.last_activity = Some(Instant::now());
-                    ws.indexed_at = Some(chrono::Utc::now());
-                }
-                self.start_watcher(hash);
-                let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
-                    hash: hash.to_string(),
-                    new_state: WatchState::Active,
-                });
+        self.set_watch(hash, current_state == WatchState::Off);
+    }
+
+    /// Start or stop watching a workspace, ignoring a request that changes nothing.
+    fn set_watch(&mut self, hash: &str, enabled: bool) {
+        let current_state = match self.workspaces.get(hash) {
+            Some(ws) => ws.watch_state.clone(),
+            None => return,
+        };
+
+        if enabled {
+            if current_state != WatchState::Off {
+                return;
             }
-            WatchState::Active | WatchState::Sleeping => {
-                // Active/Sleeping -> Off
-                self.stop_watcher(hash);
-                if let Some(ws) = self.workspaces.get_mut(hash) {
-                    ws.watch_state = WatchState::Off;
-                    ws.last_activity = None;
-                    ws.last_sleep_poll = None;
-                }
-                let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
-                    hash: hash.to_string(),
-                    new_state: WatchState::Off,
-                });
+            if let Some(ws) = self.workspaces.get_mut(hash) {
+                ws.watch_state = WatchState::Active;
+                ws.last_activity = Some(Instant::now());
+                ws.indexed_at = Some(chrono::Utc::now());
             }
+            self.start_watcher(hash);
+            let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
+                hash: hash.to_string(),
+                new_state: WatchState::Active,
+            });
+        } else {
+            if current_state == WatchState::Off {
+                return;
+            }
+            self.stop_watcher(hash);
+            if let Some(ws) = self.workspaces.get_mut(hash) {
+                ws.watch_state = WatchState::Off;
+                ws.last_activity = None;
+                ws.last_sleep_poll = None;
+            }
+            let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
+                hash: hash.to_string(),
+                new_state: WatchState::Off,
+            });
+        }
+    }
+
+    /// Add a workspace after the manager is running, starting its watcher when the
+    /// registration says so. A hash already known keeps its live watcher untouched.
+    fn handle_register(&mut self, reg: WorkspaceRegistration) {
+        let hash = reg.hash.clone();
+        if self.workspaces.contains_key(&hash) {
+            self.set_watch(&hash, reg.watch);
+            return;
+        }
+
+        if self.apply_registration(reg) {
+            self.start_watcher(&hash);
+            let _ = self.event_tx.send(ManagerEvent::WatchStateChanged {
+                hash,
+                new_state: WatchState::Active,
+            });
         }
     }
 

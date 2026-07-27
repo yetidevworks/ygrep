@@ -78,11 +78,30 @@ pub enum ActivityKind {
     Reindex,
 }
 
+/// A workspace handed to the WatchManager after it is already running
+#[derive(Debug, Clone)]
+pub struct WorkspaceRegistration {
+    /// Index hash
+    pub hash: String,
+    /// Workspace root path
+    pub workspace_path: PathBuf,
+    /// Whether the index carries embeddings
+    pub semantic: bool,
+    /// When the index was last updated
+    pub indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Persisted watch flag
+    pub watch: bool,
+}
+
 /// Commands sent from the TUI to the WatchManager
 #[derive(Debug)]
 pub enum ManagerCommand {
     /// Toggle watch state for a workspace (Off <-> Active)
     ToggleWatch(String),
+    /// Set the watch state for a workspace explicitly
+    SetWatch { hash: String, enabled: bool },
+    /// Add a workspace the manager has not seen yet
+    Register(WorkspaceRegistration),
     /// Trigger full re-index for a workspace
     Reindex(String),
     /// Remove an index entirely
