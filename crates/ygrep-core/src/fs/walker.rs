@@ -1,6 +1,7 @@
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ impl FileWalker {
                 root: root.clone(),
                 prune_suffixes,
                 config,
-                followed_symlinks: Mutex::new(HashSet::new()),
+                symlinks: Mutex::new(SymlinkAliases::default()),
                 visited: AtomicUsize::new(0),
             }),
             root,
@@ -41,11 +42,24 @@ impl FileWalker {
 
     /// Iterate over all indexable files in the directory tree
     pub fn walk(&mut self) -> impl Iterator<Item = WalkEntry> + '_ {
-        let filter = Arc::clone(&self.filter);
+        self.filter.reset_symlinks();
 
-        self.builder()
-            .build()
-            .filter_map(move |entry| filter.accept(entry.ok()?))
+        let mut entries = Vec::new();
+        let mut roots = vec![self.root.clone()];
+
+        while !roots.is_empty() {
+            for root in std::mem::take(&mut roots) {
+                for entry in self.builder_for(&root).build() {
+                    if let Some(walk_entry) = entry.ok().and_then(|e| self.filter.accept(e)) {
+                        entries.push(walk_entry);
+                    }
+                }
+            }
+            roots = self.filter.take_symlinked_dirs();
+        }
+
+        entries.extend(self.filter.take_symlinked_files());
+        entries.into_iter()
     }
 
     /// Walk the tree on `threads` worker threads, handing each entry to a visitor.
@@ -58,23 +72,40 @@ impl FileWalker {
         M: FnMut() -> V,
         V: FnMut(WalkEntry) + Send,
     {
-        self.builder().build_parallel().run(|| {
-            let filter = Arc::clone(&self.filter);
-            let mut visit = make_visitor();
+        self.filter.reset_symlinks();
 
-            Box::new(move |entry| {
-                if let Some(walk_entry) = entry.ok().and_then(|e| filter.accept(e)) {
-                    visit(walk_entry);
-                }
-                WalkState::Continue
-            })
-        });
+        let mut roots = vec![self.root.clone()];
+
+        while !roots.is_empty() {
+            for root in std::mem::take(&mut roots) {
+                self.builder_for(&root).build_parallel().run(|| {
+                    let filter = Arc::clone(&self.filter);
+                    let mut visit = make_visitor();
+
+                    Box::new(move |entry| {
+                        if let Some(walk_entry) = entry.ok().and_then(|e| filter.accept(e)) {
+                            visit(walk_entry);
+                        }
+                        WalkState::Continue
+                    })
+                });
+            }
+            roots = self.filter.take_symlinked_dirs();
+        }
+
+        let deferred = self.filter.take_symlinked_files();
+        if !deferred.is_empty() {
+            let mut visit = make_visitor();
+            for entry in deferred {
+                visit(entry);
+            }
+        }
     }
 
-    fn builder(&self) -> WalkBuilder {
+    fn builder_for(&self, root: &Path) -> WalkBuilder {
         let config = &self.filter.config;
         let respect_gitignore = config.respect_gitignore;
-        let mut builder = WalkBuilder::new(&self.root);
+        let mut builder = WalkBuilder::new(root);
 
         // Hidden entries are judged by our own rules below, not skipped wholesale:
         // `.github/workflows/*.yml` and `.gitignore` are source like any other.
@@ -120,11 +151,86 @@ struct EntryFilter {
     config: IndexerConfig,
     /// Directory path suffixes pruned during the walk, derived from `ignore_patterns`
     prune_suffixes: Vec<String>,
-    /// Canonical targets of symlinks already followed, so a tree reachable through two
-    /// links is walked once. Only symlinked entries are canonicalized: doing it for
-    /// every file cost more than the rest of the walk put together.
-    followed_symlinks: Mutex<HashSet<PathBuf>>,
+    /// Symlinks the walk set aside instead of following, keyed by canonical target
+    symlinks: Mutex<SymlinkAliases>,
     visited: AtomicUsize,
+}
+
+/// The symlinks a walk has stepped over, grouped by the target they resolve to.
+///
+/// A tree reachable through several links is indexed once, under one alias. Which alias
+/// cannot be decided when a link is first met: another thread may still be holding a
+/// lower-sorting one, and with worker threads racing each other the winner changed from
+/// run to run, so an unchanged workspace re-indexed and deleted the same files on every
+/// incremental pass. Links are therefore collected first and walked afterwards, keeping
+/// the lexicographically first alias for each target.
+///
+/// Only symlinked entries are canonicalized: doing it for every file cost more than the
+/// rest of the walk put together.
+#[derive(Default)]
+struct SymlinkAliases {
+    /// Best alias so far for each directory target still waiting to be walked
+    dirs: HashMap<PathBuf, PathBuf>,
+    /// Best alias so far for each file target, with the metadata the indexer needs
+    files: HashMap<PathBuf, WalkEntry>,
+    /// Targets already handed out, so a later link to the same tree is not walked again
+    resolved: HashSet<PathBuf>,
+}
+
+impl SymlinkAliases {
+    fn offer_dir(&mut self, canonical: PathBuf, alias: &Path) {
+        if self.resolved.contains(&canonical) {
+            return;
+        }
+        match self.dirs.entry(canonical) {
+            Entry::Occupied(mut existing) => {
+                if alias < existing.get().as_path() {
+                    existing.insert(alias.to_path_buf());
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(alias.to_path_buf());
+            }
+        }
+    }
+
+    fn offer_file(&mut self, canonical: PathBuf, entry: WalkEntry) {
+        if self.resolved.contains(&canonical) {
+            return;
+        }
+        match self.files.entry(canonical) {
+            Entry::Occupied(mut existing) => {
+                if entry.path < existing.get().path {
+                    existing.insert(entry);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+        }
+    }
+
+    fn take_dirs(&mut self) -> Vec<PathBuf> {
+        let claimed: Vec<(PathBuf, PathBuf)> = self.dirs.drain().collect();
+        let mut roots = Vec::with_capacity(claimed.len());
+        for (canonical, alias) in claimed {
+            self.resolved.insert(canonical);
+            roots.push(alias);
+        }
+        roots.sort();
+        roots
+    }
+
+    fn take_files(&mut self) -> Vec<WalkEntry> {
+        let claimed: Vec<(PathBuf, WalkEntry)> = self.files.drain().collect();
+        let mut entries = Vec::with_capacity(claimed.len());
+        for (canonical, entry) in claimed {
+            self.resolved.insert(canonical);
+            entries.push(entry);
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        entries
+    }
 }
 
 impl EntryFilter {
@@ -152,7 +258,15 @@ impl EntryFilter {
                 return false;
             }
 
-            if entry.path_is_symlink() && self.skip_symlink(entry.path()) {
+            // A linked directory is never followed by the walk that found it. It is set
+            // aside and walked in a later pass, once every alias to the same target is
+            // known and the choice between them no longer depends on thread timing.
+            if entry.path_is_symlink() {
+                if self.config.follow_symlinks {
+                    if let Some(canonical) = self.link_target(entry.path()) {
+                        self.symlinks.lock().offer_dir(canonical, entry.path());
+                    }
+                }
                 return false;
             }
         }
@@ -176,7 +290,8 @@ impl EntryFilter {
             return None;
         }
 
-        if entry.path_is_symlink() && (!self.config.follow_symlinks || self.skip_symlink(path)) {
+        let is_link = entry.path_is_symlink();
+        if is_link && !self.config.follow_symlinks {
             return None;
         }
 
@@ -191,33 +306,55 @@ impl EntryFilter {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        self.visited.fetch_add(1, Ordering::Relaxed);
-
-        Some(WalkEntry {
+        let walk_entry = WalkEntry {
             path: path.to_path_buf(),
             meta: FileMeta {
                 size: metadata.len(),
                 mtime,
             },
-        })
-    }
-
-    /// Whether a symlink leads somewhere the walk covers by another route.
-    ///
-    /// A link into the workspace itself is always redundant — the walk reaches the real
-    /// path anyway — and two links to the same tree outside it are followed once. This
-    /// is the only place anything is canonicalized: doing it for every file, which is
-    /// how duplicates used to be found, cost more than the rest of the walk together.
-    fn skip_symlink(&self, path: &Path) -> bool {
-        let Ok(canonical) = std::fs::canonicalize(path) else {
-            return true;
         };
 
-        if canonical.starts_with(&self.canonical_root) {
-            return true;
+        // Linked files wait alongside linked directories, for the same reason.
+        if is_link {
+            let canonical = self.link_target(path)?;
+            self.symlinks.lock().offer_file(canonical, walk_entry);
+            return None;
         }
 
-        !self.followed_symlinks.lock().insert(canonical)
+        self.visited.fetch_add(1, Ordering::Relaxed);
+
+        Some(walk_entry)
+    }
+
+    /// The canonical target of a symlink, unless the walk already covers it.
+    ///
+    /// A link into the workspace itself is always redundant — the walk reaches the real
+    /// path anyway. Everything else is a candidate alias for its target.
+    fn link_target(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+
+        if canonical.starts_with(&self.canonical_root) {
+            return None;
+        }
+
+        Some(canonical)
+    }
+
+    /// Aliases held back by the walk that just finished, one per target, sorted
+    fn take_symlinked_dirs(&self) -> Vec<PathBuf> {
+        self.symlinks.lock().take_dirs()
+    }
+
+    /// Linked files held back by the walk, one per target, sorted
+    fn take_symlinked_files(&self) -> Vec<WalkEntry> {
+        let entries = self.symlinks.lock().take_files();
+        self.visited.fetch_add(entries.len(), Ordering::Relaxed);
+        entries
+    }
+
+    /// Forget every link seen so far, so a second walk of the same tree starts clean
+    fn reset_symlinks(&self) {
+        *self.symlinks.lock() = SymlinkAliases::default();
     }
 
     /// Check if path matches custom ignore patterns
@@ -551,6 +688,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_alias_chosen_for_a_shared_target_never_changes() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, workspace) = workspace_with_source("myapp");
+
+        let outside = _temp.path().join("shared");
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        std::fs::write(outside.join("shared.rs"), "fn shared() {}\n").unwrap();
+        std::fs::write(outside.join("nested/deep.rs"), "fn deep() {}\n").unwrap();
+        std::fs::write(outside.join("one.rs"), "fn one() {}\n").unwrap();
+
+        // Three names for one tree, created in an order that does not match their sort
+        // order, plus three names for one file.
+        for alias in ["mid", "zed", "abc"] {
+            symlink(&outside, workspace.join(alias)).unwrap();
+        }
+        for alias in ["m.rs", "z.rs", "a.rs"] {
+            symlink(outside.join("one.rs"), workspace.join(alias)).unwrap();
+        }
+
+        let expected = vec![
+            "a.rs".to_string(),
+            "abc/nested/deep.rs".to_string(),
+            "abc/one.rs".to_string(),
+            "abc/shared.rs".to_string(),
+            "src/main.rs".to_string(),
+        ];
+
+        // The parallel walk is the one that used to pick a different alias per run.
+        for run in 0..8 {
+            let walker = FileWalker::new(workspace.clone(), IndexerConfig::default()).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            walker.walk_parallel(|| {
+                let tx = tx.clone();
+                move |entry: WalkEntry| {
+                    let _ = tx.send(entry.path);
+                }
+            });
+            drop(tx);
+
+            let mut paths: Vec<String> = rx
+                .into_iter()
+                .map(|p| {
+                    p.strip_prefix(&workspace)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            paths.sort();
+
+            assert_eq!(paths, expected, "run {run} picked a different alias");
+        }
+
+        // And the sequential walk agrees with it.
+        assert_eq!(walked_paths(&workspace, IndexerConfig::default()), expected);
     }
 
     #[test]
