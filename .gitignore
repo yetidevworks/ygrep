@@ -20,4 +20,5 @@ Thumbs.db
 
 # Local plan file
 .claude-plan.md
-/benchmark
+/benchmark/*
+!/benchmark/compare-3.5-vs-4.0/

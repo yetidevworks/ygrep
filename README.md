@@ -526,6 +526,46 @@ src/main.rs:12-28
 4. **Search**: BM25-ranked literal search (default) or regex matching with `-r` flag, plus optional semantic search
 5. **Results**: Returns matching files with line numbers and context
 
+## Performance
+
+Measured against 3.5.1 on an M4 Max (14 cores, 36 GB RAM), median of 3 runs for builds
+and 10 for queries, each version indexing into its own data directory:
+
+| Workload | Corpus | 3.5.1 | 4.0.0 |
+|---|---|---|---|
+| No-op `ygrep index` | 8.5k files, 11 MB | 595 ms | **185 ms** |
+| No-op `ygrep index` | 44.8k files, 350 MB | 3.50 s | **0.90 s** |
+| Full build | 8.5k files, 11 MB | 902 ms | **447 ms** |
+| Full build | 44.8k files, 350 MB | 10.2 s | 11.7 s |
+| `<<<` literal query | 44.8k files, 350 MB | 202 ms | **53 ms** |
+| `-e c malloc` query | 44.8k files, 350 MB | 23 ms, 61 hits | **15 ms, 100 hits** |
+
+An unchanged tree is now decided from the directory metadata the walk already carries,
+rather than re-reading and re-stat-ing every file, so repeat runs cost a fraction of what
+they did. Punctuation-heavy queries are pre-filtered by any alphanumeric part of the
+query, and what still has to be scanned is scanned across segments in parallel. Extension
+and path filters are applied before the result limit rather than after, so a filtered
+query fills its page instead of returning whatever survived truncation - that last row
+returns 39 results 3.5.1 dropped.
+
+Two costs came with it, both from walking in parallel. On a 350 MB tree the build is
+already saturated by Tantivy's own indexing threads, so the parallel walk adds up to 14%
+build time, and interleaving unrelated files into the doc store's 64 KB compression
+blocks costs 13% more disk (203 MB vs 179 MB). Peak build memory rose from 501 MB to
+536 MB. Restoring the sequential walk gives back all three, and the incremental win is
+unaffected:
+
+```toml
+[indexer]
+threads = 1   # 0 = one per core
+```
+
+Multi-word literal queries that ask for more results than exist also cost more, because
+4.0.0 retries with a deeper candidate pool instead of returning short: a two-word query
+with 84 matches went from 111 ms to 227 ms at `-n 100`, and from 9 ms to 7 ms at `-n 20`.
+
+Full tables and the script that produced them are in `benchmark/compare-3.5-vs-4.0/`.
+
 ## Development
 
 ### Running Tests
