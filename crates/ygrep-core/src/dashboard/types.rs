@@ -42,6 +42,8 @@ pub struct IndexEntry {
     pub semantic: bool,
     /// Current watch state
     pub watch_state: WatchState,
+    /// Persisted watch flag: the background service watches this index on login
+    pub watch: bool,
     /// Changes per minute (rolling average)
     pub changes_per_min: f64,
     /// Whether the workspace still exists on disk

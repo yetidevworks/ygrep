@@ -14,7 +14,9 @@ pub mod embeddings;
 pub mod error;
 pub mod fs;
 pub mod index;
+pub mod registry;
 pub mod search;
+pub mod telemetry;
 pub mod watcher;
 
 pub use config::Config;
@@ -118,20 +120,13 @@ impl Workspace {
     pub fn resolve_index_path(root: &Path, config: &Config) -> Result<PathBuf> {
         let root = std::fs::canonicalize(root)?;
 
-        // Resolve data directory:
-        // 1. Auto-detect: .ygrep/ directory in workspace root
-        // 2. Relative data_dir in config: resolve against workspace root
-        // 3. Absolute data_dir from config: use as-is
-        let local_ygrep = root.join(".ygrep");
-        let data_dir = if local_ygrep.is_dir() {
-            local_ygrep
-        } else if config.indexer.data_dir.is_relative() {
-            root.join(&config.indexer.data_dir)
-        } else {
-            config.indexer.data_dir.clone()
-        };
+        Ok(registry::indexes_dir_for(&root, config).join(hash_path(&root)))
+    }
 
-        Ok(data_dir.join("indexes").join(hash_path(&root)))
+    /// Resolve the data directory holding this workspace's index, telemetry, and logs.
+    pub fn resolve_data_dir(root: &Path, config: &Config) -> Result<PathBuf> {
+        let root = std::fs::canonicalize(root)?;
+        Ok(registry::data_dir_for(&root, config))
     }
 
     /// Open or create a workspace with custom config.
@@ -596,7 +591,8 @@ impl Workspace {
             self.log("Warning: Semantic search feature not available in this build.");
         }
 
-        // Save workspace metadata for index management
+        // Save workspace metadata for index management. Merged into whatever is already
+        // there so the watch flag — and anything a newer ygrep wrote — survives a reindex.
         let metadata = serde_json::json!({
             "workspace": self.root.to_string_lossy(),
             "indexed_at": chrono::Utc::now().to_rfc3339(),
@@ -604,11 +600,7 @@ impl Workspace {
             "semantic": with_embeddings,
             "schema_version": index::SCHEMA_VERSION,
         });
-        let metadata_path = self.index_path.join("workspace.json");
-        if let Err(e) = std::fs::write(
-            &metadata_path,
-            serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        ) {
+        if let Err(e) = registry::update_metadata(&self.index_path, metadata) {
             tracing::warn!("Failed to save workspace metadata: {}", e);
         }
 

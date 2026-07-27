@@ -62,6 +62,9 @@ pub enum YgrepError {
 
     #[error("Search error: {0}")]
     Search(String),
+
+    #[error("{0}")]
+    Registry(String),
 }
 
 pub type Result<T> = std::result::Result<T, YgrepError>;

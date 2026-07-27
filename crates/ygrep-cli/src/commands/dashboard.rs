@@ -21,7 +21,9 @@ use ygrep_core::dashboard::{
     ActivityEvent, ActivityKind, IndexEntry, ManagerCommand, ManagerEvent, WatchState,
 };
 
-use super::indexes::{collect_indexes, format_relative_time, format_size, shorten_path, IndexInfo};
+use ygrep_core::registry::{
+    collect_indexes, format_relative_time, format_size, shorten_path, IndexInfo,
+};
 
 /// Maximum activity log entries to keep
 const MAX_ACTIVITY_LOG: usize = 500;
@@ -561,6 +563,7 @@ fn build_entries(indexes: Vec<IndexInfo>) -> Vec<IndexEntry> {
                 indexed_at: info.indexed_at,
                 semantic: info.semantic.unwrap_or(false),
                 watch_state: WatchState::Off,
+                watch: info.watch,
                 changes_per_min: 0.0,
                 orphaned: info.orphaned,
             }
@@ -1004,28 +1007,37 @@ pub fn run() -> Result<()> {
             entry.workspace_path.clone(),
             entry.semantic,
             entry.indexed_at,
+            entry.watch,
         );
     }
 
     // Build the app
     let mut app = App::new(entries, cmd_tx.clone());
 
-    // Set up initial watch states from manager registration (auto-watch recently indexed)
-    // We need to check which entries the manager decided to auto-watch
-    for entry in &mut app.entries {
-        if let Some(indexed_at) = entry.indexed_at {
-            let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 4 * 3600 && entry.workspace_path.exists() {
-                entry.watch_state = WatchState::Active;
-            }
+    // Set up initial watch states to match what the manager decided to auto-watch:
+    // anything carrying the persisted watch flag, plus anything indexed recently enough
+    // to still be the workspace someone is working in.
+    fn auto_watched(entry: &IndexEntry) -> bool {
+        if !entry.workspace_path.exists() {
+            return false;
         }
+        if entry.watch {
+            return true;
+        }
+        entry
+            .indexed_at
+            .map(|indexed_at| {
+                chrono::Utc::now()
+                    .signed_duration_since(indexed_at)
+                    .num_seconds()
+                    < 4 * 3600
+            })
+            .unwrap_or(false)
     }
-    for entry in &mut app.all_entries {
-        if let Some(indexed_at) = entry.indexed_at {
-            let age = chrono::Utc::now().signed_duration_since(indexed_at);
-            if age.num_seconds() < 4 * 3600 && entry.workspace_path.exists() {
-                entry.watch_state = WatchState::Active;
-            }
+
+    for entry in app.entries.iter_mut().chain(app.all_entries.iter_mut()) {
+        if auto_watched(entry) {
+            entry.watch_state = WatchState::Active;
         }
     }
 

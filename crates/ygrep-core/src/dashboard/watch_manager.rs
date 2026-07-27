@@ -75,20 +75,27 @@ impl WatchManager {
         (manager, cmd_tx, event_rx)
     }
 
-    /// Register a workspace. If recently indexed and workspace exists, auto-start watching.
+    /// Register a workspace.
+    ///
+    /// Watching starts on its own when the index carries the persisted `watch` flag, or
+    /// when it was indexed recently enough to still be the workspace someone is working
+    /// in. The flag being off only means "don't start on its own" — the TUI can still
+    /// turn watching on for the session.
     pub fn register(
         &mut self,
         hash: String,
         workspace_path: PathBuf,
         semantic: bool,
         indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+        watch: bool,
     ) {
-        let should_auto_watch = indexed_at
+        let recently_indexed = indexed_at
             .map(|dt| {
                 let age = chrono::Utc::now().signed_duration_since(dt);
-                age.num_seconds() < AUTO_WATCH_THRESHOLD.as_secs() as i64 && workspace_path.exists()
+                age.num_seconds() < AUTO_WATCH_THRESHOLD.as_secs() as i64
             })
             .unwrap_or(false);
+        let should_auto_watch = (watch || recently_indexed) && workspace_path.exists();
 
         let state = WorkspaceState {
             hash: hash.clone(),

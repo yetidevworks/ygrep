@@ -212,6 +212,30 @@ pub enum IndexesCommand {
         /// Index hash or workspace path (default: current workspace)
         identifier: Option<String>,
     },
+    /// Watch an index from the background service on login
+    Watch {
+        /// Index hash or workspace path (default: current workspace)
+        identifier: Option<String>,
+        /// Turn watching on or off
+        state: Option<WatchFlag>,
+    },
+}
+
+/// On/off argument for `ygrep indexes watch`
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchFlag {
+    On,
+    Off,
+}
+
+impl WatchFlag {
+    fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "enable" | "enabled" => Some(WatchFlag::On),
+            "off" | "false" | "no" | "disable" | "disabled" => Some(WatchFlag::Off),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -341,6 +365,24 @@ fn main() -> Result<()> {
             } => commands::indexes::remove(&identifier, dry_run, yes)?,
             IndexesCommand::Compact { identifier } => {
                 commands::indexes::compact(identifier.as_deref())?
+            }
+            IndexesCommand::Watch { identifier, state } => {
+                // `watch on` targets the current workspace; `watch <id> on` names one.
+                let (identifier, state) = match (identifier, state) {
+                    (Some(identifier), Some(state)) => (Some(identifier), state),
+                    (Some(token), None) => match WatchFlag::parse(&token) {
+                        Some(state) => (None, state),
+                        None => {
+                            eprintln!("Usage: ygrep indexes watch [<hash|path>] <on|off>");
+                            std::process::exit(2);
+                        }
+                    },
+                    (None, _) => {
+                        eprintln!("Usage: ygrep indexes watch [<hash|path>] <on|off>");
+                        std::process::exit(2);
+                    }
+                };
+                commands::indexes::watch(identifier.as_deref(), state == WatchFlag::On)?
             }
         },
         Some(Commands::Dashboard) => {
