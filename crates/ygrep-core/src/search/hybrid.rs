@@ -167,11 +167,16 @@ impl HybridSearcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
+        let ids: Vec<&str> = neighbors
+            .iter()
+            .map(|(_, _, doc_id)| doc_id.as_str())
+            .collect();
+        let mut found = self.lookup_by_doc_ids(&searcher, &ids)?;
+
         let mut results = Vec::with_capacity(neighbors.len());
 
         for (rank, (_, distance, doc_id)) in neighbors.iter().enumerate() {
-            // Find document by doc_id in tantivy
-            if let Some(hit) = self.lookup_by_doc_id(&searcher, doc_id)? {
+            if let Some(hit) = found.remove(doc_id.as_str()) {
                 results.push(RankedResult {
                     doc_id: doc_id.clone(),
                     path: hit.path,
@@ -187,35 +192,76 @@ impl HybridSearcher {
         Ok(results)
     }
 
-    /// Look up document by doc_id
-    fn lookup_by_doc_id(
+    /// Look up every neighbour in one search.
+    ///
+    /// One query per neighbour meant up to a few hundred sequential index lookups for a
+    /// single hybrid search, each re-walking the term dictionary for one document.
+    fn lookup_by_doc_ids<'a>(
         &self,
         searcher: &tantivy::Searcher,
-        doc_id: &str,
-    ) -> Result<Option<DocInfo>> {
-        use tantivy::query::TermQuery;
+        doc_ids: &[&'a str],
+    ) -> Result<HashMap<&'a str, DocInfo>> {
+        use tantivy::query::{TermQuery, TermSetQuery};
         use tantivy::schema::IndexRecordOption;
         use tantivy::Term;
 
-        let term = Term::from_field_text(self.fields.doc_id, doc_id);
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let mut wanted: Vec<&str> = doc_ids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        let query = TermSetQuery::new(
+            wanted
+                .iter()
+                .map(|id| Term::from_field_text(self.fields.doc_id, id)),
+        );
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(wanted.len()))?;
 
-        if let Some((_, doc_address)) = top_docs.first() {
-            let doc = searcher.doc(*doc_address)?;
-
-            Ok(Some(DocInfo {
+        let mut found: HashMap<&str, DocInfo> = HashMap::with_capacity(top_docs.len());
+        for (_, doc_address) in top_docs {
+            let doc = searcher.doc(doc_address)?;
+            let doc_id = extract_text(&doc, self.fields.doc_id).unwrap_or_default();
+            let Ok(slot) = wanted.binary_search(&doc_id.as_str()) else {
+                continue;
+            };
+            found.entry(wanted[slot]).or_insert_with(|| DocInfo {
                 path: extract_text(&doc, self.fields.path).unwrap_or_default(),
                 content: extract_text(&doc, self.fields.content).unwrap_or_default(),
                 line_start: extract_u64(&doc, self.fields.line_start).unwrap_or(1),
                 is_chunk: !extract_text(&doc, self.fields.chunk_id)
                     .unwrap_or_default()
                     .is_empty(),
-            }))
-        } else {
-            Ok(None)
+            });
         }
+
+        // A document id that shares its slot with another can be crowded out of the
+        // batch; ask for those on their own rather than dropping the neighbour.
+        for id in wanted {
+            if found.contains_key(id) {
+                continue;
+            }
+            let term = Term::from_field_text(self.fields.doc_id, id);
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+            if let Some((_, doc_address)) = top_docs.first() {
+                let doc = searcher.doc(*doc_address)?;
+                found.insert(
+                    id,
+                    DocInfo {
+                        path: extract_text(&doc, self.fields.path).unwrap_or_default(),
+                        content: extract_text(&doc, self.fields.content).unwrap_or_default(),
+                        line_start: extract_u64(&doc, self.fields.line_start).unwrap_or(1),
+                        is_chunk: !extract_text(&doc, self.fields.chunk_id)
+                            .unwrap_or_default()
+                            .is_empty(),
+                    },
+                );
+            }
+        }
+
+        Ok(found)
     }
 
     /// Reciprocal Rank Fusion to combine results from multiple retrieval methods

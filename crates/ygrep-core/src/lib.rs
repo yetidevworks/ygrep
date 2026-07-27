@@ -50,9 +50,9 @@ pub struct Workspace {
     index_path: std::path::PathBuf,
     /// Optional log channel — messages go here instead of stderr when set
     log_tx: Option<LogSender>,
-    /// Vector index for semantic search
+    /// Vector index for semantic search, read from disk on first use
     #[cfg(feature = "embeddings")]
-    vector_index: Arc<VectorIndex>,
+    vector_index: LazyVectorIndex,
     /// Embedding model
     #[cfg(feature = "embeddings")]
     embedding_model: Arc<EmbeddingModel>,
@@ -228,33 +228,11 @@ impl Workspace {
 
         #[cfg(feature = "embeddings")]
         let (vector_index, embedding_model, embedding_cache) = {
-            // Create vector index path
-            let vector_path = index_path.join("vectors");
-
-            // Load or create vector index
-            let vector_index = if VectorIndex::exists(&vector_path) {
-                match VectorIndex::load(vector_path.clone()) {
-                    Ok(vi) => Arc::new(vi),
-                    Err(_e) if mode == OpenMode::ReadOnly => {
-                        // Corrupt vector index, but we can't rewrite it —
-                        // fall back to text-only search
-                        Arc::new(VectorIndex::empty(vector_path, EMBEDDING_DIM))
-                    }
-                    Err(_e) => {
-                        // Corrupt vector index detected, silently recreate
-                        // Remove corrupted vector files and create fresh
-                        if vector_path.exists() {
-                            let _ = std::fs::remove_dir_all(&vector_path);
-                        }
-                        Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
-                    }
-                }
-            } else if mode == OpenMode::ReadOnly {
-                // No semantic index on disk; don't create its directory
-                Arc::new(VectorIndex::empty(vector_path, EMBEDDING_DIM))
-            } else {
-                Arc::new(VectorIndex::new(vector_path, EMBEDDING_DIM)?)
-            };
+            // The graph itself is only read when something actually searches or writes
+            // a vector; opening a workspace to run a regex, print status or index files
+            // has no use for it.
+            let vector_index =
+                LazyVectorIndex::new(index_path.join("vectors"), mode == OpenMode::ReadOnly);
 
             // Create embedding model (lazy-loaded on first use)
             let embedding_model = Arc::new(EmbeddingModel::default()); // Uses all-MiniLM-L6-v2
@@ -314,7 +292,7 @@ impl Workspace {
     pub fn index_all_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
         // Clear vector index for fresh re-index
         #[cfg(feature = "embeddings")]
-        self.vector_index.clear();
+        self.vector_index.reset()?;
 
         self.index_walk(with_embeddings, None)
     }
@@ -594,14 +572,14 @@ impl Workspace {
             // Also remove stale embeddings from vector index
             #[cfg(feature = "embeddings")]
             if !doc_id.is_empty() {
-                self.vector_index.mark_deleted(doc_id);
+                self.vector_index.get()?.mark_deleted(doc_id);
             }
         }
 
         // Save vector index if we removed any embeddings
         #[cfg(feature = "embeddings")]
         if removed > 0 {
-            if let Err(e) = self.vector_index.save() {
+            if let Err(e) = self.vector_index.get().and_then(|vi| vi.save()) {
                 tracing::debug!("Failed to save vector index after removals: {}", e);
             }
         }
@@ -698,6 +676,7 @@ impl Workspace {
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
+        let vector_index = self.vector_index.get()?;
         let mut total_embedded = 0usize;
         for chunk in batch.chunks(BATCH_SIZE) {
             let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
@@ -705,7 +684,7 @@ impl Workspace {
             match self.embedding_model.embed_batch(&texts) {
                 Ok(embeddings) => {
                     for ((doc_id, _), embedding) in chunk.iter().zip(embeddings) {
-                        if let Err(e) = self.vector_index.insert(doc_id, &embedding) {
+                        if let Err(e) = vector_index.insert(doc_id, &embedding) {
                             tracing::debug!("Failed to insert embedding for {}: {}", doc_id, e);
                         }
                     }
@@ -721,7 +700,7 @@ impl Workspace {
 
         pb.finish_and_clear();
         self.log(format!("  Indexed {} documents.", total_embedded));
-        self.vector_index.save()?;
+        vector_index.save()?;
 
         Ok(total_embedded)
     }
@@ -765,7 +744,7 @@ impl Workspace {
         let searcher = search::HybridSearcher::new(
             self.config.search.clone(),
             self.index.clone(),
-            self.vector_index.clone(),
+            self.vector_index.get()?,
             self.embedding_model.clone(),
             self.embedding_cache.clone(),
         );
@@ -775,7 +754,7 @@ impl Workspace {
     /// Check if semantic search is available (vector index has data)
     #[cfg(feature = "embeddings")]
     pub fn has_semantic_index(&self) -> bool {
-        !self.vector_index.is_empty()
+        self.vector_index.stored_len() > 0
     }
 
     /// Check if semantic search is available (always false without embeddings feature)
@@ -885,10 +864,11 @@ impl Workspace {
                 // Generate embedding if semantic indexing is enabled (reuse content from indexer)
                 #[cfg(feature = "embeddings")]
                 if with_embeddings {
+                    let vector_index = self.vector_index.get()?;
                     if let Some(text) = embeddable_text(&content) {
                         match self.embedding_model.embed(text) {
                             Ok(embedding) => {
-                                if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
+                                if let Err(e) = vector_index.insert(&doc_id, &embedding) {
                                     tracing::debug!(
                                         "Failed to insert embedding for {}: {}",
                                         doc_id,
@@ -896,7 +876,7 @@ impl Workspace {
                                     );
                                 } else {
                                     // Save vector index after each file (incremental)
-                                    if let Err(e) = self.vector_index.save() {
+                                    if let Err(e) = vector_index.save() {
                                         tracing::debug!("Failed to save vector index: {}", e);
                                     }
                                 }
@@ -959,10 +939,11 @@ impl Workspace {
 
                 #[cfg(feature = "embeddings")]
                 if with_embeddings {
+                    let vector_index = self.vector_index.get()?;
                     if let Some(text) = embeddable_text(&content) {
                         match self.embedding_model.embed(text) {
                             Ok(embedding) => {
-                                if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
+                                if let Err(e) = vector_index.insert(&doc_id, &embedding) {
                                     tracing::debug!(
                                         "Failed to insert embedding for {}: {}",
                                         doc_id,
@@ -1026,6 +1007,107 @@ impl Workspace {
 
         tracing::debug!("Deleted from index: {}", path.display());
         Ok(())
+    }
+}
+
+/// A vector index that stays on disk until something needs it.
+///
+/// Every workspace open used to read the whole HNSW graph, so `ygrep status`, a regex
+/// search and an indexing run all paid for a structure they never touched, and the
+/// dashboard paid again for every watched workspace on every sleep/wake cycle.
+#[cfg(feature = "embeddings")]
+struct LazyVectorIndex {
+    path: PathBuf,
+    read_only: bool,
+    loaded: parking_lot::Mutex<Option<Arc<VectorIndex>>>,
+}
+
+#[cfg(feature = "embeddings")]
+impl LazyVectorIndex {
+    fn new(path: PathBuf, read_only: bool) -> Self {
+        Self {
+            path,
+            read_only,
+            loaded: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// The vector index, reading it from disk the first time it is asked for
+    fn get(&self) -> Result<Arc<VectorIndex>> {
+        let mut slot = self.loaded.lock();
+        if let Some(index) = slot.as_ref() {
+            return Ok(index.clone());
+        }
+
+        let index = self.open()?;
+        *slot = Some(index.clone());
+        Ok(index)
+    }
+
+    fn open(&self) -> Result<Arc<VectorIndex>> {
+        if VectorIndex::exists(&self.path) {
+            return match VectorIndex::load(self.path.clone()) {
+                Ok(index) => Ok(Arc::new(index)),
+                Err(_e) if self.read_only => {
+                    // Corrupt vector index, but we can't rewrite it —
+                    // fall back to text-only search
+                    Ok(Arc::new(VectorIndex::empty(
+                        self.path.clone(),
+                        EMBEDDING_DIM,
+                    )))
+                }
+                Err(_e) => {
+                    // Corrupt vector index detected, silently recreate
+                    let _ = std::fs::remove_dir_all(&self.path);
+                    Ok(Arc::new(VectorIndex::new(
+                        self.path.clone(),
+                        EMBEDDING_DIM,
+                    )?))
+                }
+            };
+        }
+
+        if self.read_only {
+            // No semantic index on disk; don't create its directory
+            Ok(Arc::new(VectorIndex::empty(
+                self.path.clone(),
+                EMBEDDING_DIM,
+            )))
+        } else {
+            Ok(Arc::new(VectorIndex::new(
+                self.path.clone(),
+                EMBEDDING_DIM,
+            )?))
+        }
+    }
+
+    /// Start over from an empty index, without reading the one on disk first
+    fn reset(&self) -> Result<()> {
+        let mut slot = self.loaded.lock();
+        match slot.as_ref() {
+            Some(index) => index.clear(),
+            None if self.read_only => {
+                *slot = Some(Arc::new(VectorIndex::empty(
+                    self.path.clone(),
+                    EMBEDDING_DIM,
+                )))
+            }
+            None => {
+                *slot = Some(Arc::new(VectorIndex::new(
+                    self.path.clone(),
+                    EMBEDDING_DIM,
+                )?))
+            }
+        }
+        Ok(())
+    }
+
+    /// How many vectors are stored, answered from the doc id list when nothing is loaded
+    fn stored_len(&self) -> usize {
+        if let Some(index) = self.loaded.lock().as_ref() {
+            return index.len();
+        }
+        VectorIndex::stored_len(&self.path)
     }
 }
 

@@ -46,6 +46,20 @@ pub struct VectorIndex {
     /// thousand files from a two hundred thousand vector index compared a billion
     /// strings to do it.
     slots: RwLock<HashMap<String, usize>>,
+    /// The reloader `hnsw` was read through.
+    ///
+    /// `load_hnsw` hands back a graph borrowed from its reloader, so the reloader has to
+    /// outlive it. It used to be leaked to arrange that, and the dashboard re-opens every
+    /// watched workspace after each sleep, so a long session leaked one reloader per
+    /// wake. Owning it here frees it with the index instead: `hnsw` is declared before
+    /// this field, and fields drop in declaration order, so the graph goes first.
+    _reloader: Option<Box<HnswIo>>,
+}
+
+/// Read a JSON file, treating any failure as "nothing there"
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader(std::io::BufReader::new(file)).ok()
 }
 
 /// Map document IDs to their position, skipping the blanks left by soft deletes
@@ -91,6 +105,7 @@ impl VectorIndex {
             dimension,
             doc_ids: RwLock::new(Vec::new()),
             slots: RwLock::new(HashMap::new()),
+            _reloader: None,
         }
     }
 
@@ -107,9 +122,11 @@ impl VectorIndex {
                     YgrepError::Config(format!("Failed to load doc_id index: {}", e))
                 })?;
 
-            let reloader = Box::leak(Box::new(HnswIo::new(&path, HNSW_BASENAME)));
-            let hnsw = reloader
-                .load_hnsw::<f32, DistCosine>()
+            let mut reloader = Box::new(HnswIo::new(&path, HNSW_BASENAME));
+            let reloader_ptr: *mut HnswIo = &mut *reloader;
+            // SAFETY: the reloader is boxed, so its address stays put, and it is stored
+            // in the struct built below and dropped after the graph that borrows it.
+            let hnsw = unsafe { (*reloader_ptr).load_hnsw::<f32, DistCosine>() }
                 .map_err(|e| YgrepError::Config(format!("Failed to load HNSW index: {}", e)))?;
 
             return Ok(Self {
@@ -118,6 +135,7 @@ impl VectorIndex {
                 dimension: doc_index.dimension,
                 slots: RwLock::new(slot_map(&doc_index.doc_ids)),
                 doc_ids: RwLock::new(doc_index.doc_ids),
+                _reloader: Some(reloader),
             });
         }
 
@@ -146,7 +164,35 @@ impl VectorIndex {
             dimension: data.dimension,
             slots: RwLock::new(slot_map(&doc_ids)),
             doc_ids: RwLock::new(doc_ids),
+            _reloader: None,
         })
+    }
+
+    /// How many vectors a saved index holds, read without building the graph.
+    ///
+    /// Answering "is semantic search available?" used to mean loading the whole HNSW
+    /// graph, on every workspace open, including runs that never search a vector.
+    pub fn stored_len(path: &Path) -> usize {
+        #[derive(Deserialize)]
+        struct DocIdCount {
+            doc_ids: Vec<serde::de::IgnoredAny>,
+        }
+
+        #[derive(Deserialize)]
+        struct VectorCount {
+            vectors: Vec<serde::de::IgnoredAny>,
+        }
+
+        let doc_ids_path = path.join("doc_ids.json");
+        if doc_ids_path.exists() && path.join(format!("{}.hnsw.graph", HNSW_BASENAME)).exists() {
+            return read_json(&doc_ids_path)
+                .map(|counted: DocIdCount| counted.doc_ids.len())
+                .unwrap_or(0);
+        }
+
+        read_json(&path.join("vectors.json"))
+            .map(|counted: VectorCount| counted.vectors.len())
+            .unwrap_or(0)
     }
 
     /// Check if a vector index exists at the path
