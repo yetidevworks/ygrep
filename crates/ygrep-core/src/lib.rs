@@ -21,16 +21,15 @@ pub use config::Config;
 pub use error::{Result, YgrepError};
 pub use watcher::{FileWatcher, WatchEvent};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tantivy::Index;
 
 #[cfg(feature = "embeddings")]
 use embeddings::{EmbeddingCache, EmbeddingModel};
 #[cfg(feature = "embeddings")]
 use index::VectorIndex;
-#[cfg(feature = "embeddings")]
-use std::sync::Arc;
 
 /// Embedding dimension for all-MiniLM-L6-v2
 #[cfg(feature = "embeddings")]
@@ -312,183 +311,12 @@ impl Workspace {
     }
 
     /// Index all files with options
-    #[allow(unused_variables)]
     pub fn index_all_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
         // Clear vector index for fresh re-index
         #[cfg(feature = "embeddings")]
         self.vector_index.clear();
 
-        // Phase 1: Index all files with BM25 (fast)
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
-
-        let mut walker = fs::FileWalker::new(self.root.clone(), self.config.indexer.clone())?;
-
-        let mut indexed = 0;
-        let mut skipped = 0;
-        let mut errors = 0;
-
-        // Collect content for batch embedding
-        #[cfg(feature = "embeddings")]
-        let mut embedding_batch: Vec<(String, String)> = Vec::new(); // (doc_id, content)
-                                                                     // Larger batch size = more efficient SIMD/vectorization in ONNX Runtime
-        #[cfg(feature = "embeddings")]
-        const BATCH_SIZE: usize = 64;
-
-        for entry in walker.walk() {
-            match indexer.index_file_with_chunks(&entry.path, should_index_chunks(with_embeddings))
-            {
-                Ok((doc_id, content)) => {
-                    indexed += 1;
-                    if indexed % 500 == 0 {
-                        self.log_inline(format!("\r  Indexed {} files...          ", indexed));
-                    }
-
-                    // Collect for embedding if enabled (reuse content from indexer)
-                    #[cfg(feature = "embeddings")]
-                    if with_embeddings {
-                        embedding_batch.push((doc_id, content));
-                    }
-                    #[cfg(not(feature = "embeddings"))]
-                    {
-                        let _ = doc_id;
-                        let _ = content;
-                    }
-                }
-                Err(YgrepError::FileTooLarge { .. }) => {
-                    skipped += 1;
-                }
-                Err(e) => {
-                    tracing::debug!("Error indexing {}: {}", entry.path.display(), e);
-                    errors += 1;
-                }
-            }
-        }
-
-        self.log(format!("\r  Indexed {} files.              ", indexed));
-        indexer.commit()?;
-
-        // Track embedded count
-        #[cfg(feature = "embeddings")]
-        let mut total_embedded = 0usize;
-        #[cfg(not(feature = "embeddings"))]
-        let total_embedded = 0usize;
-
-        // Phase 2: Generate embeddings in batches (if enabled)
-        #[cfg(feature = "embeddings")]
-        if with_embeddings && !embedding_batch.is_empty() {
-            // Filter out very short content (< 50 chars) and very long content (> 50KB)
-            // These don't embed well or are too slow
-            let filtered_batch: Vec<_> = embedding_batch
-                .into_iter()
-                .filter(|(_, content)| {
-                    let len = content.len();
-                    len >= 50 && len <= 50_000
-                })
-                .collect();
-
-            if filtered_batch.is_empty() {
-                self.log("No documents suitable for semantic indexing.");
-            } else {
-                use indicatif::{ProgressBar, ProgressStyle};
-
-                let total_docs = filtered_batch.len() as u64;
-                self.log(format!(
-                    "Building semantic index for {} documents...",
-                    total_docs
-                ));
-
-                // Pre-load the semantic model before starting progress bar
-                self.embedding_model.preload()?;
-
-                let pb = if self.log_tx.is_some() {
-                    ProgressBar::hidden()
-                } else {
-                    ProgressBar::new(total_docs)
-                };
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
-                        .unwrap()
-                        .progress_chars("━╸─"),
-                );
-                pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-                for chunk in filtered_batch.chunks(BATCH_SIZE) {
-                    // Truncate to ~4KB for embedding - sufficient context for code, faster tokenization
-                    // Use floor_char_boundary to avoid slicing in the middle of multi-byte UTF-8 characters
-                    const EMBED_TRUNCATE: usize = 4096;
-                    let texts: Vec<&str> = chunk
-                        .iter()
-                        .map(|(_, content)| {
-                            if content.len() > EMBED_TRUNCATE {
-                                let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
-                                &content[..boundary]
-                            } else {
-                                content.as_str()
-                            }
-                        })
-                        .collect();
-
-                    match self.embedding_model.embed_batch(&texts) {
-                        Ok(embeddings) => {
-                            for ((doc_id, _), embedding) in chunk.iter().zip(embeddings) {
-                                if let Err(e) = self.vector_index.insert(doc_id, &embedding) {
-                                    tracing::debug!(
-                                        "Failed to insert embedding for {}: {}",
-                                        doc_id,
-                                        e
-                                    );
-                                }
-                            }
-                            total_embedded += chunk.len();
-                            pb.set_position(total_embedded as u64);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Batch embedding failed: {}", e);
-                            pb.inc(chunk.len() as u64);
-                        }
-                    }
-                }
-
-                pb.finish_and_clear();
-                self.log(format!("  Indexed {} documents.", total_embedded));
-                self.vector_index.save()?;
-            }
-        }
-
-        #[cfg(not(feature = "embeddings"))]
-        if with_embeddings {
-            self.log("Warning: Semantic search feature not available in this build.");
-        }
-
-        let stats = walker.stats();
-
-        // Save workspace metadata for index management
-        let metadata = serde_json::json!({
-            "workspace": self.root.to_string_lossy(),
-            "indexed_at": chrono::Utc::now().to_rfc3339(),
-            "files_indexed": indexed,
-            "semantic": with_embeddings,
-            "schema_version": index::SCHEMA_VERSION,
-        });
-        let metadata_path = self.index_path.join("workspace.json");
-        if let Err(e) = std::fs::write(
-            &metadata_path,
-            serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        ) {
-            tracing::warn!("Failed to save workspace metadata: {}", e);
-        }
-
-        Ok(IndexStats {
-            indexed,
-            embedded: total_embedded,
-            skipped,
-            errors,
-            unique_paths: stats.visited_paths,
-            unchanged: 0,
-            removed: 0,
-        })
+        self.index_walk(with_embeddings, None)
     }
 
     /// Build a map of all indexed files: relative_path -> (mtime, doc_id)
@@ -577,91 +405,191 @@ impl Workspace {
     }
 
     /// Incremental index: only re-index files that changed since last index
-    #[allow(unused_variables)]
     pub fn index_incremental_with_options(&self, with_embeddings: bool) -> Result<IndexStats> {
-        // Build map of currently indexed files
-        let mut indexed_map = self.build_indexed_files_map()?;
+        let indexed_map = self.build_indexed_files_map()?;
+        self.index_walk(with_embeddings, Some(indexed_map))
+    }
 
-        // Create indexer (does NOT clear vector index)
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+    /// Walk the workspace and index what needs it.
+    ///
+    /// `already_indexed` makes the pass incremental: a file whose mtime still matches
+    /// the indexed copy is left alone, and paths that are no longer on disk are deleted
+    /// from the index at the end. Passing `None` indexes everything.
+    ///
+    /// The walk runs on `indexer.threads` worker threads. They read and index files
+    /// while this thread accounts for what they did, so progress reporting, the
+    /// embedding batch, and the deletion bookkeeping stay on one thread and need no
+    /// locking of their own.
+    #[allow(unused_variables)]
+    fn index_walk(
+        &self,
+        with_embeddings: bool,
+        already_indexed: Option<HashMap<String, (u64, String)>>,
+    ) -> Result<IndexStats> {
+        let incremental = already_indexed.is_some();
+        let already_indexed = already_indexed.unwrap_or_default();
 
-        let mut walker = fs::FileWalker::new(self.root.clone(), self.config.indexer.clone())?;
+        let indexer = Arc::new(index::Indexer::new(
+            self.config.indexer.clone(),
+            self.index.clone(),
+            &self.root,
+        )?);
 
-        let mut indexed = 0;
-        let mut skipped = 0;
-        let mut errors = 0;
-        let mut unchanged = 0;
+        let walker = fs::FileWalker::new(self.root.clone(), self.config.indexer.clone())?;
 
+        let mut indexed = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = 0usize;
+        let mut unchanged = 0usize;
+        let mut pending_bytes = 0u64;
+        let mut seen: HashSet<String> = HashSet::with_capacity(already_indexed.len());
+
+        // Collect content for batch embedding
         #[cfg(feature = "embeddings")]
-        let mut embedding_batch: Vec<(String, String)> = Vec::new();
-        #[cfg(feature = "embeddings")]
-        const BATCH_SIZE: usize = 64;
+        let mut embedding_batch: Vec<(String, String)> = Vec::new(); // (doc_id, truncated content)
 
-        for entry in walker.walk() {
-            // Get relative path for this file
-            let rel_path = entry
-                .path
-                .strip_prefix(&self.root)
-                .unwrap_or(&entry.path)
-                .to_string_lossy()
-                .to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<FileOutcome>();
+        let index_chunks = should_index_chunks(with_embeddings);
+        let collect_embeddings = with_embeddings && cfg!(feature = "embeddings");
+        let known = Arc::new(already_indexed);
+        let root = self.root.clone();
 
-            // Get current file mtime
-            let current_mtime = std::fs::metadata(&entry.path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+        let walk_stats = std::thread::scope(|scope| {
+            let walk = {
+                let indexer = Arc::clone(&indexer);
+                let known = Arc::clone(&known);
+                let walker = &walker;
 
-            // Check if file is unchanged
-            if let Some((stored_mtime, _stored_doc_id)) = indexed_map.remove(&rel_path) {
-                if stored_mtime == current_mtime {
-                    unchanged += 1;
-                    continue;
+                scope.spawn(move || {
+                    walker.walk_parallel(|| {
+                        let tx = tx.clone();
+                        let indexer = Arc::clone(&indexer);
+                        let known = Arc::clone(&known);
+                        let root = root.clone();
+
+                        move |entry: fs::WalkEntry| {
+                            let rel_path = entry
+                                .path
+                                .strip_prefix(&root)
+                                .unwrap_or(&entry.path)
+                                .to_string_lossy()
+                                .to_string();
+
+                            // The mtime comparison comes first, before anything opens the
+                            // file: on an unchanged tree this is the only work per file.
+                            if let Some((stored_mtime, _)) = known.get(&rel_path) {
+                                if *stored_mtime == entry.meta.mtime {
+                                    let _ = tx.send(FileOutcome::Unchanged(rel_path));
+                                    return;
+                                }
+                            }
+
+                            let outcome =
+                                match indexer.index_entry(&entry.path, entry.meta, index_chunks) {
+                                    Ok((doc_id, content)) => {
+                                        let embed_text = if collect_embeddings {
+                                            embeddable_text(&content).map(str::to_string)
+                                        } else {
+                                            None
+                                        };
+                                        FileOutcome::Indexed {
+                                            rel_path,
+                                            doc_id,
+                                            bytes: entry.meta.size,
+                                            embed_text,
+                                        }
+                                    }
+                                    Err(
+                                        YgrepError::FileTooLarge { .. }
+                                        | YgrepError::GeneratedFile(_),
+                                    ) => FileOutcome::Skipped(rel_path),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Error indexing {}: {}",
+                                            entry.path.display(),
+                                            e
+                                        );
+                                        FileOutcome::Failed(rel_path)
+                                    }
+                                };
+
+                            let _ = tx.send(outcome);
+                        }
+                    });
+
+                    walker.stats()
+                })
+            };
+
+            for outcome in rx {
+                match outcome {
+                    FileOutcome::Unchanged(rel_path) => {
+                        unchanged += 1;
+                        seen.insert(rel_path);
+                    }
+                    FileOutcome::Skipped(rel_path) => {
+                        skipped += 1;
+                        seen.insert(rel_path);
+                    }
+                    FileOutcome::Failed(rel_path) => {
+                        errors += 1;
+                        seen.insert(rel_path);
+                    }
+                    FileOutcome::Indexed {
+                        rel_path,
+                        doc_id,
+                        bytes,
+                        embed_text,
+                    } => {
+                        indexed += 1;
+                        seen.insert(rel_path);
+                        if indexed % 500 == 0 {
+                            self.log_inline(format!("\r  Indexed {} files...          ", indexed));
+                        }
+
+                        // Documents queue up inside tantivy until its own indexing
+                        // threads get to them, and several reader threads fill that
+                        // queue faster than it drains. Committing on the way through
+                        // keeps a huge tree's worth of file content from piling up in
+                        // memory; the segments it leaves behind are merged afterwards.
+                        pending_bytes += bytes;
+                        if pending_bytes >= FLUSH_AFTER_BYTES {
+                            pending_bytes = 0;
+                            if let Err(e) = indexer.commit() {
+                                tracing::warn!("Interim commit failed: {}", e);
+                            }
+                        }
+
+                        #[cfg(feature = "embeddings")]
+                        if let Some(text) = embed_text {
+                            embedding_batch.push((doc_id, text));
+                        }
+                        #[cfg(not(feature = "embeddings"))]
+                        {
+                            let _ = doc_id;
+                            let _ = embed_text;
+                        }
+                    }
                 }
-                // mtime differs - re-index below
             }
-            // else: new file, not in map
 
-            match indexer.index_file_with_chunks(&entry.path, should_index_chunks(with_embeddings))
-            {
-                Ok((doc_id, content)) => {
-                    indexed += 1;
-                    if indexed % 500 == 0 {
-                        self.log_inline(format!("\r  Indexed {} files...          ", indexed));
-                    }
+            walk.join()
+        })
+        .unwrap_or_default();
 
-                    #[cfg(feature = "embeddings")]
-                    if with_embeddings {
-                        embedding_batch.push((doc_id, content));
-                    }
-                    #[cfg(not(feature = "embeddings"))]
-                    {
-                        let _ = doc_id;
-                        let _ = content;
-                    }
-                }
-                Err(YgrepError::FileTooLarge { .. }) => {
-                    skipped += 1;
-                }
-                Err(e) => {
-                    tracing::debug!("Error indexing {}: {}", entry.path.display(), e);
-                    errors += 1;
-                }
-            }
-        }
-
-        if indexed > 0 {
+        if indexed > 0 || !incremental {
             self.log(format!("\r  Indexed {} files.              ", indexed));
         }
 
-        // Remove files that no longer exist on disk
-        // Any paths remaining in indexed_map are deleted files
-        let removed = indexed_map.len();
-        for (deleted_path, (_mtime, doc_id)) in &indexed_map {
-            indexer.delete_by_path(deleted_path)?;
+        // Anything still indexed that the walk never reached is gone from disk
+        let mut removed = 0usize;
+        for (path, (_mtime, doc_id)) in known.iter() {
+            if seen.contains(path) {
+                continue;
+            }
+
+            removed += 1;
+            indexer.delete_by_path(path)?;
 
             // Also remove stale embeddings from vector index
             #[cfg(feature = "embeddings")]
@@ -680,101 +608,21 @@ impl Workspace {
 
         indexer.commit()?;
 
-        // Track embedded count
         #[cfg(feature = "embeddings")]
-        let mut total_embedded = 0usize;
+        let total_embedded = self.embed_batch(embedding_batch, with_embeddings, incremental)?;
         #[cfg(not(feature = "embeddings"))]
         let total_embedded = 0usize;
-
-        // Generate embeddings for changed files
-        #[cfg(feature = "embeddings")]
-        if with_embeddings && !embedding_batch.is_empty() {
-            let filtered_batch: Vec<_> = embedding_batch
-                .into_iter()
-                .filter(|(_, content)| {
-                    let len = content.len();
-                    len >= 50 && len <= 50_000
-                })
-                .collect();
-
-            if !filtered_batch.is_empty() {
-                use indicatif::{ProgressBar, ProgressStyle};
-
-                let total_docs = filtered_batch.len() as u64;
-                self.log(format!(
-                    "Building semantic index for {} changed documents...",
-                    total_docs
-                ));
-
-                self.embedding_model.preload()?;
-
-                let pb = if self.log_tx.is_some() {
-                    ProgressBar::hidden()
-                } else {
-                    ProgressBar::new(total_docs)
-                };
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
-                        .unwrap()
-                        .progress_chars("━╸─"),
-                );
-                pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-                for chunk in filtered_batch.chunks(BATCH_SIZE) {
-                    const EMBED_TRUNCATE: usize = 4096;
-                    let texts: Vec<&str> = chunk
-                        .iter()
-                        .map(|(_, content)| {
-                            if content.len() > EMBED_TRUNCATE {
-                                let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
-                                &content[..boundary]
-                            } else {
-                                content.as_str()
-                            }
-                        })
-                        .collect();
-
-                    match self.embedding_model.embed_batch(&texts) {
-                        Ok(embeddings) => {
-                            for ((doc_id, _), embedding) in chunk.iter().zip(embeddings) {
-                                if let Err(e) = self.vector_index.insert(doc_id, &embedding) {
-                                    tracing::debug!(
-                                        "Failed to insert embedding for {}: {}",
-                                        doc_id,
-                                        e
-                                    );
-                                }
-                            }
-                            total_embedded += chunk.len();
-                            pb.set_position(total_embedded as u64);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Batch embedding failed: {}", e);
-                            pb.inc(chunk.len() as u64);
-                        }
-                    }
-                }
-
-                pb.finish_and_clear();
-                self.log(format!("  Indexed {} documents.", total_embedded));
-                self.vector_index.save()?;
-            }
-        }
 
         #[cfg(not(feature = "embeddings"))]
         if with_embeddings {
             self.log("Warning: Semantic search feature not available in this build.");
         }
 
-        let walk_stats = walker.stats();
-
-        // Save workspace metadata
-        let total_files = unchanged + indexed;
+        // Save workspace metadata for index management
         let metadata = serde_json::json!({
             "workspace": self.root.to_string_lossy(),
             "indexed_at": chrono::Utc::now().to_rfc3339(),
-            "files_indexed": total_files,
+            "files_indexed": indexed + unchanged,
             "semantic": with_embeddings,
             "schema_version": index::SCHEMA_VERSION,
         });
@@ -795,6 +643,87 @@ impl Workspace {
             unchanged,
             removed,
         })
+    }
+
+    /// Embed the documents collected during a walk, in batches
+    #[cfg(feature = "embeddings")]
+    fn embed_batch(
+        &self,
+        batch: Vec<(String, String)>,
+        with_embeddings: bool,
+        incremental: bool,
+    ) -> Result<usize> {
+        // Larger batch size = more efficient SIMD/vectorization in ONNX Runtime
+        const BATCH_SIZE: usize = 64;
+
+        if !with_embeddings {
+            return Ok(0);
+        }
+
+        if batch.is_empty() {
+            if !incremental {
+                self.log("No documents suitable for semantic indexing.");
+            }
+            return Ok(0);
+        }
+
+        use indicatif::{ProgressBar, ProgressStyle};
+
+        let total_docs = batch.len() as u64;
+        if incremental {
+            self.log(format!(
+                "Building semantic index for {} changed documents...",
+                total_docs
+            ));
+        } else {
+            self.log(format!(
+                "Building semantic index for {} documents...",
+                total_docs
+            ));
+        }
+
+        // Pre-load the semantic model before starting progress bar
+        self.embedding_model.preload()?;
+
+        let pb = if self.log_tx.is_some() {
+            ProgressBar::hidden()
+        } else {
+            ProgressBar::new(total_docs)
+        };
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
+                .unwrap()
+                .progress_chars("━╸─"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let mut total_embedded = 0usize;
+        for chunk in batch.chunks(BATCH_SIZE) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+
+            match self.embedding_model.embed_batch(&texts) {
+                Ok(embeddings) => {
+                    for ((doc_id, _), embedding) in chunk.iter().zip(embeddings) {
+                        if let Err(e) = self.vector_index.insert(doc_id, &embedding) {
+                            tracing::debug!("Failed to insert embedding for {}: {}", doc_id, e);
+                        }
+                    }
+                    total_embedded += chunk.len();
+                    pb.set_position(total_embedded as u64);
+                }
+                Err(e) => {
+                    tracing::warn!("Batch embedding failed: {}", e);
+                    pb.inc(chunk.len() as u64);
+                }
+            }
+        }
+
+        pb.finish_and_clear();
+        self.log(format!("  Indexed {} documents.", total_embedded));
+        self.vector_index.save()?;
+
+        Ok(total_embedded)
     }
 
     /// Search the workspace
@@ -874,9 +803,7 @@ impl Workspace {
     /// Index or re-index a single file (for incremental updates)
     /// Note: path can be under workspace root OR under a symlink target
     pub fn index_file(&self, path: &Path) -> Result<()> {
-        // Create indexer and index the file
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+        let indexer = self.create_single_file_indexer()?;
 
         match indexer.index_file_with_chunks(path, false) {
             Ok((_doc_id, _content)) => {
@@ -884,8 +811,8 @@ impl Workspace {
                 tracing::debug!("Indexed: {}", path.display());
                 Ok(())
             }
-            Err(YgrepError::FileTooLarge { .. }) => {
-                tracing::debug!("Skipped (too large): {}", path.display());
+            Err(YgrepError::FileTooLarge { .. } | YgrepError::GeneratedFile(_)) => {
+                tracing::debug!("Skipped: {}", path.display());
                 Ok(())
             }
             Err(e) => Err(e),
@@ -894,28 +821,8 @@ impl Workspace {
 
     /// Delete a file from the index (for incremental updates)
     pub fn delete_file(&self, path: &Path) -> Result<()> {
-        use tantivy::Term;
-
-        // Get the relative path as doc_id
-        let relative_path = path
-            .strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy();
-
-        let schema = self.index.schema();
-        let path_field = schema
-            .get_field("path")
-            .map_err(|_| YgrepError::Config("path field not found in schema".to_string()))?;
-
-        let term = Term::from_field_text(path_field, &relative_path);
-
-        let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
-            index::writer::open_index_writer(&self.index, 50_000_000)?;
-        writer.delete_term(term);
-        writer.commit()?;
-
-        tracing::debug!("Deleted from index: {}", path.display());
-        Ok(())
+        let indexer = self.create_single_file_indexer()?;
+        self.delete_file_with_indexer(&indexer, path)
     }
 
     /// Create a file watcher for this workspace
@@ -958,9 +865,7 @@ impl Workspace {
     /// Index or re-index a single file with optional semantic indexing (for incremental updates)
     #[allow(unused_variables)]
     pub fn index_file_with_options(&self, path: &Path, with_embeddings: bool) -> Result<()> {
-        // Create indexer and index the file
-        let indexer =
-            index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)?;
+        let indexer = self.create_single_file_indexer()?;
         self.index_file_with_indexer(&indexer, path, with_embeddings)
     }
 
@@ -980,18 +885,7 @@ impl Workspace {
                 // Generate embedding if semantic indexing is enabled (reuse content from indexer)
                 #[cfg(feature = "embeddings")]
                 if with_embeddings {
-                    // Only embed files within size bounds
-                    let len = content.len();
-                    if (50..=50_000).contains(&len) {
-                        // Truncate for embedding
-                        const EMBED_TRUNCATE: usize = 4096;
-                        let text = if content.len() > EMBED_TRUNCATE {
-                            let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
-                            &content[..boundary]
-                        } else {
-                            content.as_str()
-                        };
-
+                    if let Some(text) = embeddable_text(&content) {
                         match self.embedding_model.embed(text) {
                             Ok(embedding) => {
                                 if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
@@ -1026,8 +920,8 @@ impl Workspace {
 
                 Ok(())
             }
-            Err(YgrepError::FileTooLarge { .. }) => {
-                tracing::debug!("Skipped (too large): {}", path.display());
+            Err(YgrepError::FileTooLarge { .. } | YgrepError::GeneratedFile(_)) => {
+                tracing::debug!("Skipped: {}", path.display());
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1037,6 +931,11 @@ impl Workspace {
     /// Create a persistent Indexer for this workspace (holds a single writer lock)
     pub fn create_indexer(&self) -> Result<index::Indexer> {
         index::Indexer::new(self.config.indexer.clone(), self.index.clone(), &self.root)
+    }
+
+    /// Create an Indexer sized for updating one file at a time
+    fn create_single_file_indexer(&self) -> Result<index::Indexer> {
+        index::Indexer::new_single_file(self.config.indexer.clone(), self.index.clone(), &self.root)
     }
 
     /// Create a persistent Indexer with NoMergePolicy (for watch mode)
@@ -1060,16 +959,7 @@ impl Workspace {
 
                 #[cfg(feature = "embeddings")]
                 if with_embeddings {
-                    let len = content.len();
-                    if (50..=50_000).contains(&len) {
-                        const EMBED_TRUNCATE: usize = 4096;
-                        let text = if content.len() > EMBED_TRUNCATE {
-                            let boundary = content.floor_char_boundary(EMBED_TRUNCATE);
-                            &content[..boundary]
-                        } else {
-                            content.as_str()
-                        };
-
+                    if let Some(text) = embeddable_text(&content) {
                         match self.embedding_model.embed(text) {
                             Ok(embedding) => {
                                 if let Err(e) = self.vector_index.insert(&doc_id, &embedding) {
@@ -1099,8 +989,8 @@ impl Workspace {
 
                 Ok(())
             }
-            Err(YgrepError::FileTooLarge { .. }) => {
-                tracing::debug!("Skipped (too large): {}", path.display());
+            Err(YgrepError::FileTooLarge { .. } | YgrepError::GeneratedFile(_)) => {
+                tracing::debug!("Skipped: {}", path.display());
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1175,6 +1065,44 @@ fn hash_path(path: &Path) -> String {
 
 fn should_index_chunks(with_embeddings: bool) -> bool {
     cfg!(feature = "embeddings") && with_embeddings
+}
+
+/// File content indexed between commits, above which the walk commits what it has
+const FLUSH_AFTER_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What an indexing worker did with one file, reported back to the accounting thread
+enum FileOutcome {
+    Unchanged(String),
+    Skipped(String),
+    Failed(String),
+    Indexed {
+        rel_path: String,
+        doc_id: String,
+        bytes: u64,
+        embed_text: Option<String>,
+    },
+}
+
+/// The part of a document that gets embedded, or `None` if it isn't worth embedding.
+///
+/// Very short content carries no signal and content over 50KB is too slow to be worth
+/// it. What survives is truncated here rather than at embedding time: the batch used to
+/// hold every indexed file whole until the walk finished, which cost around a gigabyte
+/// of resident memory on a 500MB tree to embed 4KB of each file.
+fn embeddable_text(content: &str) -> Option<&str> {
+    /// Enough context for code, and fast to tokenize
+    const EMBED_TRUNCATE: usize = 4096;
+
+    if !(50..=50_000).contains(&content.len()) {
+        return None;
+    }
+
+    if content.len() <= EMBED_TRUNCATE {
+        return Some(content);
+    }
+
+    // Never slice through a multi-byte character
+    Some(&content[..content.floor_char_boundary(EMBED_TRUNCATE)])
 }
 
 #[cfg(test)]

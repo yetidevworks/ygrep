@@ -14,7 +14,10 @@ pub use schema::{
 };
 #[cfg(feature = "embeddings")]
 pub use vector::VectorIndex;
-pub use writer::Indexer;
+pub use writer::{FileMeta, Indexer};
+
+/// Writer heap used while merging segments, where more heap means fewer merge passes
+const MERGE_WRITER_HEAP_BYTES: usize = writer::DEFAULT_WRITER_HEAP_MB * 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompactStats {
@@ -96,7 +99,7 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     drop(reader);
 
     let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
-        writer::open_index_writer(&index, 50_000_000)?;
+        writer::open_index_writer(&index, MERGE_WRITER_HEAP_BYTES)?;
     if segment_ids.len() > 1 {
         writer.merge(&segment_ids).wait()?;
     }
@@ -110,7 +113,7 @@ pub fn compact_index(index_path: &Path) -> crate::Result<CompactStats> {
     // A fresh writer now that the index is quiesced, purely to collect what the merges
     // superseded.
     let writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
-        writer::open_index_writer(&index, 50_000_000)?;
+        writer::open_index_writer(&index, MERGE_WRITER_HEAP_BYTES)?;
     writer.garbage_collect_files().wait()?;
     writer.wait_merging_threads()?;
 

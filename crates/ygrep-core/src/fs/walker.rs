@@ -1,29 +1,23 @@
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use super::symlink::{ResolvedPath, SymlinkResolver};
+use super::classify;
 use crate::config::IndexerConfig;
 use crate::error::Result;
+use crate::index::FileMeta;
 
 /// Walks a directory tree, respecting gitignore and handling symlinks
 pub struct FileWalker {
     root: PathBuf,
-    config: IndexerConfig,
-    gitignore: Option<Gitignore>,
-    symlink_resolver: SymlinkResolver,
-    /// Directory path suffixes pruned during the walk, derived from `ignore_patterns`
-    prune_suffixes: Vec<String>,
+    filter: Arc<EntryFilter>,
 }
 
 impl FileWalker {
     pub fn new(root: PathBuf, config: IndexerConfig) -> Result<Self> {
-        let gitignore = if config.respect_gitignore {
-            load_gitignore(&root)
-        } else {
-            None
-        };
-        let symlink_resolver = SymlinkResolver::new(config.follow_symlinks, 20);
         let prune_suffixes = prune_suffixes(&config.ignore_patterns);
 
         tracing::debug!(
@@ -31,155 +25,76 @@ impl FileWalker {
             config.ignore_patterns.len(),
             prune_suffixes.len()
         );
-        for pattern in &config.ignore_patterns {
-            tracing::debug!("  ignore pattern: {}", pattern);
-        }
 
         Ok(Self {
+            filter: Arc::new(EntryFilter {
+                canonical_root: std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone()),
+                root: root.clone(),
+                prune_suffixes,
+                config,
+                followed_symlinks: Mutex::new(HashSet::new()),
+                visited: AtomicUsize::new(0),
+            }),
             root,
-            config,
-            gitignore,
-            symlink_resolver,
-            prune_suffixes,
         })
     }
 
     /// Iterate over all indexable files in the directory tree
     pub fn walk(&mut self) -> impl Iterator<Item = WalkEntry> + '_ {
-        let follow_links = self.config.follow_symlinks;
-        let root = self.root.clone();
-        let prune = self.prune_suffixes.clone();
+        let filter = Arc::clone(&self.filter);
 
-        WalkDir::new(&self.root)
-            .follow_links(follow_links)
-            .into_iter()
-            .filter_entry(move |e| {
-                // The workspace root itself is always walked. Testing it would skip the
-                // whole tree whenever the root is hidden or happens to be named like a
-                // build directory, which is the caller's explicit choice to index.
-                if e.depth() == 0 {
-                    return true;
-                }
-
-                // Skip hidden files/directories
-                if is_hidden(e) {
-                    return false;
-                }
-
-                // Prune whole subtrees that the ignore patterns already exclude, so we
-                // never descend into node_modules/ or target/ just to discard each file.
-                if e.file_type().is_dir() && is_pruned_dir(&root, e.path(), &prune) {
-                    return false;
-                }
-
-                true
-            })
-            .filter_map(|entry| entry.ok())
-            .filter_map(move |entry| {
-                let path = entry.path();
-
-                // Skip directories
-                if entry.file_type().is_dir() {
-                    return None;
-                }
-
-                // Check gitignore
-                if self.is_ignored(path) {
-                    return None;
-                }
-
-                // Check custom ignore patterns
-                if self.matches_ignore_pattern(path) {
-                    return None;
-                }
-
-                // Check if file is indexable (text file, right extension)
-                if !self.is_indexable(path) {
-                    return None;
-                }
-
-                // Resolve symlinks and check for cycles/duplicates
-                match self.symlink_resolver.resolve(path) {
-                    Ok(ResolvedPath::Resolved {
-                        original,
-                        canonical,
-                        is_symlink,
-                    }) => Some(WalkEntry {
-                        path: original,
-                        canonical,
-                        is_symlink,
-                    }),
-                    Ok(ResolvedPath::Skipped(reason)) => {
-                        tracing::debug!("Skipping {}: {}", path.display(), reason);
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error resolving {}: {}", path.display(), e);
-                        None
-                    }
-                }
-            })
+        self.builder()
+            .build()
+            .filter_map(move |entry| filter.accept(entry.ok()?))
     }
 
-    /// Check if a path should be ignored by gitignore
-    fn is_ignored(&self, path: &Path) -> bool {
-        if let Some(ref gitignore) = self.gitignore {
-            let is_dir = path.is_dir();
-            gitignore.matched(path, is_dir).is_ignore()
-        } else {
-            false
-        }
-    }
-
-    /// Check if path matches custom ignore patterns
+    /// Walk the tree on `threads` worker threads, handing each entry to a visitor.
     ///
-    /// Patterns are matched against the path relative to the workspace root. Matching the
-    /// absolute path would let directories *above* the workspace exclude everything inside
-    /// it, so a project stored under `~/build/myapp` would index nothing.
-    fn matches_ignore_pattern(&self, path: &Path) -> bool {
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        let path_str = relative.to_string_lossy();
+    /// `make_visitor` is called once per worker thread, on the calling thread, so a
+    /// visitor can own per-thread state (a channel sender, a reusable buffer) without
+    /// any synchronisation of its own.
+    pub fn walk_parallel<M, V>(&self, mut make_visitor: M)
+    where
+        M: FnMut() -> V,
+        V: FnMut(WalkEntry) + Send,
+    {
+        self.builder().build_parallel().run(|| {
+            let filter = Arc::clone(&self.filter);
+            let mut visit = make_visitor();
 
-        for pattern in &self.config.ignore_patterns {
-            if glob_match(pattern, &path_str) {
-                return true;
-            }
-        }
-
-        false
+            Box::new(move |entry| {
+                if let Some(walk_entry) = entry.ok().and_then(|e| filter.accept(e)) {
+                    visit(walk_entry);
+                }
+                WalkState::Continue
+            })
+        });
     }
 
-    /// Check if a file should be indexed
-    fn is_indexable(&self, path: &Path) -> bool {
-        // Check extension filter if set
-        if !self.config.include_extensions.is_empty() {
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                if !self
-                    .config
-                    .include_extensions
-                    .iter()
-                    .any(|e| e.to_lowercase() == ext_str)
-                {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
+    fn builder(&self) -> WalkBuilder {
+        let config = &self.filter.config;
+        let respect_gitignore = config.respect_gitignore;
+        let mut builder = WalkBuilder::new(&self.root);
 
-        // Check if it's a text file
-        if !is_text_file(path) {
-            return false;
-        }
+        // Hidden entries are judged by our own rules below, not skipped wholesale:
+        // `.github/workflows/*.yml` and `.gitignore` are source like any other.
+        builder
+            .hidden(false)
+            .follow_links(config.follow_symlinks)
+            .threads(config.threads)
+            .git_ignore(respect_gitignore)
+            .git_global(respect_gitignore)
+            .git_exclude(respect_gitignore)
+            .ignore(respect_gitignore)
+            .parents(respect_gitignore)
+            // Gitignore rules are worth honouring in a checkout that has no .git of its
+            // own — a worktree, a vendored copy, an export.
+            .require_git(false);
 
-        // Skip generated assets: bundled JS, minified CSS, compact data blobs
-        if is_minified(path, self.config.max_avg_line_length) {
-            tracing::debug!("Skipping minified/generated file: {}", path.display());
-            return false;
-        }
+        let filter = Arc::clone(&self.filter);
+        builder.filter_entry(move |entry| filter.descend(entry));
 
-        true
+        builder
     }
 
     /// Get the root directory
@@ -190,40 +105,150 @@ impl FileWalker {
     /// Get statistics about the walk
     pub fn stats(&self) -> WalkStats {
         WalkStats {
-            visited_paths: self.symlink_resolver.visited_count(),
+            visited_paths: self.filter.visited.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// The rules applied to every entry the walk produces.
+///
+/// Shared by the sequential and parallel walks so they can never drift apart.
+struct EntryFilter {
+    root: PathBuf,
+    /// The root with every symlink resolved, to compare canonical targets against
+    canonical_root: PathBuf,
+    config: IndexerConfig,
+    /// Directory path suffixes pruned during the walk, derived from `ignore_patterns`
+    prune_suffixes: Vec<String>,
+    /// Canonical targets of symlinks already followed, so a tree reachable through two
+    /// links is walked once. Only symlinked entries are canonicalized: doing it for
+    /// every file cost more than the rest of the walk put together.
+    followed_symlinks: Mutex<HashSet<PathBuf>>,
+    visited: AtomicUsize,
+}
+
+impl EntryFilter {
+    /// Whether the walk should look at this entry at all (and descend, for directories)
+    fn descend(&self, entry: &DirEntry) -> bool {
+        // The workspace root itself is always walked. Testing it would skip the whole
+        // tree whenever the root is hidden or happens to be named like a build
+        // directory, which is the caller's explicit choice to index.
+        if entry.depth() == 0 {
+            return true;
+        }
+
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with('.') && is_dir && !classify::TEXT_DOT_DIRS.contains(&name) {
+                return false;
+            }
+        }
+
+        if is_dir {
+            // Prune whole subtrees that the ignore patterns already exclude, so we never
+            // descend into node_modules/ or target/ just to discard each file.
+            if is_pruned_dir(&self.root, entry.path(), &self.prune_suffixes) {
+                return false;
+            }
+
+            if entry.path_is_symlink() && self.skip_symlink(entry.path()) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Whether this entry should be indexed, and the metadata the indexer will need
+    fn accept(&self, entry: DirEntry) -> Option<WalkEntry> {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            return None;
+        }
+
+        let path = entry.path();
+
+        if self.matches_ignore_pattern(path) {
+            return None;
+        }
+
+        if !classify::is_indexable(path, &self.config) {
+            return None;
+        }
+
+        if entry.path_is_symlink() && (!self.config.follow_symlinks || self.skip_symlink(path)) {
+            return None;
+        }
+
+        // The one stat per file: the indexer needs the size to enforce the file-size
+        // limit and the mtime to decide whether the file changed, and re-reading either
+        // later would mean walking the tree's metadata twice.
+        let metadata = entry.metadata().ok()?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.visited.fetch_add(1, Ordering::Relaxed);
+
+        Some(WalkEntry {
+            path: path.to_path_buf(),
+            meta: FileMeta {
+                size: metadata.len(),
+                mtime,
+            },
+        })
+    }
+
+    /// Whether a symlink leads somewhere the walk covers by another route.
+    ///
+    /// A link into the workspace itself is always redundant — the walk reaches the real
+    /// path anyway — and two links to the same tree outside it are followed once. This
+    /// is the only place anything is canonicalized: doing it for every file, which is
+    /// how duplicates used to be found, cost more than the rest of the walk together.
+    fn skip_symlink(&self, path: &Path) -> bool {
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return true;
+        };
+
+        if canonical.starts_with(&self.canonical_root) {
+            return true;
+        }
+
+        !self.followed_symlinks.lock().insert(canonical)
+    }
+
+    /// Check if path matches custom ignore patterns
+    ///
+    /// Patterns are matched against the path relative to the workspace root. Matching
+    /// the absolute path would let directories *above* the workspace exclude everything
+    /// inside it, so a project stored under `~/build/myapp` would index nothing.
+    fn matches_ignore_pattern(&self, path: &Path) -> bool {
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let path_str = relative.to_string_lossy();
+
+        self.config
+            .ignore_patterns
+            .iter()
+            .any(|pattern| glob_match(pattern, &path_str))
     }
 }
 
 /// An entry from walking the directory tree
 #[derive(Debug, Clone)]
 pub struct WalkEntry {
-    /// The original path (may be a symlink)
+    /// The path to the file
     pub path: PathBuf,
-    /// The canonical (resolved) path
-    pub canonical: PathBuf,
-    /// Whether this was a symlink
-    pub is_symlink: bool,
+    /// Size and mtime read during the walk
+    pub meta: FileMeta,
 }
 
 /// Statistics about the walk
 #[derive(Debug, Clone, Default)]
 pub struct WalkStats {
     pub visited_paths: usize,
-}
-
-/// Load .gitignore from a directory
-fn load_gitignore(root: &Path) -> Option<Gitignore> {
-    let gitignore_path = root.join(".gitignore");
-    if gitignore_path.exists() {
-        let mut builder = GitignoreBuilder::new(root);
-        if builder.add(&gitignore_path).is_none() {
-            if let Ok(gi) = builder.build() {
-                return Some(gi);
-            }
-        }
-    }
-    None
 }
 
 /// Directory path suffixes that can be pruned wholesale during the walk.
@@ -255,15 +280,6 @@ pub(crate) fn is_pruned_dir(root: &Path, path: &Path, suffixes: &[String]) -> bo
     suffixes
         .iter()
         .any(|suffix| path_str == *suffix || path_str.ends_with(&format!("/{}", suffix)))
-}
-
-/// Check if a directory entry is hidden (starts with .)
-fn is_hidden(entry: &walkdir::DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|s| s.starts_with('.'))
-        .unwrap_or(false)
 }
 
 /// Simple glob matching for ignore patterns (for files)
@@ -307,208 +323,27 @@ pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
         || path.contains(&format!("/{}/", pattern))
 }
 
-/// Check if a file is likely a text file
-fn is_text_file(path: &Path) -> bool {
-    // Known text extensions
-    const TEXT_EXTENSIONS: &[&str] = &[
-        // Programming languages
-        "rs",
-        "py",
-        "js",
-        "ts",
-        "jsx",
-        "tsx",
-        "mjs",
-        "mts",
-        "cjs",
-        "cts",
-        "go",
-        "rb",
-        "php",
-        "java",
-        "c",
-        "cpp",
-        "cc",
-        "h",
-        "hpp",
-        "hh",
-        "cs",
-        "swift",
-        "kt",
-        "scala",
-        "clj",
-        "ex",
-        "exs",
-        "erl",
-        "hs",
-        "ml",
-        "fs",
-        "r",
-        "jl",
-        "lua",
-        "pl",
-        "pm",
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "ps1",
-        "bat",
-        "cmd",
-        // Web/markup
-        "html",
-        "htm",
-        "css",
-        "scss",
-        "sass",
-        "less",
-        "xml",
-        "json",
-        "yaml",
-        "yml",
-        "toml",
-        // Templates
-        "twig",
-        "blade",
-        "ejs",
-        "hbs",
-        "handlebars",
-        "mustache",
-        "pug",
-        "jade",
-        "erb",
-        "haml",
-        "njk",
-        "nunjucks",
-        "jinja",
-        "jinja2",
-        "liquid",
-        "eta",
-        // Documentation
-        "md",
-        "markdown",
-        "rst",
-        "txt",
-        "csv",
-        "sql",
-        "graphql",
-        "gql",
-        // Config/build
-        "dockerfile",
-        "makefile",
-        "cmake",
-        "gradle",
-        "pom",
-        "ini",
-        "conf",
-        "cfg",
-        // Frontend frameworks
-        "vue",
-        "svelte",
-        "astro",
-        // Infrastructure
-        "tf",
-        "hcl",
-        "nix",
-        // Data formats
-        "proto",
-        "thrift",
-        "avsc",
-        // Git/editor config
-        "gitignore",
-        "gitattributes",
-        "editorconfig",
-        "env",
-    ];
-
-    // Check extension
-    if let Some(ext) = path.extension() {
-        let ext_lower = ext.to_string_lossy().to_lowercase();
-        if TEXT_EXTENSIONS.contains(&ext_lower.as_str()) {
-            return true;
-        }
-    }
-
-    // Check filename for extensionless text files
-    if let Some(name) = path.file_name() {
-        let name_lower = name.to_string_lossy().to_lowercase();
-        const TEXT_FILENAMES: &[&str] = &[
-            "dockerfile",
-            "makefile",
-            "rakefile",
-            "gemfile",
-            "procfile",
-            "readme",
-            "license",
-            "copying",
-            "authors",
-            "changelog",
-            "todo",
-            "contributing",
-        ];
-        if TEXT_FILENAMES.contains(&name_lower.as_str()) {
-            return true;
-        }
-    }
-
-    // Fall back to checking the first bytes for binary content. Read only the head:
-    // reading the whole file here would pull a multi-gigabyte blob into memory just to
-    // inspect its first few kilobytes.
-    match read_head(path, BINARY_SNIFF_BYTES) {
-        Ok(head) => !head.contains(&0),
-        Err(_) => false,
-    }
-}
-
-/// Bytes sampled from the head of a file to classify it
-const BINARY_SNIFF_BYTES: usize = 8192;
-
-/// Bytes sampled when deciding whether a file is minified or bundled
-const MINIFIED_SNIFF_BYTES: usize = 65536;
-
-/// Read at most `limit` bytes from the start of a file
-fn read_head(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(path)?;
-    let mut buf = Vec::with_capacity(limit.min(8192));
-    file.take(limit as u64).read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// Check whether a file looks minified, bundled, or otherwise machine-generated.
-///
-/// Generated assets (bundled JS, minified CSS, compact JSON data, TextMate grammars)
-/// are enormous relative to their usefulness in a code search, and they pack many more
-/// bytes per line than hand-written source. Average line length over the head of the
-/// file separates the two cleanly: measured across real projects this excludes 12-30%
-/// of indexed bytes in web projects while matching nothing in a plain Rust project.
-///
-/// A threshold of 0 disables the check.
-fn is_minified(path: &Path, max_avg_line_len: usize) -> bool {
-    if max_avg_line_len == 0 {
-        return false;
-    }
-
-    let Ok(head) = read_head(path, MINIFIED_SNIFF_BYTES) else {
-        return false;
-    };
-    if head.is_empty() {
-        return false;
-    }
-
-    // A file whose head has no newline at all is only suspicious once it is big enough
-    // that a single line is implausible for hand-written source.
-    let newlines = head.iter().filter(|b| **b == b'\n').count();
-    let lines = newlines.max(1);
-
-    head.len() / lines > max_avg_line_len
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn walked_paths(workspace: &Path, config: IndexerConfig) -> Vec<String> {
+        let root = workspace.to_path_buf();
+        let mut walker = FileWalker::new(root.clone(), config).unwrap();
+        let mut paths: Vec<String> = walker
+            .walk()
+            .map(|e| {
+                e.path
+                    .strip_prefix(&root)
+                    .unwrap_or(&e.path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
 
     #[test]
     fn test_walk_directory() {
@@ -525,17 +360,50 @@ mod tests {
         std::fs::create_dir(workspace.join("src")).unwrap();
         std::fs::write(workspace.join("src/lib.rs"), "pub mod lib;").unwrap();
 
-        let mut config = IndexerConfig::default();
-        config.ignore_patterns = vec![];
+        let config = IndexerConfig {
+            ignore_patterns: vec![],
+            ..Default::default()
+        };
 
-        let mut walker = FileWalker::new(workspace.clone(), config).unwrap();
+        let paths = walked_paths(&workspace, config);
+        assert_eq!(paths, vec!["readme.md", "src/lib.rs", "test.rs"]);
+    }
 
-        let entries: Vec<_> = walker.walk().collect();
-        assert!(
-            entries.len() >= 3,
-            "Expected at least 3 entries, got {}",
-            entries.len()
-        );
+    #[test]
+    fn the_parallel_walk_sees_the_same_files() {
+        let temp_dir = tempdir().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src/deep")).unwrap();
+        for i in 0..50 {
+            std::fs::write(workspace.join(format!("src/f{i}.rs")), "fn f() {}\n").unwrap();
+            std::fs::write(workspace.join(format!("src/deep/g{i}.rs")), "fn g() {}\n").unwrap();
+        }
+
+        let sequential = walked_paths(&workspace, IndexerConfig::default());
+
+        let walker = FileWalker::new(workspace.clone(), IndexerConfig::default()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        walker.walk_parallel(|| {
+            let tx = tx.clone();
+            move |entry: WalkEntry| {
+                let _ = tx.send(entry.path);
+            }
+        });
+        drop(tx);
+
+        let mut parallel: Vec<String> = rx
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(&workspace)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        parallel.sort();
+
+        assert_eq!(parallel, sequential);
+        assert_eq!(parallel.len(), 100);
     }
 
     #[test]
@@ -564,10 +432,11 @@ mod tests {
         // the absolute path made the whole workspace vanish.
         let (_temp, workspace) = workspace_with_source("build/myapp");
 
-        let mut walker = FileWalker::new(workspace, IndexerConfig::default()).unwrap();
-        let entries: Vec<_> = walker.walk().collect();
-
-        assert_eq!(entries.len(), 1, "workspace under build/ must still index");
+        assert_eq!(
+            walked_paths(&workspace, IndexerConfig::default()),
+            vec!["src/main.rs"],
+            "workspace under build/ must still index"
+        );
     }
 
     #[test]
@@ -576,14 +445,10 @@ mod tests {
         std::fs::create_dir_all(workspace.join("build")).unwrap();
         std::fs::write(workspace.join("build/generated.rs"), "fn gen() {}\n").unwrap();
 
-        let mut walker = FileWalker::new(workspace, IndexerConfig::default()).unwrap();
-        let paths: Vec<_> = walker
-            .walk()
-            .map(|e| e.path.to_string_lossy().into_owned())
-            .collect();
-
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("src/main.rs"));
+        assert_eq!(
+            walked_paths(&workspace, IndexerConfig::default()),
+            vec!["src/main.rs"]
+        );
     }
 
     #[test]
@@ -591,10 +456,11 @@ mod tests {
         // `ygrep index ~/.config/something` used to return zero files silently.
         let (_temp, workspace) = workspace_with_source(".dotroot");
 
-        let mut walker = FileWalker::new(workspace, IndexerConfig::default()).unwrap();
-        let entries: Vec<_> = walker.walk().collect();
-
-        assert_eq!(entries.len(), 1, "hidden root must still be indexed");
+        assert_eq!(
+            walked_paths(&workspace, IndexerConfig::default()),
+            vec!["src/main.rs"],
+            "hidden root must still be indexed"
+        );
     }
 
     #[test]
@@ -603,10 +469,88 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".hidden")).unwrap();
         std::fs::write(workspace.join(".hidden/secret.rs"), "fn s() {}\n").unwrap();
 
-        let mut walker = FileWalker::new(workspace, IndexerConfig::default()).unwrap();
-        let entries: Vec<_> = walker.walk().collect();
+        assert_eq!(
+            walked_paths(&workspace, IndexerConfig::default()),
+            vec!["src/main.rs"]
+        );
+    }
 
-        assert_eq!(entries.len(), 1);
+    #[test]
+    fn workflow_files_and_useful_dotfiles_are_indexed() {
+        let (_temp, workspace) = workspace_with_source("myapp");
+        std::fs::create_dir_all(workspace.join(".github/workflows")).unwrap();
+        std::fs::write(workspace.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        std::fs::write(workspace.join(".gitignore"), "target\n").unwrap();
+        std::fs::write(workspace.join(".editorconfig"), "root = true\n").unwrap();
+        std::fs::write(workspace.join(".DS_Store"), "junk").unwrap();
+
+        assert_eq!(
+            walked_paths(&workspace, IndexerConfig::default()),
+            vec![
+                ".editorconfig",
+                ".github/workflows/ci.yml",
+                ".gitignore",
+                "src/main.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_gitignore_files_are_honoured() {
+        let (_temp, workspace) = workspace_with_source("myapp");
+        std::fs::create_dir_all(workspace.join("src/nested")).unwrap();
+        std::fs::write(workspace.join("src/nested/keep.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(workspace.join("src/nested/drop.rs"), "fn drop_me() {}\n").unwrap();
+        std::fs::write(workspace.join("src/nested/.gitignore"), "drop.rs\n").unwrap();
+
+        let config = IndexerConfig {
+            respect_gitignore: true,
+            ..Default::default()
+        };
+
+        let paths = walked_paths(&workspace, config);
+        assert!(paths.contains(&"src/nested/keep.rs".to_string()));
+        assert!(
+            !paths.contains(&"src/nested/drop.rs".to_string()),
+            "a nested .gitignore must exclude its own directory: {paths:?}"
+        );
+
+        // With gitignore disabled the same file is indexed again.
+        let paths = walked_paths(&workspace, IndexerConfig::default());
+        assert!(paths.contains(&"src/nested/drop.rs".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_reachable_twice_is_walked_once() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, workspace) = workspace_with_source("myapp");
+        std::fs::write(workspace.join("src/other.rs"), "fn other() {}\n").unwrap();
+
+        // A link into the workspace: everything behind it is walked by its real path.
+        symlink(workspace.join("src"), workspace.join("alias")).unwrap();
+
+        // Two links to the same tree outside the workspace: followed once.
+        let outside = _temp.path().join("shared");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("shared.rs"), "fn shared() {}\n").unwrap();
+        symlink(&outside, workspace.join("first")).unwrap();
+        symlink(&outside, workspace.join("second")).unwrap();
+
+        let paths = walked_paths(&workspace, IndexerConfig::default());
+
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"src/other.rs".to_string()));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| p.ends_with("shared.rs"))
+                .collect::<Vec<_>>()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -658,51 +602,15 @@ mod tests {
     }
 
     #[test]
-    fn minified_files_are_detected_and_source_is_not() {
-        let temp = tempdir().unwrap();
-
-        let bundle = temp.path().join("app.bundle.js");
-        std::fs::write(&bundle, format!("var a=1;{}\n", "x".repeat(5000))).unwrap();
-        assert!(is_minified(&bundle, 400));
-
-        let source = temp.path().join("main.rs");
-        let normal: String = (0..200)
-            .map(|i| format!("    let x{} = {};\n", i, i))
-            .collect();
-        std::fs::write(&source, &normal).unwrap();
-        assert!(!is_minified(&source, 400));
-
-        // A threshold of zero disables the check.
-        assert!(!is_minified(&bundle, 0));
-    }
-
-    #[test]
-    fn minified_files_are_excluded_from_the_walk() {
+    fn the_walk_yields_the_metadata_the_indexer_needs() {
         let (_temp, workspace) = workspace_with_source("myapp");
-        std::fs::write(
-            workspace.join("src/vendor.js"),
-            format!("var a=1;{}\n", "y".repeat(20000)),
-        )
-        .unwrap();
 
-        let mut walker = FileWalker::new(workspace, IndexerConfig::default()).unwrap();
-        let paths: Vec<_> = walker
-            .walk()
-            .map(|e| e.path.to_string_lossy().into_owned())
-            .collect();
+        let mut walker = FileWalker::new(workspace.clone(), IndexerConfig::default()).unwrap();
+        let entries: Vec<_> = walker.walk().collect();
 
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("src/main.rs"));
-    }
-
-    #[test]
-    fn read_head_stops_at_the_limit() {
-        let temp = tempdir().unwrap();
-        let big = temp.path().join("big.bin");
-        std::fs::write(&big, vec![b'a'; 100_000]).unwrap();
-
-        let head = read_head(&big, 8192).unwrap();
-
-        assert_eq!(head.len(), 8192, "must not read the whole file");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].meta.size, 13);
+        assert!(entries[0].meta.mtime > 0);
+        assert_eq!(walker.stats().visited_paths, 1);
     }
 }

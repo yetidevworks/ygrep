@@ -75,8 +75,12 @@ pub struct IndexerConfig {
     /// Chunk overlap (lines)
     pub chunk_overlap: usize,
 
-    /// Number of indexing threads
+    /// Number of threads used to walk and index a workspace (0 = one per core)
     pub threads: usize,
+
+    /// Writer heap for a full index build, in megabytes.
+    /// Indexers that handle one file at a time always use tantivy's 15MB minimum.
+    pub writer_heap_mb: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,8 +302,9 @@ impl Default for IndexerConfig {
             chunk_size: 50,
             chunk_overlap: 0,
             threads: std::thread::available_parallelism()
-                .map(|n| n.get().min(4))
+                .map(|n| n.get().min(8))
                 .unwrap_or(2),
+            writer_heap_mb: crate::index::writer::DEFAULT_WRITER_HEAP_MB,
         }
     }
 }

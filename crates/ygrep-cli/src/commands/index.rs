@@ -23,7 +23,16 @@ pub fn dry_run(workspace_path: &Path) -> Result<()> {
     let mut largest: Vec<(u64, PathBuf)> = Vec::new();
 
     for entry in walker.walk() {
-        let size = std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
+        // The walk leaves this check to the indexer, which decides from the content it
+        // reads anyway. A dry run has to make it explicitly to report the same set.
+        if ygrep_core::fs::classify::is_minified_file(
+            &entry.path,
+            config.indexer.max_avg_line_length,
+        ) {
+            continue;
+        }
+
+        let size = entry.meta.size;
         total_files += 1;
         total_bytes += size;
 

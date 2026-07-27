@@ -13,9 +13,23 @@ use crate::config::IndexerConfig;
 #[cfg(feature = "embeddings")]
 use crate::embeddings::{EmbeddingCache, EmbeddingModel};
 use crate::error::{Result, YgrepError};
+use crate::fs::classify;
 
-/// Default writer heap for a full index build
-const WRITER_HEAP_BYTES: usize = 50_000_000;
+/// Writer heap for a bulk index build, when the config asks for nothing else
+pub const DEFAULT_WRITER_HEAP_MB: usize = 50;
+
+/// Writer heap for indexers that handle one file at a time.
+///
+/// A watch session holds its writer open for as long as the workspace is watched, and
+/// the dashboard holds one per watched workspace, so the build-sized heap was charged
+/// to every idle repository: eight watched repositories reserved 400MB to index a file
+/// at a time. Tantivy's own minimum is 15MB.
+pub const SINGLE_FILE_WRITER_HEAP_BYTES: usize = 15_000_000;
+
+/// The writer heap a bulk build gets, from config, never below tantivy's own minimum
+pub(crate) fn bulk_writer_heap(config: &IndexerConfig) -> usize {
+    (config.writer_heap_mb * 1_000_000).max(SINGLE_FILE_WRITER_HEAP_BYTES)
+}
 
 /// Open an index writer, reporting a held lock as contention rather than a raw error.
 ///
@@ -35,6 +49,31 @@ pub(crate) fn open_index_writer(index: &Index, heap_size: usize) -> Result<Index
     })
 }
 
+/// Size and modification time a caller already read, so the indexer doesn't stat again
+#[derive(Debug, Clone, Copy)]
+pub struct FileMeta {
+    pub size: u64,
+    pub mtime: u64,
+}
+
+impl FileMeta {
+    /// Read a file's size and mtime
+    pub fn read(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        Ok(Self {
+            size: metadata.len(),
+            mtime,
+        })
+    }
+}
+
 /// Handles indexing of files and content
 pub struct Indexer {
     config: IndexerConfig,
@@ -43,7 +82,7 @@ pub struct Indexer {
     fields: SchemaFields,
     workspace_root: String,
     index_chunks_by_default: bool,
-    seen_content_hashes: Arc<RwLock<HashSet<String>>>,
+    seen_content_hashes: Arc<RwLock<HashSet<u64>>>,
     /// Optional vector index for semantic search
     #[cfg(feature = "embeddings")]
     vector_index: Option<Arc<VectorIndex>>,
@@ -58,25 +97,24 @@ pub struct Indexer {
 impl Indexer {
     /// Create a new indexer for a workspace (text search only)
     pub fn new(config: IndexerConfig, index: Index, workspace_root: &Path) -> Result<Self> {
-        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
-        let schema = index.schema();
-        let fields = SchemaFields::new(&schema);
+        let heap = bulk_writer_heap(&config);
+        Self::build(config, index, workspace_root, heap, false, false)
+    }
 
-        Ok(Self {
+    /// Create an indexer sized for one file at a time (watch events, single updates)
+    pub fn new_single_file(
+        config: IndexerConfig,
+        index: Index,
+        workspace_root: &Path,
+    ) -> Result<Self> {
+        Self::build(
             config,
             index,
-            writer: Arc::new(RwLock::new(writer)),
-            fields,
-            workspace_root: workspace_root.to_string_lossy().to_string(),
-            index_chunks_by_default: false,
-            seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
-            #[cfg(feature = "embeddings")]
-            vector_index: None,
-            #[cfg(feature = "embeddings")]
-            embedding_model: None,
-            #[cfg(feature = "embeddings")]
-            embedding_cache: None,
-        })
+            workspace_root,
+            SINGLE_FILE_WRITER_HEAP_BYTES,
+            false,
+            false,
+        )
     }
 
     /// Create a new indexer with NoMergePolicy (for watch mode — prevents segment merge races)
@@ -85,8 +123,28 @@ impl Indexer {
         index: Index,
         workspace_root: &Path,
     ) -> Result<Self> {
-        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
+        Self::build(
+            config,
+            index,
+            workspace_root,
+            SINGLE_FILE_WRITER_HEAP_BYTES,
+            true,
+            false,
+        )
+    }
+
+    fn build(
+        config: IndexerConfig,
+        index: Index,
+        workspace_root: &Path,
+        heap_size: usize,
+        no_merge: bool,
+        index_chunks_by_default: bool,
+    ) -> Result<Self> {
+        let writer = open_index_writer(&index, heap_size)?;
+        if no_merge {
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+        }
         let schema = index.schema();
         let fields = SchemaFields::new(&schema);
 
@@ -96,7 +154,7 @@ impl Indexer {
             writer: Arc::new(RwLock::new(writer)),
             fields,
             workspace_root: workspace_root.to_string_lossy().to_string(),
-            index_chunks_by_default: false,
+            index_chunks_by_default,
             seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
             #[cfg(feature = "embeddings")]
             vector_index: None,
@@ -117,22 +175,12 @@ impl Indexer {
         embedding_model: Arc<EmbeddingModel>,
         embedding_cache: Arc<EmbeddingCache>,
     ) -> Result<Self> {
-        let writer = open_index_writer(&index, WRITER_HEAP_BYTES)?;
-        let schema = index.schema();
-        let fields = SchemaFields::new(&schema);
-
-        Ok(Self {
-            config,
-            index,
-            writer: Arc::new(RwLock::new(writer)),
-            fields,
-            workspace_root: workspace_root.to_string_lossy().to_string(),
-            index_chunks_by_default: true,
-            seen_content_hashes: Arc::new(RwLock::new(HashSet::new())),
-            vector_index: Some(vector_index),
-            embedding_model: Some(embedding_model),
-            embedding_cache: Some(embedding_cache),
-        })
+        let heap = bulk_writer_heap(&config);
+        let mut indexer = Self::build(config, index, workspace_root, heap, false, true)?;
+        indexer.vector_index = Some(vector_index);
+        indexer.embedding_model = Some(embedding_model);
+        indexer.embedding_cache = Some(embedding_cache);
+        Ok(indexer)
     }
 
     /// Index a single file
@@ -148,10 +196,20 @@ impl Indexer {
         path: &Path,
         index_chunks: bool,
     ) -> Result<(String, String)> {
-        // Check the size before reading: a multi-gigabyte file rejected after
-        // read_to_string has already cost us its full size in RAM.
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len();
+        self.index_entry(path, FileMeta::read(path)?, index_chunks)
+    }
+
+    /// Index a file whose size and mtime the caller already read during the walk.
+    /// Returns (doc_id, content) so callers can reuse the content without re-reading.
+    pub fn index_entry(
+        &self,
+        path: &Path,
+        meta: FileMeta,
+        index_chunks: bool,
+    ) -> Result<(String, String)> {
+        // Check the size before reading: a multi-gigabyte file rejected after reading it
+        // has already cost us its full size in RAM.
+        let size = meta.size;
         if size > self.config.max_file_size {
             return Err(YgrepError::FileTooLarge {
                 path: path.to_path_buf(),
@@ -160,12 +218,12 @@ impl Indexer {
             });
         }
 
-        let content = std::fs::read_to_string(path)?;
+        let content = self.read_indexable(path, size)?;
 
         // Generate content hash for deduplication and doc_id
         let content_hash = xxh3_64(content.as_bytes());
         let doc_id = format!("{:016x}", content_hash);
-        let is_duplicate_content = self.config.deduplicate && !self.mark_content_seen(&doc_id);
+        let is_duplicate_content = self.config.deduplicate && !self.mark_content_seen(content_hash);
 
         // Get relative path
         let rel_path = path
@@ -180,14 +238,7 @@ impl Indexer {
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Get modification time
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
+        let mtime = meta.mtime;
         let line_count = content.lines().count() as u64;
 
         // Build the document
@@ -210,13 +261,15 @@ impl Indexer {
         // Delete any existing document with same path
         self.delete_by_path(&rel_path)?;
 
-        // Add the document
-        let mut writer = self.writer.write();
+        // Adding a document only needs shared access — tantivy hands it to its own
+        // indexing threads — so parallel walkers never queue behind each other. Only a
+        // commit takes the writer exclusively.
+        let writer = self.writer.read();
         writer.add_document(doc)?;
 
         // Also create chunks for the file
         let chunk_ids = if index_chunks && !is_duplicate_content {
-            self.index_chunks(&content, &doc_id, &rel_path, &mut writer)?
+            self.index_chunks(&content, &doc_id, &rel_path, &writer)?
         } else {
             Vec::new()
         };
@@ -255,9 +308,39 @@ impl Indexer {
         Ok((doc_id, content))
     }
 
-    fn mark_content_seen(&self, doc_id: &str) -> bool {
+    /// Read a file, rejecting generated content before the whole of it is in memory.
+    ///
+    /// The minified check runs on the head of the file, which is read first, so a 9MB
+    /// bundle costs 64KB instead of 9MB. Files smaller than that head are already fully
+    /// read by the time the check runs, so nothing reads twice.
+    fn read_indexable(&self, path: &Path, size: u64) -> Result<String> {
+        use std::io::Read;
+
+        let head_limit = classify::MINIFIED_SNIFF_BYTES;
+        let mut file = std::fs::File::open(path)?;
+        let mut buf = Vec::with_capacity((size as usize).min(head_limit));
+        file.by_ref()
+            .take(head_limit as u64)
+            .read_to_end(&mut buf)?;
+
+        if classify::content_is_minified(&buf, self.config.max_avg_line_length) {
+            tracing::debug!("Skipping minified/generated file: {}", path.display());
+            return Err(YgrepError::GeneratedFile(path.to_path_buf()));
+        }
+
+        if buf.len() == head_limit {
+            buf.reserve(size.saturating_sub(head_limit as u64) as usize);
+            file.read_to_end(&mut buf)?;
+        }
+
+        String::from_utf8(buf).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()).into()
+        })
+    }
+
+    fn mark_content_seen(&self, content_hash: u64) -> bool {
         let mut seen = self.seen_content_hashes.write();
-        seen.insert(doc_id.to_string())
+        seen.insert(content_hash)
     }
 
     /// Index chunks of a file for more granular search
@@ -267,7 +350,7 @@ impl Indexer {
         content: &str,
         parent_doc_id: &str,
         path: &str,
-        writer: &mut IndexWriter,
+        writer: &IndexWriter,
     ) -> Result<Vec<(String, String)>> {
         let lines: Vec<&str> = content.lines().collect();
         let chunk_size = self.config.chunk_size;
@@ -318,7 +401,7 @@ impl Indexer {
     /// Delete a document by path
     pub fn delete_by_path(&self, path: &str) -> Result<()> {
         let term = Term::from_field_text(self.fields.path, path);
-        let writer = self.writer.write();
+        let writer = self.writer.read();
         writer.delete_term(term);
         Ok(())
     }
@@ -326,7 +409,7 @@ impl Indexer {
     /// Delete a document by doc_id
     pub fn delete_by_id(&self, doc_id: &str) -> Result<()> {
         let term = Term::from_field_text(self.fields.doc_id, doc_id);
-        let writer = self.writer.write();
+        let writer = self.writer.read();
         writer.delete_term(term);
         Ok(())
     }
@@ -463,6 +546,30 @@ mod tests {
             indexer.index_file(&binary),
             Err(crate::error::YgrepError::FileTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn a_generated_file_is_rejected_from_its_head_alone() {
+        let temp_dir = tempdir().unwrap();
+        let (indexer, _) = create_test_indexer(temp_dir.path());
+
+        let bundle = temp_dir.path().join("app.bundle.js");
+        std::fs::write(&bundle, format!("var a=1;{}\n", "x".repeat(200_000))).unwrap();
+
+        assert!(matches!(
+            indexer.index_file(&bundle),
+            Err(crate::error::YgrepError::GeneratedFile(_))
+        ));
+
+        // Hand-written source of the same size is indexed.
+        let source = temp_dir.path().join("main.rs");
+        let normal: String = (0..8_000)
+            .map(|i| format!("    let x{i} = {i};\n"))
+            .collect();
+        std::fs::write(&source, &normal).unwrap();
+
+        let (_doc_id, content) = indexer.index_file(&source).unwrap();
+        assert_eq!(content.len(), normal.len(), "the whole file must be read");
     }
 
     #[test]

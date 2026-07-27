@@ -48,6 +48,9 @@ pub enum YgrepError {
     #[error("File too large: {path} ({size} bytes, max {max} bytes)")]
     FileTooLarge { path: PathBuf, size: u64, max: u64 },
 
+    #[error("Generated or minified file: {0}")]
+    GeneratedFile(PathBuf),
+
     #[error("Unsupported file type: {0}")]
     UnsupportedFileType(String),
 

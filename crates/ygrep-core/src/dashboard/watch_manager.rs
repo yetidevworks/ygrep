@@ -533,125 +533,13 @@ fn has_recent_changes(workspace_path: &Path, indexed_at: chrono::DateTime<chrono
 
             if path.is_dir() {
                 dirs.push(path);
-            } else if is_indexable(&path) && check_mtime(&path) {
+            } else if crate::fs::classify::is_text_file(&path) && check_mtime(&path) {
                 return true;
             }
         }
     }
 
     false
-}
-
-/// Check if a file should be indexed (simple extension check)
-fn is_indexable(path: &Path) -> bool {
-    const TEXT_EXTENSIONS: &[&str] = &[
-        "rs",
-        "py",
-        "js",
-        "ts",
-        "jsx",
-        "tsx",
-        "mjs",
-        "mts",
-        "cjs",
-        "cts",
-        "go",
-        "rb",
-        "php",
-        "java",
-        "c",
-        "cpp",
-        "cc",
-        "h",
-        "hpp",
-        "hh",
-        "cs",
-        "swift",
-        "kt",
-        "scala",
-        "clj",
-        "ex",
-        "exs",
-        "erl",
-        "hs",
-        "ml",
-        "fs",
-        "r",
-        "jl",
-        "lua",
-        "pl",
-        "pm",
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "ps1",
-        "bat",
-        "cmd",
-        "html",
-        "htm",
-        "css",
-        "scss",
-        "sass",
-        "less",
-        "xml",
-        "json",
-        "yaml",
-        "yml",
-        "toml",
-        "twig",
-        "blade",
-        "ejs",
-        "hbs",
-        "handlebars",
-        "mustache",
-        "pug",
-        "jade",
-        "erb",
-        "haml",
-        "njk",
-        "nunjucks",
-        "jinja",
-        "jinja2",
-        "liquid",
-        "eta",
-        "md",
-        "markdown",
-        "rst",
-        "txt",
-        "csv",
-        "sql",
-        "graphql",
-        "gql",
-        "dockerfile",
-        "makefile",
-        "cmake",
-        "gradle",
-        "pom",
-        "ini",
-        "conf",
-        "cfg",
-        "vue",
-        "svelte",
-        "astro",
-        "tf",
-        "hcl",
-        "nix",
-        "proto",
-        "thrift",
-        "avsc",
-        "gitignore",
-        "gitattributes",
-        "editorconfig",
-        "env",
-    ];
-
-    if let Some(ext) = path.extension() {
-        let ext_lower = ext.to_string_lossy().to_lowercase();
-        TEXT_EXTENSIONS.contains(&ext_lower.as_str())
-    } else {
-        false
-    }
 }
 
 /// Async task that runs a FileWatcher for a single workspace
@@ -731,7 +619,7 @@ async fn watcher_task(
                 for event in events {
                     match event {
                         WatchEvent::Changed(ref path) => {
-                            if is_indexable(path) {
+                            if crate::fs::classify::is_indexable(path, workspace.indexer_config()) {
                                 match workspace.index_file_no_commit(&indexer, path, semantic) {
                                     Ok(()) => {
                                         needs_commit = true;

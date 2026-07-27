@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use ygrep_core::fs::classify;
 use ygrep_core::{WatchEvent, Workspace, YgrepError};
 
 pub fn run(workspace_path: &Path) -> Result<()> {
@@ -87,7 +88,7 @@ pub fn run(workspace_path: &Path) -> Result<()> {
             for event in events {
                 match event {
                     WatchEvent::Changed(path) => {
-                        if is_indexable(&path) {
+                        if classify::is_indexable(&path, workspace.indexer_config()) {
                             match workspace.index_file_no_commit(&indexer, &path, use_semantic) {
                                 Ok(()) => {
                                     needs_commit = true;
@@ -173,116 +174,4 @@ pub fn run(workspace_path: &Path) -> Result<()> {
     });
 
     Ok(())
-}
-
-/// Check if a file should be indexed (simple extension check)
-fn is_indexable(path: &Path) -> bool {
-    const TEXT_EXTENSIONS: &[&str] = &[
-        "rs",
-        "py",
-        "js",
-        "ts",
-        "jsx",
-        "tsx",
-        "mjs",
-        "mts",
-        "cjs",
-        "cts",
-        "go",
-        "rb",
-        "php",
-        "java",
-        "c",
-        "cpp",
-        "cc",
-        "h",
-        "hpp",
-        "hh",
-        "cs",
-        "swift",
-        "kt",
-        "scala",
-        "clj",
-        "ex",
-        "exs",
-        "erl",
-        "hs",
-        "ml",
-        "fs",
-        "r",
-        "jl",
-        "lua",
-        "pl",
-        "pm",
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "ps1",
-        "bat",
-        "cmd",
-        "html",
-        "htm",
-        "css",
-        "scss",
-        "sass",
-        "less",
-        "xml",
-        "json",
-        "yaml",
-        "yml",
-        "toml",
-        "twig",
-        "blade",
-        "ejs",
-        "hbs",
-        "handlebars",
-        "mustache",
-        "pug",
-        "jade",
-        "erb",
-        "haml",
-        "njk",
-        "nunjucks",
-        "jinja",
-        "jinja2",
-        "liquid",
-        "eta",
-        "md",
-        "markdown",
-        "rst",
-        "txt",
-        "csv",
-        "sql",
-        "graphql",
-        "gql",
-        "dockerfile",
-        "makefile",
-        "cmake",
-        "gradle",
-        "pom",
-        "ini",
-        "conf",
-        "cfg",
-        "vue",
-        "svelte",
-        "astro",
-        "tf",
-        "hcl",
-        "nix",
-        "proto",
-        "thrift",
-        "avsc",
-        "gitignore",
-        "gitattributes",
-        "editorconfig",
-        "env",
-    ];
-
-    if let Some(ext) = path.extension() {
-        let ext_lower = ext.to_string_lossy().to_lowercase();
-        TEXT_EXTENSIONS.contains(&ext_lower.as_str())
-    } else {
-        false
-    }
 }
