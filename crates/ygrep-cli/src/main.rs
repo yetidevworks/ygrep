@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 mod commands;
@@ -31,6 +32,7 @@ Match indicators in default output:\n\
 )]
 #[command(version)]
 #[command(after_help = "EXAMPLES:\n\
+    ygrep                           Open the management TUI (on a terminal)\n\
     ygrep index                     Index current directory (text-only)\n\
     ygrep index --semantic          Index with semantic search (slower)\n\
     ygrep \"search query\"            Search with default AI output\n\
@@ -177,8 +179,24 @@ pub enum Commands {
     #[command(subcommand)]
     Service(ServiceCommand),
 
-    /// Interactive dashboard for managing all indexes and watchers
+    /// Interactive TUI for indexes, watching and the background service
+    ///
+    /// Same screen bare `ygrep` opens on a terminal.
     Dashboard,
+
+    /// Render one TUI frame with synthetic data as plain text (layout testing)
+    #[command(hide = true)]
+    TuiSnapshot {
+        /// Terminal width to render at
+        #[arg(long, default_value = "100")]
+        width: u16,
+        /// Terminal height to render at
+        #[arg(long, default_value = "30")]
+        height: u16,
+        /// Which screen to render: dashboard or stats
+        #[arg(long, default_value = "dashboard")]
+        view: String,
+    },
 
     /// Check for and install updates
     Update {
@@ -433,7 +451,14 @@ fn main() -> Result<()> {
             ServiceCommand::Log { lines, follow } => commands::service::log(lines, follow)?,
         },
         Some(Commands::Dashboard) => {
-            commands::dashboard::run()?;
+            commands::tui::run()?;
+        }
+        Some(Commands::TuiSnapshot {
+            width,
+            height,
+            view,
+        }) => {
+            print!("{}", commands::tui::snapshot(width, height, &view)?);
         }
         Some(Commands::Update { check }) => {
             commands::update::run(check)?;
@@ -460,8 +485,11 @@ fn main() -> Result<()> {
                     cli.no_auto_index,
                 )?;
                 commands::update::maybe_print_update_hint();
+            } else if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                // On a terminal, bare `ygrep` opens the management TUI.
+                commands::tui::run()?;
             } else {
-                // No query, show help
+                // Piped or redirected: print help, so nothing scripted ever hangs.
                 use clap::CommandFactory;
                 Cli::command().print_help()?;
                 println!();
