@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use ygrep_core::index::SCHEMA_VERSION;
+use ygrep_core::search::SearchResult;
+use ygrep_core::telemetry::{self, QueryMode};
 use ygrep_core::{Config, Workspace, YgrepError};
 
 use crate::commands::progress;
@@ -213,6 +215,14 @@ fn search_with(
     let use_hybrid = false;
     let _ = text_only; // Suppress unused warning when embeddings disabled
 
+    let mode = if use_hybrid && !use_regex {
+        QueryMode::Hybrid
+    } else if use_regex {
+        QueryMode::Regex
+    } else {
+        QueryMode::Literal
+    };
+
     let result = if use_hybrid && !use_regex {
         // Hybrid search (BM25 + vector with RRF) - not supported with regex
         #[cfg(feature = "embeddings")]
@@ -247,6 +257,8 @@ fn search_with(
             .context("Search failed")?
     };
 
+    record_telemetry(&workspace, query, &result, mode);
+
     // Output results
     let output = match format {
         OutputFormat::Ai => result.format_ai(),
@@ -257,4 +269,29 @@ fn search_with(
     print!("{}", output);
 
     Ok(())
+}
+
+/// Log the query for the dashboard's stats view.
+///
+/// Best-effort throughout: a search that already produced its answer must not fail
+/// because the log line couldn't be worked out or written.
+fn record_telemetry(workspace: &Workspace, query: &str, result: &SearchResult, mode: QueryMode) {
+    let index_path = workspace.index_path();
+    let Some(hash) = index_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    // <data_dir>/indexes/<hash> — the telemetry log lives beside the indexes directory.
+    let Some(data_dir) = index_path.parent().and_then(|p| p.parent()) else {
+        return;
+    };
+
+    telemetry::record_query(
+        &Config::load(),
+        data_dir,
+        hash,
+        query,
+        result.query_time_ms,
+        result.hits.len(),
+        mode,
+    );
 }

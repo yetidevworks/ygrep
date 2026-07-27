@@ -5,8 +5,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Daemon configuration
-    pub daemon: DaemonConfig,
+    /// Background watch service
+    pub service: ServiceConfig,
 
     /// Indexing configuration
     pub indexer: IndexerConfig,
@@ -20,15 +20,13 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DaemonConfig {
-    /// Socket path (default: $XDG_RUNTIME_DIR/ygrep/ygrep.sock or ~/.ygrep/ygrep.sock)
-    pub socket_path: Option<PathBuf>,
+pub struct ServiceConfig {
+    /// Rotate the service log once it passes this size, in megabytes
+    pub log_max_size_mb: u64,
 
-    /// Auto-shutdown after idle time (seconds, 0 = never)
-    pub idle_timeout: u64,
-
-    /// Maximum concurrent index operations
-    pub max_concurrent_ops: usize,
+    /// How often the service re-reads the index registry, in seconds.
+    /// Picks up newly built indexes and watch flags toggled elsewhere.
+    pub registry_rescan_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,12 +126,16 @@ pub struct OutputConfig {
 
     /// Show scores in output
     pub show_scores: bool,
+
+    /// Append one line per search to <data_dir>/telemetry/queries.jsonl.
+    /// Local only — it feeds the dashboard's query stats and nothing leaves the machine.
+    pub telemetry: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            daemon: DaemonConfig::default(),
+            service: ServiceConfig::default(),
             indexer: IndexerConfig::default(),
             search: SearchConfig::default(),
             output: OutputConfig::default(),
@@ -141,12 +143,11 @@ impl Default for Config {
     }
 }
 
-impl Default for DaemonConfig {
+impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
-            socket_path: None,
-            idle_timeout: 3600, // 1 hour
-            max_concurrent_ops: 4,
+            log_max_size_mb: 5,
+            registry_rescan_secs: 30,
         }
     }
 }
@@ -332,6 +333,7 @@ impl Default for OutputConfig {
             context_lines: 2,
             max_lines_per_result: 10,
             show_scores: false,
+            telemetry: true,
         }
     }
 }
@@ -401,30 +403,6 @@ impl Config {
         let config = toml::from_str(&content)?;
         Ok(config)
     }
-
-    /// Get the socket path, using default if not specified
-    pub fn socket_path(&self) -> PathBuf {
-        self.daemon
-            .socket_path
-            .clone()
-            .unwrap_or_else(default_socket_path)
-    }
-}
-
-fn default_socket_path() -> PathBuf {
-    // Honor XDG_RUNTIME_DIR if set (even on macOS)
-    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        if !xdg_runtime.is_empty() {
-            return PathBuf::from(xdg_runtime).join("ygrep").join("ygrep.sock");
-        }
-    }
-    if let Some(runtime_dir) = dirs::runtime_dir() {
-        runtime_dir.join("ygrep").join("ygrep.sock")
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".ygrep").join("ygrep.sock")
-    } else {
-        PathBuf::from("/tmp/ygrep/ygrep.sock")
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -468,6 +446,41 @@ mod tests {
 
         assert_eq!(config.indexer.max_file_size, default.indexer.max_file_size);
         assert_eq!(config.search.default_limit, default.search.default_limit);
+    }
+
+    #[test]
+    fn test_service_defaults() {
+        let config = Config::default();
+        assert_eq!(config.service.log_max_size_mb, 5);
+        assert_eq!(config.service.registry_rescan_secs, 30);
+        assert!(config.output.telemetry);
+    }
+
+    #[test]
+    fn test_retired_daemon_section_still_parses() {
+        // Config files written before the service replaced the daemon scaffolding must
+        // keep loading rather than failing the whole run.
+        let config: Config = toml::from_str(
+            r#"
+            [daemon]
+            socket_path = "/tmp/ygrep.sock"
+            idle_timeout = 3600
+            max_concurrent_ops = 4
+
+            [service]
+            registry_rescan_secs = 90
+            "#,
+        )
+        .expect("an unknown section must be ignored, not rejected");
+
+        assert_eq!(config.service.registry_rescan_secs, 90);
+        assert_eq!(config.service.log_max_size_mb, 5);
+    }
+
+    #[test]
+    fn test_telemetry_can_be_switched_off() {
+        let config: Config = toml::from_str("[output]\ntelemetry = false\n").unwrap();
+        assert!(!config.output.telemetry);
     }
 
     #[test]
