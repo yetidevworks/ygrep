@@ -114,39 +114,65 @@ struct CodeTokenStream<'a> {
     chars: std::iter::Peekable<std::str::CharIndices<'a>>,
     token: tantivy::tokenizer::Token,
     /// Buffered subtokens to emit at the same position as the parent token
-    subtoken_buffer: VecDeque<String>,
+    subtoken_buffer: VecDeque<&'a str>,
     /// The position value to use for buffered subtokens
     subtoken_position: usize,
 }
 
+/// Whether a token has a snake_case or camelCase boundary in it at all.
+///
+/// Most tokens have neither, and this runs on every token of every indexed file, so it
+/// answers that from the bytes alone rather than allocating anything to find out.
+fn has_subtokens(text: &str) -> bool {
+    let mut previous: Option<char> = None;
+
+    for c in text.chars() {
+        if c == '_' {
+            return true;
+        }
+        if let Some(p) = previous {
+            if p.is_lowercase() && c.is_uppercase() {
+                return true;
+            }
+        }
+        previous = Some(c);
+    }
+
+    false
+}
+
 /// Split a token into subtokens at camelCase and snake_case boundaries.
 /// Returns subtokens only if there are 2+ parts; returns empty vec for simple tokens.
-fn split_subtokens(text: &str) -> Vec<String> {
+///
+/// The parts are slices of the token itself, so splitting a token allocates nothing
+/// beyond the list holding them.
+fn split_subtokens(text: &str) -> Vec<&str> {
+    if !has_subtokens(text) {
+        return Vec::new();
+    }
+
     let mut parts = Vec::new();
 
     // First handle snake_case: split on underscores
-    let segments: Vec<&str> = text.split('_').filter(|s| !s.is_empty()).collect();
-
-    // If there were underscores and multiple segments, process each for camelCase too
-    for segment in &segments {
+    for segment in text.split('_').filter(|s| !s.is_empty()) {
         // Split on camelCase boundaries within each segment
-        let chars: Vec<char> = segment.chars().collect();
         let mut part_start = 0;
+        let mut previous: Option<char> = None;
 
-        for i in 1..chars.len() {
+        for (offset, c) in segment.char_indices() {
             // camelCase boundary: lowercase followed by uppercase
-            if chars[i - 1].is_lowercase() && chars[i].is_uppercase() {
-                let part: String = chars[part_start..i].iter().collect();
-                if !part.is_empty() {
-                    parts.push(part);
+            if let Some(p) = previous {
+                if p.is_lowercase() && c.is_uppercase() && offset > part_start {
+                    parts.push(&segment[part_start..offset]);
+                    part_start = offset;
                 }
-                part_start = i;
             }
+            previous = Some(c);
         }
+
         // Push the remaining part
-        let part: String = chars[part_start..].iter().collect();
-        if !part.is_empty() {
-            parts.push(part);
+        if part_start < segment.len() {
+            parts.push(&segment[part_start..]);
         }
     }
 
@@ -163,65 +189,74 @@ impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
         // First, check if we have buffered subtokens to emit
         if let Some(subtoken) = self.subtoken_buffer.pop_front() {
             self.token.text.clear();
-            self.token.text.push_str(&subtoken);
+            self.token.text.push_str(subtoken);
             // Keep the same position as the parent token
             self.token.position = self.subtoken_position;
             return true;
         }
 
-        self.token.text.clear();
-        self.token.position = self.token.position.wrapping_add(1);
+        let text = self.text;
 
-        // Skip whitespace
-        while let Some(&(_, c)) = self.chars.peek() {
-            if !c.is_whitespace() {
-                break;
-            }
-            self.chars.next();
-        }
+        // Leading punctuation is skipped by going round again rather than by recursing:
+        // a banner line of `====` used to recurse once per character.
+        loop {
+            self.token.text.clear();
+            self.token.position = self.token.position.wrapping_add(1);
 
-        let start = match self.chars.peek() {
-            Some(&(pos, _)) => pos,
-            None => return false,
-        };
-
-        // Collect token: alphanumeric + code chars ($, @, #, _, -)
-        let mut end = start;
-        while let Some(&(pos, c)) = self.chars.peek() {
-            if c.is_alphanumeric() || c == '_' || c == '$' || c == '@' || c == '#' || c == '-' {
-                end = pos + c.len_utf8();
-                self.chars.next();
-            } else if c.is_whitespace() {
-                break;
-            } else {
-                // Other punctuation - emit as separate token or skip
-                self.chars.next();
-                if start == pos {
-                    // Started with punctuation, skip and try again
-                    return self.advance();
+            // Skip whitespace
+            while let Some(&(_, c)) = self.chars.peek() {
+                if !c.is_whitespace() {
+                    break;
                 }
-                break;
+                self.chars.next();
             }
-        }
 
-        if end > start {
+            let start = match self.chars.peek() {
+                Some(&(pos, _)) => pos,
+                None => return false,
+            };
+
+            // Collect token: alphanumeric + code chars ($, @, #, _, -)
+            let mut end = start;
+            let mut punctuation_only = false;
+            while let Some(&(pos, c)) = self.chars.peek() {
+                if c.is_alphanumeric() || c == '_' || c == '$' || c == '@' || c == '#' || c == '-' {
+                    end = pos + c.len_utf8();
+                    self.chars.next();
+                } else if c.is_whitespace() {
+                    break;
+                } else {
+                    // Other punctuation - emit as separate token or skip
+                    self.chars.next();
+                    if start == pos {
+                        // Started with punctuation, skip and try again
+                        punctuation_only = true;
+                    }
+                    break;
+                }
+            }
+
+            if punctuation_only {
+                continue;
+            }
+
+            if end <= start {
+                return false;
+            }
+
             self.token.offset_from = start;
             self.token.offset_to = end;
-            let token_text = &self.text[start..end];
+            let token_text = &text[start..end];
             self.token.text.push_str(token_text);
 
             // Check for camelCase/snake_case subtokens
             let subtokens = split_subtokens(token_text);
             if !subtokens.is_empty() {
                 self.subtoken_position = self.token.position;
-                for sub in subtokens {
-                    self.subtoken_buffer.push_back(sub);
-                }
+                self.subtoken_buffer.extend(subtokens);
             }
 
-            true
-        } else {
-            false
+            return true;
         }
     }
 
@@ -522,6 +557,31 @@ mod tests {
         // Single word should not produce subtokens
         let tokens = tokenize("hello");
         assert_eq!(tokens, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn subtokens_are_slices_of_the_token_they_came_from() {
+        assert_eq!(split_subtokens("sendCampaign"), vec!["send", "Campaign"]);
+        assert_eq!(split_subtokens("send_campaign"), vec!["send", "campaign"]);
+        assert_eq!(
+            split_subtokens("myQueue_sendCampaign"),
+            vec!["my", "Queue", "send", "Campaign"]
+        );
+        assert!(split_subtokens("hello").is_empty());
+        assert!(split_subtokens("HELLO").is_empty());
+        assert!(split_subtokens("trailing_").is_empty());
+        assert!(split_subtokens("").is_empty());
+
+        // Multi-byte characters must not be sliced through.
+        assert_eq!(split_subtokens("crème_brûlée"), vec!["crème", "brûlée"]);
+    }
+
+    #[test]
+    fn a_run_of_punctuation_does_not_recurse() {
+        // A banner line used to recurse once per character before yielding a token.
+        let banner = "=".repeat(20_000);
+        let tokens = tokenize(&format!("{banner} after"));
+        assert_eq!(tokens, vec!["after".to_string()]);
     }
 
     #[test]

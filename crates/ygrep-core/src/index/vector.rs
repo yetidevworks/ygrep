@@ -4,6 +4,7 @@ use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, YgrepError};
@@ -39,6 +40,26 @@ pub struct VectorIndex {
     dimension: usize,
     /// Document IDs (index matches HNSW point ID)
     doc_ids: RwLock<Vec<String>>,
+    /// Where each document ID sits in `doc_ids`.
+    ///
+    /// Deleting used to scan the whole vector: a branch switch that removed five
+    /// thousand files from a two hundred thousand vector index compared a billion
+    /// strings to do it.
+    slots: RwLock<HashMap<String, usize>>,
+}
+
+/// Map document IDs to their position, skipping the blanks left by soft deletes
+fn slot_map(doc_ids: &[String]) -> HashMap<String, usize> {
+    let mut slots = HashMap::with_capacity(doc_ids.len());
+    for (slot, doc_id) in doc_ids.iter().enumerate() {
+        if doc_id.is_empty() {
+            continue;
+        }
+        // The first slot wins, matching the scan this replaced: duplicate content
+        // hashes to one document ID, so the same ID can land in several slots.
+        slots.entry(doc_id.clone()).or_insert(slot);
+    }
+    slots
 }
 
 impl VectorIndex {
@@ -69,6 +90,7 @@ impl VectorIndex {
             hnsw: RwLock::new(hnsw),
             dimension,
             doc_ids: RwLock::new(Vec::new()),
+            slots: RwLock::new(HashMap::new()),
         }
     }
 
@@ -94,6 +116,7 @@ impl VectorIndex {
                 path,
                 hnsw: RwLock::new(hnsw),
                 dimension: doc_index.dimension,
+                slots: RwLock::new(slot_map(&doc_index.doc_ids)),
                 doc_ids: RwLock::new(doc_index.doc_ids),
             });
         }
@@ -121,6 +144,7 @@ impl VectorIndex {
             path,
             hnsw: RwLock::new(hnsw),
             dimension: data.dimension,
+            slots: RwLock::new(slot_map(&doc_ids)),
             doc_ids: RwLock::new(doc_ids),
         })
     }
@@ -149,10 +173,11 @@ impl VectorIndex {
 
         // Store the doc_id
         doc_ids.push(doc_id.to_string());
+        self.slots.write().entry(doc_id.to_string()).or_insert(id);
 
         // Insert into HNSW
         let hnsw = self.hnsw.write();
-        hnsw.insert((&embedding.to_vec(), id));
+        hnsw.insert((embedding, id));
 
         Ok(id as u64)
     }
@@ -234,14 +259,19 @@ impl VectorIndex {
     /// The HNSW point remains but is effectively invisible.
     /// Returns true if the doc_id was found and marked deleted.
     pub fn mark_deleted(&self, doc_id: &str) -> bool {
+        // Always `doc_ids` before `slots`, the order `insert` takes them in.
         let mut doc_ids = self.doc_ids.write();
-        for entry in doc_ids.iter_mut() {
-            if entry == doc_id {
+        let Some(slot) = self.slots.write().remove(doc_id) else {
+            return false;
+        };
+
+        match doc_ids.get_mut(slot) {
+            Some(entry) => {
                 entry.clear();
-                return true;
+                true
             }
+            None => false,
         }
-        false
     }
 
     /// Clear the index
@@ -249,6 +279,7 @@ impl VectorIndex {
         let mut hnsw = self.hnsw.write();
         *hnsw = Hnsw::new(16, 10_000, 16, 200, DistCosine {});
         self.doc_ids.write().clear();
+        self.slots.write().clear();
     }
 }
 
@@ -280,6 +311,31 @@ mod tests {
         // Results should include doc1 and doc3 (most similar to v1)
         let doc_ids: Vec<_> = results.iter().map(|(_, _, id)| id.as_str()).collect();
         assert!(doc_ids.contains(&"doc1"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_entries_disappear_from_search_and_survive_a_reload() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        let index = VectorIndex::new(path.clone(), 4)?;
+        index.insert("doc1", &[1.0, 0.0, 0.0, 0.0])?;
+        index.insert("doc2", &[0.0, 1.0, 0.0, 0.0])?;
+
+        assert!(index.mark_deleted("doc1"));
+        assert!(!index.mark_deleted("doc1"), "a second delete finds nothing");
+        assert!(!index.mark_deleted("missing"));
+
+        let hits = index.search(&[1.0, 0.0, 0.0, 0.0], 2)?;
+        assert!(hits.iter().all(|(_, _, doc_id)| doc_id != "doc1"));
+
+        // A reload rebuilds the slot map, so deleting still works afterwards.
+        index.save()?;
+        let reloaded = VectorIndex::load(path)?;
+        assert!(reloaded.mark_deleted("doc2"));
+        assert!(reloaded.search(&[0.0, 1.0, 0.0, 0.0], 2)?.is_empty());
 
         Ok(())
     }
