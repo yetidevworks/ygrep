@@ -163,8 +163,33 @@ Index is being built for /path/to/project (running 1m 35s).
 Retry the search shortly, or run `ygrep index` to build it in the foreground.
 ```
 
-Searches against an index older than a day print a one-line reminder to stderr. This is
-a timestamp comparison, not a directory scan, so it costs nothing.
+#### Keeping indexes current
+
+Searches refresh the index themselves rather than telling you to. An index older than a
+day gets an incremental pass first, which re-reads only files whose modification time
+changed:
+
+```console
+$ ygrep "some query"
+Index is out of date, refreshing...
+Indexed 3 files in 0.24s (1.95 MB).
+# 6 results (text)
+...
+```
+
+An index left over from an older ygrep is rebuilt outright, since an outdated index
+format can return wrong results rather than merely dated ones:
+
+```console
+$ ygrep "some query"
+Index format changed, rebuilding...
+Indexed 374 files in 0.23s (1.95 MB).
+```
+
+Both respect `--no-auto-index` and `search.auto_index`, and both fall back to a printed
+note when the index directory isn't writable. The one exception is a **semantic** index
+whose format is outdated: rebuilding it re-embeds every file, which takes minutes, so
+ygrep asks rather than blocking your search. Run `ygrep index` when you see that.
 
 #### What gets indexed
 
@@ -222,8 +247,30 @@ Indexes shrink more than the excluded bytes alone would suggest, because minifie
 tokenize badly and inflate the term dictionary and position lists out of proportion to
 their size.
 
-Existing indexes keep working and are rebuilt into the new format on the next
-`ygrep index` run.
+Existing indexes keep working and are rebuilt into the new format the next time you
+search or index.
+
+The doc store compression level is tunable. Higher levels build a smaller index more
+slowly; search speed is unaffected either way, since a query decompresses only the few
+blocks holding its results:
+
+```toml
+[indexer]
+docstore_compression_level = 3   # 1-22 for zstd, or 0 for LZ4
+```
+
+Measured on php-project-2 (3.0k files):
+
+| Level | Index | Doc store | Build |
+|---|---|---|---|
+| 0 (LZ4) | 15.9 MB | 7.6 MB | 0.8s |
+| 3 (default) | 13.3 MB | 5.0 MB | 0.8s |
+| 9 | 12.6 MB | 4.3 MB | 0.7s |
+| 19 | 12.7 MB | 4.0 MB | 3.1s |
+
+Level 9 is worth trying on a large workspace: at this size it costs no measurable build
+time. Level 19 compresses the doc store further but takes roughly four times as long to
+build, and the rest of the index doesn't shrink to match.
 
 The `--semantic` and `--text` flags are **sticky** - once set, subsequent `ygrep index` commands (without flags) will remember and use the same mode. This also applies to `ygrep watch`.
 

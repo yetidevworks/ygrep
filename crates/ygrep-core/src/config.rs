@@ -50,6 +50,11 @@ pub struct IndexerConfig {
     /// Catches bundled JS, minified CSS, and compact data blobs that no one searches.
     pub max_avg_line_length: usize,
 
+    /// zstd level for the index doc store (1-22, or 0 for LZ4).
+    /// Higher levels build a smaller index more slowly; search speed is unaffected.
+    /// Takes effect when an index is next built with `--rebuild`.
+    pub docstore_compression_level: i32,
+
     /// Follow symlinks
     pub follow_symlinks: bool,
 
@@ -144,6 +149,7 @@ impl Default for IndexerConfig {
             max_file_size: 10 * 1024 * 1024, // 10MB
             include_extensions: vec![],
             max_avg_line_length: 400,
+            docstore_compression_level: crate::index::schema::DEFAULT_DOCSTORE_COMPRESSION_LEVEL,
             ignore_patterns: vec![
                 // Package managers & dependencies
                 "**/node_modules/**".into(),

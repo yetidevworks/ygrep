@@ -202,7 +202,11 @@ impl Workspace {
                         // Remove corrupted index and create fresh
                         std::fs::remove_dir_all(&index_path)?;
                         std::fs::create_dir_all(&index_path)?;
-                        create_index(&index_path, schema)?
+                        create_index(
+                            &index_path,
+                            schema,
+                            config.indexer.docstore_compression_level,
+                        )?
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -216,7 +220,11 @@ impl Workspace {
         } else {
             // Create directory only when explicitly creating the index
             std::fs::create_dir_all(&index_path)?;
-            create_index(&index_path, schema)?
+            create_index(
+                &index_path,
+                schema,
+                config.indexer.docstore_compression_level,
+            )?
         };
 
         // Register our custom code tokenizer
@@ -1150,10 +1158,14 @@ pub struct IndexStats {
 ///
 /// Always go through here rather than `Index::create_in_dir`, so every index ygrep
 /// writes gets the same compression settings.
-fn create_index(index_path: &Path, schema: tantivy::schema::Schema) -> Result<Index> {
+fn create_index(
+    index_path: &Path,
+    schema: tantivy::schema::Schema,
+    compression_level: i32,
+) -> Result<Index> {
     Ok(Index::builder()
         .schema(schema)
-        .settings(index::index_settings())
+        .settings(index::index_settings(compression_level))
         .create_in_dir(index_path)?)
 }
 

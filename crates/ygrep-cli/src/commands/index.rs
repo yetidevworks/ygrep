@@ -82,9 +82,34 @@ pub fn run(
     semantic_flag: bool,
     text_flag: bool,
 ) -> Result<()> {
+    run_with_verbosity(workspace_path, rebuild, semantic_flag, text_flag, false)
+}
+
+/// Index a workspace, reporting a single summary line instead of the full breakdown.
+///
+/// Used when indexing happens implicitly behind a search: the caller asked for search
+/// results, so a screen of indexing statistics buries what they actually wanted.
+pub fn run_quiet(
+    workspace_path: &Path,
+    rebuild: bool,
+    semantic_flag: bool,
+    text_flag: bool,
+) -> Result<()> {
+    run_with_verbosity(workspace_path, rebuild, semantic_flag, text_flag, true)
+}
+
+fn run_with_verbosity(
+    workspace_path: &Path,
+    rebuild: bool,
+    semantic_flag: bool,
+    text_flag: bool,
+    quiet: bool,
+) -> Result<()> {
     let start = Instant::now();
 
-    eprintln!("Indexing {}...", workspace_path.display());
+    if !quiet {
+        eprintln!("Indexing {}...", workspace_path.display());
+    }
 
     // Open workspace first to read stored flags (before potential rebuild)
     // Use create() here since we may need to create the index
@@ -111,7 +136,9 @@ pub fn run(
     let do_rebuild = rebuild || needs_schema_rebuild;
 
     if do_rebuild {
-        if needs_schema_rebuild && !rebuild {
+        if quiet {
+            // Caller already explained why we're indexing.
+        } else if needs_schema_rebuild && !rebuild {
             eprintln!("Schema version changed, rebuilding index...");
         } else {
             eprintln!("Rebuilding index from scratch...");
@@ -122,7 +149,9 @@ pub fn run(
             drop(workspace); // Release the workspace before deleting
             if index_path.exists() {
                 std::fs::remove_dir_all(&index_path).context("Failed to remove existing index")?;
-                eprintln!("  Cleared old index at {}", index_path.display());
+                if !quiet {
+                    eprintln!("  Cleared old index at {}", index_path.display());
+                }
             }
         }
     }
@@ -141,7 +170,9 @@ pub fn run(
     };
 
     // Show what mode we're using
-    if with_embeddings {
+    if quiet {
+        // Summarised in one line at the end.
+    } else if with_embeddings {
         if semantic_flag {
             eprintln!("(building semantic index - this may take a while)");
         } else {
@@ -152,7 +183,15 @@ pub fn run(
     }
 
     // Create or open workspace for indexing
-    let workspace = Workspace::create(workspace_path).context("Failed to create workspace")?;
+    let mut workspace = Workspace::create(workspace_path).context("Failed to create workspace")?;
+
+    // In quiet mode, route the indexer's own progress output into a dropped channel so
+    // it never reaches the terminal. Sends to a closed channel are already ignored.
+    if quiet {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        workspace.set_log_tx(tx);
+    }
 
     // Mark the build as in flight so a concurrent search can report progress instead of
     // "not indexed". Dropped on every exit path, including errors.
@@ -165,7 +204,9 @@ pub fn run(
     let use_incremental = !do_rebuild && workspace.is_indexed();
 
     let stats = if use_incremental {
-        eprintln!("(incremental update)");
+        if !quiet {
+            eprintln!("(incremental update)");
+        }
         workspace
             .index_incremental_with_options(with_embeddings)
             .context("Failed to incrementally index workspace")?
@@ -179,6 +220,16 @@ pub fn run(
     let index_size = dir_size(workspace.index_path());
 
     let index_type = if with_embeddings { "semantic" } else { "text" };
+
+    if quiet {
+        eprintln!(
+            "Indexed {} files in {:.2}s ({}).",
+            stats.indexed,
+            elapsed.as_secs_f64(),
+            format_size(index_size)
+        );
+        return Ok(());
+    }
 
     eprintln!();
     eprintln!("Indexing complete in {:.2}s", elapsed.as_secs_f64());

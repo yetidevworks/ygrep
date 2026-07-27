@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use ygrep_core::index::SCHEMA_VERSION;
 use ygrep_core::{Config, Workspace, YgrepError};
 
 use crate::commands::progress;
@@ -38,11 +39,7 @@ pub fn run(
         }
     };
 
-    if let Ok(index_path) = Workspace::resolve_index_path(workspace_path, &Config::load()) {
-        if let Some(note) = progress::staleness_note(&index_path) {
-            eprintln!("{}", note);
-        }
-    }
+    let workspace = refresh_if_needed(workspace, workspace_path, no_auto_index)?;
 
     search_with(
         workspace,
@@ -58,6 +55,72 @@ pub fn run(
         format,
         verbose,
     )
+}
+
+/// Bring an existing index up to date before searching it.
+///
+/// An index in an outdated format can return wrong results rather than merely dated
+/// ones, so telling the user about it and searching anyway is the worst of both worlds:
+/// they get an answer that looks authoritative and isn't. Refresh, then search.
+///
+/// Falls back to reporting the problem when a rebuild isn't possible or is disabled,
+/// so a read-only index directory still searches rather than failing.
+fn refresh_if_needed(
+    workspace: Workspace,
+    workspace_path: &Path,
+    no_auto_index: bool,
+) -> Result<Workspace> {
+    let config = Config::load();
+    let index_path = workspace.index_path().to_path_buf();
+
+    let schema_outdated = workspace
+        .stored_schema_version()
+        .map(|v| v != SCHEMA_VERSION)
+        .unwrap_or(true);
+    let stale_note = progress::staleness_note(&index_path);
+
+    if !schema_outdated && stale_note.is_none() {
+        return Ok(workspace);
+    }
+
+    let mut may_rebuild =
+        !no_auto_index && config.search.auto_index && progress::index_dir_writable(&index_path);
+
+    // A schema rebuild of a semantic index re-embeds every file, which takes minutes.
+    // That is too long to spend implicitly behind a search, so ask instead. Incremental
+    // refreshes stay automatic: they only embed the files that actually changed.
+    if schema_outdated && workspace.stored_semantic_flag() == Some(true) {
+        may_rebuild = false;
+    }
+
+    if !may_rebuild {
+        // Can't fix it, so at least say what's wrong.
+        if schema_outdated {
+            eprintln!(
+                "note: index was built by an older ygrep and may return wrong results, \
+                 run `ygrep index` to rebuild it"
+            );
+        } else if let Some(note) = stale_note {
+            eprintln!("{}", note);
+        }
+        return Ok(workspace);
+    }
+
+    if schema_outdated {
+        eprintln!("Index format changed, rebuilding...");
+    } else {
+        eprintln!("Index is out of date, refreshing...");
+    }
+
+    // Release the index before reindexing so the writer isn't blocked by our reader.
+    drop(workspace);
+
+    // A schema change needs a full rebuild; staleness only needs an incremental pass,
+    // which skips every file whose mtime is unchanged.
+    super::index::run_quiet(workspace_path, schema_outdated, false, false)
+        .context("Refreshing the index failed")?;
+
+    Workspace::open_readonly(workspace_path).context("Index refreshed but could not be reopened")
 }
 
 /// Handle a search against a workspace with no index yet.
@@ -108,7 +171,7 @@ fn open_after_auto_index(workspace_path: &Path, no_auto_index: bool) -> Result<W
 
     // Text-only: a semantic build downloads a model and takes minutes, which is far too
     // much to do implicitly behind someone's search.
-    super::index::run(workspace_path, false, false, true).context("Auto-indexing failed")?;
+    super::index::run_quiet(workspace_path, false, false, true).context("Auto-indexing failed")?;
 
     Workspace::open_readonly(workspace_path).context("Index built but could not be opened")
 }

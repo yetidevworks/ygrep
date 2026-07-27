@@ -7,6 +7,13 @@ use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerMa
 /// Schema version - increment when schema changes require reindexing
 pub const SCHEMA_VERSION: u32 = 6;
 
+/// Default zstd level for the doc store
+pub const DEFAULT_DOCSTORE_COMPRESSION_LEVEL: i32 = 3;
+
+/// Lowest and highest zstd levels tantivy will accept
+pub const MIN_DOCSTORE_COMPRESSION_LEVEL: i32 = 1;
+pub const MAX_DOCSTORE_COMPRESSION_LEVEL: i32 = 22;
+
 /// Index settings applied when creating a new index.
 ///
 /// Tantivy defaults the doc store to LZ4. Stored file content is about half of a ygrep
@@ -16,16 +23,51 @@ pub const SCHEMA_VERSION: u32 = 6;
 ///
 /// The larger block size buys a further few percent: blocks compress better with more
 /// context, and a block is cheap to decompress relative to the rest of a query.
-pub fn index_settings() -> tantivy::IndexSettings {
+///
+/// `compression_level` selects the zstd level. Levels above the default trade indexing
+/// speed for a smaller index; the stored bytes decompress the same either way, so the
+/// level only affects how long a build takes, never how fast a search runs.
+/// A level of 0 selects LZ4 instead, for the fastest possible indexing.
+pub fn index_settings(compression_level: i32) -> tantivy::IndexSettings {
     use tantivy::store::{Compressor, ZstdCompressor};
 
+    let docstore_compression = if compression_level == 0 {
+        Compressor::Lz4
+    } else {
+        Compressor::Zstd(ZstdCompressor {
+            compression_level: Some(clamp_compression_level(compression_level)),
+        })
+    };
+
     tantivy::IndexSettings {
-        docstore_compression: Compressor::Zstd(ZstdCompressor {
-            compression_level: Some(3),
-        }),
+        docstore_compression,
         docstore_blocksize: 65_536,
         ..Default::default()
     }
+}
+
+/// Hold the configured level inside the range tantivy accepts.
+///
+/// Out-of-range values come from hand-edited config, so warn rather than fail: an
+/// unusable index is a worse outcome than a slightly different compression level.
+fn clamp_compression_level(level: i32) -> i32 {
+    if level < MIN_DOCSTORE_COMPRESSION_LEVEL || level > MAX_DOCSTORE_COMPRESSION_LEVEL {
+        tracing::warn!(
+            "docstore_compression_level {} is out of range ({}-{}), using {}",
+            level,
+            MIN_DOCSTORE_COMPRESSION_LEVEL,
+            MAX_DOCSTORE_COMPRESSION_LEVEL,
+            level.clamp(
+                MIN_DOCSTORE_COMPRESSION_LEVEL,
+                MAX_DOCSTORE_COMPRESSION_LEVEL
+            )
+        );
+    }
+
+    level.clamp(
+        MIN_DOCSTORE_COMPRESSION_LEVEL,
+        MAX_DOCSTORE_COMPRESSION_LEVEL,
+    )
 }
 
 /// Name of our custom code tokenizer
@@ -319,7 +361,7 @@ mod tests {
     fn index_settings_use_zstd_for_the_doc_store() {
         use tantivy::store::Compressor;
 
-        let settings = index_settings();
+        let settings = index_settings(DEFAULT_DOCSTORE_COMPRESSION_LEVEL);
 
         assert!(
             matches!(settings.docstore_compression, Compressor::Zstd(_)),
@@ -330,6 +372,53 @@ mod tests {
     }
 
     #[test]
+    fn compression_level_is_configurable() {
+        use tantivy::store::{Compressor, ZstdCompressor};
+
+        let settings = index_settings(9);
+
+        assert!(matches!(
+            settings.docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(9)
+            })
+        ));
+    }
+
+    #[test]
+    fn compression_level_zero_selects_lz4() {
+        use tantivy::store::Compressor;
+
+        let settings = index_settings(0);
+
+        assert!(
+            matches!(settings.docstore_compression, Compressor::Lz4),
+            "level 0 must fall back to lz4, got {:?}",
+            settings.docstore_compression
+        );
+    }
+
+    #[test]
+    fn out_of_range_compression_levels_are_clamped() {
+        use tantivy::store::{Compressor, ZstdCompressor};
+
+        // Negative levels are valid zstd but tantivy rejects them, so clamp up.
+        assert!(matches!(
+            index_settings(-5).docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(MIN_DOCSTORE_COMPRESSION_LEVEL)
+            })
+        ));
+
+        assert!(matches!(
+            index_settings(99).docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(MAX_DOCSTORE_COMPRESSION_LEVEL)
+            })
+        ));
+    }
+
+    #[test]
     fn a_created_index_carries_the_doc_store_settings() {
         use tantivy::store::Compressor;
         use tempfile::tempdir;
@@ -337,7 +426,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let index = tantivy::Index::builder()
             .schema(build_document_schema())
-            .settings(index_settings())
+            .settings(index_settings(DEFAULT_DOCSTORE_COMPRESSION_LEVEL))
             .create_in_dir(dir.path())
             .unwrap();
 
