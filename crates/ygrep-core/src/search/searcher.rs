@@ -18,12 +18,13 @@ use crate::index::schema::{SchemaFields, CODE_TOKENIZER};
 /// The literal filter runs on the stored text, so a query whose best-scoring documents
 /// don't contain the literal needs a deeper pool to fill the page. Starting small keeps
 /// the common case — where the first handful of candidates already match — cheap, and
-/// the second pass only runs when the first came up short. Its ceiling is above what a
-/// single fixed pass used to fetch, so nothing that used to be found gets lost.
-const LITERAL_FETCH_MULTIPLIERS: [usize; 2] = [5, 100];
+/// each further step only runs when the last one came up short. A step re-ranks the
+/// candidates the previous one already examined but only reads the documents past them,
+/// so the deepest pass costs what a single fixed pass of the same depth would have.
+const LITERAL_FETCH_MULTIPLIERS: [usize; 2] = [5, 50];
 
 /// Same idea for regex searches, which reject candidates more often.
-const REGEX_FETCH_MULTIPLIERS: [usize; 2] = [10, 200];
+const REGEX_FETCH_MULTIPLIERS: [usize; 2] = [10, 100];
 
 /// Documents below this count are scanned on the calling thread.
 const MIN_PARALLEL_SCAN_DOCS: u64 = 4_096;
@@ -113,9 +114,17 @@ impl Searcher {
         let query_normalized: &str = if case_sensitive { query } else { &query_lower };
         let query_terms: Vec<&str> = query_normalized.split_whitespace().collect();
         let lowered_terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        // A document is rejected as soon as one word of the query is missing from it,
+        // so the word least likely to be there is worth testing first. Length is the
+        // proxy: "collection" rules out far more documents than "page" does.
+        let mut rarest_first = query_terms.clone();
+        rarest_first.sort_by_key(|term| std::cmp::Reverse(term.len()));
+
         let matcher = LiteralMatcher {
             normalized: query_normalized,
             terms: &query_terms,
+            rarest_first: &rarest_first,
             is_multi_word: query_terms.len() > 1,
             case_sensitive,
             lowered: &query_lower,
@@ -143,21 +152,26 @@ impl Searcher {
             let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
             let tantivy_query = self.with_filters(parsed, filters);
 
-            let mut hits = Vec::new();
-            let mut fetched = 0usize;
+            let mut hits = Vec::with_capacity(limit);
+            let mut seen: HashSet<HitKey> = HashSet::new();
+            let mut examined = 0usize;
+            let mut max_score = 1.0f32;
+
             for multiplier in LITERAL_FETCH_MULTIPLIERS {
                 let fetch_limit = limit.saturating_mul(multiplier);
-                if fetch_limit <= fetched {
+                if fetch_limit <= examined {
                     break;
                 }
                 let top_docs =
                     searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
                 let candidates = top_docs.len();
-                let max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
+                if examined == 0 {
+                    max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
+                }
 
-                hits = Vec::with_capacity(limit);
-                let mut seen: HashSet<HitKey> = HashSet::new();
-                for (score, doc_address) in top_docs {
+                // TopDocs ranks by score and then by address, so a deeper fetch returns
+                // the previous one as its prefix: only the documents past it are new.
+                for (score, doc_address) in top_docs.into_iter().skip(examined) {
                     if hits.len() >= limit {
                         break;
                     }
@@ -179,7 +193,7 @@ impl Searcher {
                 if hits.len() >= limit || candidates < fetch_limit {
                     break;
                 }
-                fetched = fetch_limit;
+                examined = candidates;
             }
             hits
         };
@@ -351,21 +365,24 @@ impl Searcher {
             let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
             let tantivy_query = self.with_filters(parsed, filters);
 
-            let mut hits = Vec::new();
-            let mut fetched = 0usize;
+            let mut hits = Vec::with_capacity(limit);
+            let mut seen: HashSet<HitKey> = HashSet::new();
+            let mut examined = 0usize;
+            let mut max_score = 1.0f32;
+
             for multiplier in REGEX_FETCH_MULTIPLIERS {
                 let fetch_limit = limit.saturating_mul(multiplier);
-                if fetch_limit <= fetched {
+                if fetch_limit <= examined {
                     break;
                 }
                 let candidates =
                     searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
                 let candidate_count = candidates.len();
-                let max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
+                if examined == 0 {
+                    max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
+                }
 
-                hits = Vec::with_capacity(limit);
-                let mut seen: HashSet<HitKey> = HashSet::new();
-                for (score, doc_address) in candidates {
+                for (score, doc_address) in candidates.into_iter().skip(examined) {
                     if hits.len() >= limit {
                         break;
                     }
@@ -387,7 +404,7 @@ impl Searcher {
                 if hits.len() >= limit || candidate_count < fetch_limit {
                     break;
                 }
-                fetched = fetch_limit;
+                examined = candidate_count;
             }
             hits
         };
@@ -620,14 +637,20 @@ impl Searcher {
                 .iter()
                 .all(|term| matcher.contains(path, term));
 
-        // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word queries
-        let exact_match = matcher.contains(content, matcher.normalized);
-        let and_match = matcher.is_multi_word
-            && matcher
-                .terms
+        // LITERAL GREP-LIKE FILTER: exact phrase match, or AND match for multi-word
+        // queries. A document holding the phrase holds every word of it, so the words
+        // are all a multi-word query has to test — and testing them first rejects a
+        // document that is missing one after a single scan, instead of scanning it
+        // once for the phrase and again for each word.
+        let is_content_match = if matcher.is_multi_word {
+            matcher
+                .rarest_first
                 .iter()
-                .all(|term| matcher.contains(content, term));
-        if !exact_match && !and_match && !path_match {
+                .all(|term| matcher.contains(content, term))
+        } else {
+            matcher.contains(content, matcher.normalized)
+        };
+        if !is_content_match && !path_match {
             return None;
         }
 
@@ -639,8 +662,6 @@ impl Searcher {
         };
 
         // For path-only matches (no content match), show beginning of file
-        let is_content_match = exact_match || and_match;
-
         let (snippet, snippet_offset, snippet_line_count, match_line_offset) = if is_content_match {
             create_relevant_snippet(content, matcher, 10, context_before, context_after)
         } else {
@@ -757,6 +778,8 @@ struct LiteralMatcher<'a> {
     normalized: &'a str,
     /// Words of `normalized`
     terms: &'a [&'a str],
+    /// The same words, longest first, for the test that rejects a document
+    rarest_first: &'a [&'a str],
     is_multi_word: bool,
     case_sensitive: bool,
     /// Lowercased query, used for picking the snippet line, which stays
@@ -1573,6 +1596,67 @@ mod tests {
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "src/main.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_multi_word_query_finds_every_match_behind_a_crowd_of_decoys() -> Result<()> {
+        // Candidates are fetched in steps and a deeper step re-ranks the documents the
+        // last one already read, skipping straight to what is new. Every real match has
+        // to come back exactly once even when it sits far down the ranking, and a
+        // document holding both words apart counts as a match just as the phrase does.
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+
+        // Documents with one word only, scoring high on it and never matching.
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                800,
+                "decoy",
+                |i| format!("src/decoy_{i}.rs"),
+                "memory memory memory memory memory",
+                "rs",
+            ),
+        );
+        // Real matches: the phrase, and the same words far apart.
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                30,
+                "phrase",
+                |i| format!("src/phrase_{i}.rs"),
+                "a note about memory allocation here",
+                "rs",
+            ),
+        );
+        add_docs(
+            &index,
+            &fields,
+            &batch(
+                30,
+                "apart",
+                |i| format!("src/apart_{i}.rs"),
+                "memory is reserved early; the allocation happens later",
+                "rs",
+            ),
+        );
+
+        let config = SearchConfig::default();
+        let searcher = Searcher::new(config, index);
+        let result = searcher.search("memory allocation", Some(100), false, None, None)?;
+
+        assert_eq!(result.hits.len(), 60, "every match must be returned");
+        let unique: HashSet<&str> = result.hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(unique.len(), 60, "no document may be returned twice");
+        assert!(result.hits.iter().all(|h| !h.path.contains("decoy")));
+
+        // A page smaller than the number of matches is filled from the first step.
+        let result = searcher.search("memory allocation", Some(20), false, None, None)?;
+        assert_eq!(result.hits.len(), 20);
 
         Ok(())
     }
