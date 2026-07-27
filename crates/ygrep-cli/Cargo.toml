@@ -50,6 +50,10 @@ ureq = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
 walkdir = { workspace = true }
+fs2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

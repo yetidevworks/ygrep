@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod commands;
 mod output;
+mod service;
 
 #[derive(Parser)]
 #[command(name = "ygrep")]
@@ -172,6 +173,10 @@ pub enum Commands {
     #[command(subcommand)]
     Indexes(IndexesCommand),
 
+    /// Manage the background service that watches indexes on login
+    #[command(subcommand)]
+    Service(ServiceCommand),
+
     /// Interactive dashboard for managing all indexes and watchers
     Dashboard,
 
@@ -218,6 +223,38 @@ pub enum IndexesCommand {
         identifier: Option<String>,
         /// Turn watching on or off
         state: Option<WatchFlag>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ServiceCommand {
+    /// Install the service and start it (launchd on macOS, systemd user unit on Linux)
+    #[command(long_about = "Install the background watch service and start it.\n\n\
+The service runs `ygrep service run` at login and watches every index whose watch flag\n\
+is on (`ygrep indexes watch <hash|path> on`).\n\n\
+Re-run `ygrep service install` after the ygrep binary moves — a `cargo install`, a\n\
+package upgrade — to rewrite the service definition with the new path and restart.")]
+    Install,
+    /// Stop the service and remove it
+    Uninstall,
+    /// Start the installed service
+    Start,
+    /// Stop the running service
+    Stop,
+    /// Restart the service, re-reading its definition
+    Restart,
+    /// Show whether the service is installed, running, and what it watches
+    Status,
+    /// Run the watcher in the foreground (used by the service)
+    Run,
+    /// Print the tail of the service log
+    Log {
+        /// How many lines to print
+        #[arg(long, default_value = "50")]
+        lines: usize,
+        /// Keep printing new lines as they arrive
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
 }
 
@@ -384,6 +421,16 @@ fn main() -> Result<()> {
                 };
                 commands::indexes::watch(identifier.as_deref(), state == WatchFlag::On)?
             }
+        },
+        Some(Commands::Service(cmd)) => match cmd {
+            ServiceCommand::Install => commands::service::install()?,
+            ServiceCommand::Uninstall => commands::service::uninstall()?,
+            ServiceCommand::Start => commands::service::start()?,
+            ServiceCommand::Stop => commands::service::stop()?,
+            ServiceCommand::Restart => commands::service::restart()?,
+            ServiceCommand::Status => commands::service::status(format)?,
+            ServiceCommand::Run => commands::service::run()?,
+            ServiceCommand::Log { lines, follow } => commands::service::log(lines, follow)?,
         },
         Some(Commands::Dashboard) => {
             commands::dashboard::run()?;

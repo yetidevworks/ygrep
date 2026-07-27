@@ -186,6 +186,16 @@ pub fn watch(identifier: Option<&str>, enabled: bool) -> Result<()> {
 
     if enabled && info.orphaned {
         println!("Note: this workspace no longer exists on disk, so nothing will be watched.");
+        return Ok(());
+    }
+
+    // The service has no socket — it re-reads the registry on a timer, so say when the
+    // change actually lands rather than leaving it looking like nothing happened.
+    if crate::service::is_running() {
+        let rescan = ygrep_core::Config::load().service.registry_rescan_secs;
+        println!("The background service picks this up within {}s.", rescan);
+    } else if enabled {
+        println!("Start the background service to watch it on login: `ygrep service install`.");
     }
 
     Ok(())
