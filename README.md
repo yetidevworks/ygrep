@@ -230,15 +230,18 @@ Largest files:
 
 Indexes are roughly half the size they were in 3.3.x. Two changes account for it:
 generated assets are no longer indexed, and the doc store is compressed with zstd
-instead of LZ4. Measured on real projects:
+instead of LZ4.
 
-| Project | 3.3.x | 3.4.0 | Change |
+Measured by building each index with both releases and compacting to a single segment,
+so segment count doesn't skew the comparison:
+
+| Project | 3.3.2 | 3.4.0 | Change |
 |---|---|---|---|
-| php-project-1 (5.1k files) | 38.0 MB | 23.2 MB | **-39%** |
-| php-project-2 (3.0k files) | 28.0 MB | 13.3 MB | **-53%** |
-| php-project-3 (1.1k files) | 6.7 MB | 3.8 MB | **-43%** |
-| swift-project-1 (374 files) | 3.1 MB | 2.0 MB | **-37%** |
-| rust-project-1 (90 files) | 968 KB | 747 KB | **-23%** |
+| php-project-1 (5.1k files) | 36.9 MB | 21.5 MB | **-42%** |
+| php-project-2 (3.0k files) | 24.0 MB | 12.0 MB | **-50%** |
+| php-project-3 (1.1k files) | 6.5 MB | 3.5 MB | **-46%** |
+| swift-project-1 (374 files) | 3.0 MB | 1.8 MB | **-41%** |
+| rust-project-1 (90 files) | 869 KB | 675 KB | **-22%** |
 
 Projects with generated assets checked in gain the most. A pure source tree like
 rust-project-1 gains only from compression, since nothing was being wrongly indexed.
@@ -256,21 +259,26 @@ blocks holding its results:
 
 ```toml
 [indexer]
-docstore_compression_level = 3   # 1-22 for zstd, or 0 for LZ4
+docstore_compression_level = 6   # 1-22 for zstd, or 0 for LZ4
 ```
 
-Measured on php-project-2 (3.0k files):
+Measured on php-project-1 (5.1k files), compacted to one segment:
 
 | Level | Index | Doc store | Build |
 |---|---|---|---|
-| 0 (LZ4) | 15.9 MB | 7.6 MB | 0.8s |
-| 3 (default) | 13.3 MB | 5.0 MB | 0.8s |
-| 9 | 12.6 MB | 4.3 MB | 0.7s |
-| 19 | 12.7 MB | 4.0 MB | 3.1s |
+| 0 (LZ4) | 26.6 MB | 13.5 MB | 1.18s |
+| 3 | 22.3 MB | 9.1 MB | 1.12s |
+| **6 (default)** | **21.5 MB** | **8.4 MB** | **1.14s** |
+| 9 | 21.3 MB | 8.2 MB | 1.16s |
+| 12 | 21.3 MB | 8.1 MB | 1.36s |
 
-Level 9 is worth trying on a large workspace: at this size it costs no measurable build
-time. Level 19 compresses the doc store further but takes roughly four times as long to
-build, and the rest of the index doesn't shrink to match.
+Level 6 is the knee of the curve: three quarters of the available size gain for a build
+cost inside measurement noise. Past it the returns collapse, with 12 costing 20% more
+build time for a further 1%.
+
+Search latency is flat across every level (26-27 ms on this workspace, dominated by
+process startup), because a query decompresses only the blocks holding its results
+rather than streaming the store.
 
 The `--semantic` and `--text` flags are **sticky** - once set, subsequent `ygrep index` commands (without flags) will remember and use the same mode. This also applies to `ygrep watch`.
 

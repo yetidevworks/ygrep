@@ -7,8 +7,14 @@ use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerMa
 /// Schema version - increment when schema changes require reindexing
 pub const SCHEMA_VERSION: u32 = 6;
 
-/// Default zstd level for the doc store
-pub const DEFAULT_DOCSTORE_COMPRESSION_LEVEL: i32 = 3;
+/// Default zstd level for the doc store.
+///
+/// Measured on a 5.1k-file workspace, compacted to one segment so segment count doesn't
+/// skew the comparison: level 3 gives a 22.27 MB index, 6 gives 21.49 MB, 9 gives
+/// 21.31 MB, and 12 gives 21.25 MB. Build times were 1.12s, 1.14s, 1.16s and 1.36s.
+/// Level 6 is the knee: it takes three quarters of the available size gain for a build
+/// cost inside measurement noise, while 12 costs 20% more time for a further 1%.
+pub const DEFAULT_DOCSTORE_COMPRESSION_LEVEL: i32 = 6;
 
 /// Lowest and highest zstd levels tantivy will accept
 pub const MIN_DOCSTORE_COMPRESSION_LEVEL: i32 = 1;
