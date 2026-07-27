@@ -475,6 +475,7 @@ impl App {
 
         let known: HashSet<String> = self.rows.iter().map(|row| row.hash.clone()).collect();
         let mut fresh = Vec::with_capacity(indexes.len());
+        let mut handed_over: Vec<(String, String)> = Vec::new();
         for info in indexes {
             let is_new = !known.contains(&info.hash);
             let mut row = IndexRow::from_info(info);
@@ -491,8 +492,25 @@ impl App {
                     indexed_at: row.indexed_at,
                     watch: row.watch && !self.watched_by_service(&row.hash),
                 }));
+            } else if row.state != WatchState::Off && self.watched_by_service(&row.hash) {
+                // The service started, or picked up a flag, while this session was
+                // already watching. Hand the index over rather than leaving two
+                // watchers fighting over one writer.
+                handed_over.push((row.hash.clone(), row.name()));
             }
             fresh.push(row);
+        }
+
+        for (hash, name) in handed_over {
+            self.send(ManagerCommand::SetWatch {
+                hash,
+                enabled: false,
+            });
+            self.push(
+                ActivityKind::State,
+                name,
+                "handed the watch to the service".to_string(),
+            );
         }
 
         // The old view indexes into the rows that were just replaced, so it goes first.
@@ -651,6 +669,14 @@ impl App {
                 self.resume_after_op(&hash);
                 self.last_refresh = Instant::now() - REGISTRY_REFRESH;
             }
+            ManagerEvent::ReindexFailed { hash, message } => {
+                let name = self.name_of(&hash);
+                self.busy = self.busy.saturating_sub(1);
+                self.push(ActivityKind::Error, name.clone(), message.clone());
+                self.act(&format!("re-index {name}"), Err(message));
+                // The watcher this re-index paused comes back whether or not it worked.
+                self.resume_after_op(&hash);
+            }
             ManagerEvent::IndexRemoved { hash } => {
                 self.rows.retain(|row| row.hash != hash);
                 self.resort();
@@ -698,7 +724,7 @@ impl App {
     /// Flip the persisted watch flag for the selected index.
     fn toggle_watch_flag(&mut self) {
         let Some(row) = self.selected() else { return };
-        let (hash, name, path, enable, semantic, workspace, indexed_at) = (
+        let (hash, name, path, enable, semantic, workspace, indexed_at, orphaned) = (
             row.hash.clone(),
             row.name(),
             row.index_path.clone(),
@@ -706,7 +732,15 @@ impl App {
             row.semantic,
             row.workspace.clone(),
             row.indexed_at,
+            row.orphaned,
         );
+
+        // Turning the flag off is always allowed; turning it on for a workspace that is
+        // gone would ask the service to watch a directory that no longer exists.
+        if enable && orphaned {
+            self.note("✗ the workspace is gone — remove the index instead");
+            return;
+        }
 
         if let Err(e) = registry::set_watch_flag(&path, enable) {
             self.act("watch flag", Err(e.to_string()));
@@ -1569,6 +1603,64 @@ mod tests {
         assert!(
             !app.resume_watch.contains(&hash),
             "watching resumes after the re-index"
+        );
+    }
+
+    #[test]
+    fn a_failed_reindex_still_gives_the_watcher_back() {
+        let mut app = synthetic_app();
+        let hash = app.rows[0].hash.clone();
+        app.resume_watch.insert(hash.clone());
+        app.busy = 1;
+
+        app.handle_manager_event(ManagerEvent::ReindexFailed {
+            hash: hash.clone(),
+            message: "Index is already being written".to_string(),
+        });
+
+        assert_eq!(app.busy, 0, "the action has to stop counting as in flight");
+        assert!(
+            !app.resume_watch.contains(&hash),
+            "a failed re-index must not strand the paused watcher"
+        );
+        assert!(app.message.starts_with('✗'), "message: {}", app.message);
+    }
+
+    #[test]
+    fn a_scan_hands_a_session_watch_over_to_the_service() {
+        let mut app = synthetic_app();
+        let row = app
+            .rows
+            .iter()
+            .find(|row| row.state == WatchState::Active && !app.watched_by_service(&row.hash))
+            .expect("the synthetic dashboard watches one index itself");
+        let hash = row.hash.clone();
+        let scanned = vec![IndexInfo {
+            hash: hash.clone(),
+            path: row.index_path.clone(),
+            workspace: Some(row.workspace.display().to_string()),
+            size_bytes: row.size_bytes,
+            semantic: Some(row.semantic),
+            files_indexed: Some(row.files),
+            indexed_at: row.indexed_at,
+            orphaned: false,
+            watch: row.watch,
+            segments: row.segments,
+        }];
+
+        // The next scan reports the service watching what this session already watches.
+        let mut report = app.service.clone().unwrap();
+        if let Some(state) = report.heartbeat.as_mut() {
+            state.watched.push(hash.clone());
+        }
+        app.apply_scan(scanned, Some(report), true);
+
+        assert!(app.watched_by_service(&hash));
+        assert!(
+            app.activity
+                .iter()
+                .any(|line| line.text.contains("handed the watch")),
+            "the hand-over has to be reported"
         );
     }
 }

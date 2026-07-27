@@ -20,6 +20,9 @@ const SLEEP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// How recently an index must have been updated to auto-watch on startup
 const AUTO_WATCH_THRESHOLD: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
+/// How long a stopped watcher gets to drop its index writer before we stop waiting
+const WATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-workspace watcher state tracked by the manager
 struct WorkspaceState {
     #[allow(dead_code)]
@@ -170,22 +173,22 @@ impl WatchManager {
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         ManagerCommand::ToggleWatch(hash) => {
-                            self.handle_toggle(&hash);
+                            self.handle_toggle(&hash).await;
                         }
                         ManagerCommand::SetWatch { hash, enabled } => {
-                            self.set_watch(&hash, enabled);
+                            self.set_watch(&hash, enabled).await;
                         }
                         ManagerCommand::Register(reg) => {
-                            self.handle_register(reg);
+                            self.handle_register(reg).await;
                         }
                         ManagerCommand::Reindex(hash) => {
                             self.handle_reindex(&hash);
                         }
                         ManagerCommand::RemoveIndex(hash) => {
-                            self.handle_remove(&hash);
+                            self.handle_remove(&hash).await;
                         }
                         ManagerCommand::Shutdown => {
-                            self.shutdown_all();
+                            self.shutdown_all().await;
                             break;
                         }
                     }
@@ -198,7 +201,7 @@ impl WatchManager {
 
                 // Periodic tick for inactivity checks and sleep polling
                 _ = tick.tick() => {
-                    self.check_inactivity();
+                    self.check_inactivity().await;
                     self.poll_sleeping().await;
                 }
             }
@@ -255,8 +258,16 @@ impl WatchManager {
         ws.last_activity = Some(Instant::now());
     }
 
-    /// Stop a watcher task for a workspace
-    fn stop_watcher(&mut self, hash: &str) {
+    /// Stop a watcher task for a workspace and wait for it to let go of the index.
+    ///
+    /// Aborting used to be the whole of it, which reported the workspace as unwatched
+    /// while its index writer was still open — and the next thing a caller does with a
+    /// paused workspace is re-index or compact it, which needs that writer. Worse,
+    /// aborting a watcher still inside its opening incremental pass cancels the task
+    /// while the blocking work carries on holding the writer. So the task is asked to
+    /// stop and given time to unwind; only one that ignores that gets aborted, and then
+    /// the caller is told the index may still be busy.
+    async fn stop_watcher(&mut self, hash: &str) {
         let ws = match self.workspaces.get_mut(hash) {
             Some(ws) => ws,
             None => return,
@@ -267,23 +278,33 @@ impl WatchManager {
             let _ = stop_tx.send(());
         }
 
-        // Abort the task if it doesn't stop cleanly
-        if let Some(handle) = ws.watcher_handle.take() {
+        let Some(mut handle) = ws.watcher_handle.take() else {
+            return;
+        };
+
+        if tokio::time::timeout(WATCHER_STOP_TIMEOUT, &mut handle)
+            .await
+            .is_err()
+        {
             handle.abort();
+            let _ = self.event_tx.send(ManagerEvent::Error {
+                hash: hash.to_string(),
+                message: "watcher did not stop in time; the index may still be busy".to_string(),
+            });
         }
     }
 
-    fn handle_toggle(&mut self, hash: &str) {
+    async fn handle_toggle(&mut self, hash: &str) {
         let current_state = match self.workspaces.get(hash) {
             Some(ws) => ws.watch_state.clone(),
             None => return,
         };
 
-        self.set_watch(hash, current_state == WatchState::Off);
+        self.set_watch(hash, current_state == WatchState::Off).await;
     }
 
     /// Start or stop watching a workspace, ignoring a request that changes nothing.
-    fn set_watch(&mut self, hash: &str, enabled: bool) {
+    async fn set_watch(&mut self, hash: &str, enabled: bool) {
         let current_state = match self.workspaces.get(hash) {
             Some(ws) => ws.watch_state.clone(),
             None => return,
@@ -307,7 +328,7 @@ impl WatchManager {
             if current_state == WatchState::Off {
                 return;
             }
-            self.stop_watcher(hash);
+            self.stop_watcher(hash).await;
             if let Some(ws) = self.workspaces.get_mut(hash) {
                 ws.watch_state = WatchState::Off;
                 ws.last_activity = None;
@@ -322,10 +343,10 @@ impl WatchManager {
 
     /// Add a workspace after the manager is running, starting its watcher when the
     /// registration says so. A hash already known keeps its live watcher untouched.
-    fn handle_register(&mut self, reg: WorkspaceRegistration) {
+    async fn handle_register(&mut self, reg: WorkspaceRegistration) {
         let hash = reg.hash.clone();
         if self.workspaces.contains_key(&hash) {
-            self.set_watch(&hash, reg.watch);
+            self.set_watch(&hash, reg.watch).await;
             return;
         }
 
@@ -386,25 +407,27 @@ impl WatchManager {
                         files_indexed: files,
                     });
                 }
+                // A re-index that failed still has to be reported as finished: whatever
+                // asked for it is holding a watcher paused until it hears back.
                 Ok(Err(e)) => {
-                    let _ = event_tx.send(ManagerEvent::Error {
+                    let _ = event_tx.send(ManagerEvent::ReindexFailed {
                         hash: hash_clone,
-                        message: format!("Re-index failed: {}", e),
+                        message: e.to_string(),
                     });
                 }
                 Err(e) => {
-                    let _ = event_tx.send(ManagerEvent::Error {
+                    let _ = event_tx.send(ManagerEvent::ReindexFailed {
                         hash: hash_clone,
-                        message: format!("Re-index task panicked: {}", e),
+                        message: format!("the re-index task panicked: {}", e),
                     });
                 }
             }
         });
     }
 
-    fn handle_remove(&mut self, hash: &str) {
+    async fn handle_remove(&mut self, hash: &str) {
         // Stop watcher first
-        self.stop_watcher(hash);
+        self.stop_watcher(hash).await;
         self.workspaces.remove(hash);
         let _ = self.event_tx.send(ManagerEvent::IndexRemoved {
             hash: hash.to_string(),
@@ -451,7 +474,7 @@ impl WatchManager {
     }
 
     /// Check for inactivity and transition Active -> Sleeping
-    fn check_inactivity(&mut self) {
+    async fn check_inactivity(&mut self) {
         let now = Instant::now();
         let mut to_sleep = Vec::new();
 
@@ -466,7 +489,7 @@ impl WatchManager {
         }
 
         for (i, hash) in to_sleep.iter().enumerate() {
-            self.stop_watcher(hash);
+            self.stop_watcher(hash).await;
             if let Some(ws) = self.workspaces.get_mut(hash) {
                 ws.watch_state = WatchState::Sleeping;
                 ws.indexed_at = Some(chrono::Utc::now());
@@ -537,10 +560,10 @@ impl WatchManager {
         }
     }
 
-    fn shutdown_all(&mut self) {
+    async fn shutdown_all(&mut self) {
         let hashes: Vec<String> = self.workspaces.keys().cloned().collect();
         for hash in hashes {
-            self.stop_watcher(&hash);
+            self.stop_watcher(&hash).await;
         }
     }
 }
@@ -745,5 +768,86 @@ async fn watcher_task(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+
+    /// A workspace with its own `.ygrep/` data directory, so every `Config::load()` open
+    /// inside the manager resolves there instead of the real one.
+    fn indexed_workspace() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".ygrep")).unwrap();
+        // Enough files that the watcher's opening incremental pass is still running when
+        // it is asked to stop, which is the case an abort cancels without waiting for.
+        for i in 0..2_000 {
+            std::fs::write(root.join(format!("src/f{i}.rs")), "fn main() {}\n").unwrap();
+        }
+
+        let workspace = Workspace::create_with_config(&root, Config::default()).unwrap();
+        workspace.index_all().unwrap();
+
+        (temp, root)
+    }
+
+    /// Whether the index writer can be taken right now.
+    fn writer_is_free(root: &Path) -> bool {
+        Workspace::open(root)
+            .and_then(|workspace| workspace.create_watch_indexer())
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_stopped_watcher_has_let_go_of_the_writer() {
+        let (_temp, root) = indexed_workspace();
+
+        let (mut manager, cmd_tx, mut event_rx) = WatchManager::new();
+        manager.register("test".to_string(), root.clone(), false, None, true);
+        tokio::spawn(manager.run());
+
+        // The watcher holds its writer for as long as it watches.
+        let root_for_wait = root.clone();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while writer_is_free(&root_for_wait) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the watcher should take the writer");
+
+        cmd_tx
+            .send(ManagerCommand::SetWatch {
+                hash: "test".to_string(),
+                enabled: false,
+            })
+            .unwrap();
+
+        let stopped = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(
+                    event,
+                    ManagerEvent::WatchStateChanged {
+                        new_state: WatchState::Off,
+                        ..
+                    }
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(stopped.is_ok(), "the manager should report the watch off");
+
+        // Reporting the watch off has to mean the index is free: the TUI re-indexes and
+        // compacts the moment it sees this, and both need the writer.
+        assert!(
+            writer_is_free(&root),
+            "a stopped watcher must have released the index writer"
+        );
     }
 }

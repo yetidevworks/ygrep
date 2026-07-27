@@ -191,7 +191,9 @@ pub fn report() -> Result<ServiceReport> {
         log_path: log_path_in(&data_dir),
         indexes: indexes.len(),
         watch_enabled: indexes.iter().filter(|info| info.watch).count(),
-        heartbeat: state::read(&data_dir),
+        // A service killed outright leaves its heartbeat behind, and reporting a dead
+        // process's pid, uptime and watch list as current is worse than reporting none.
+        heartbeat: state::read(&data_dir).filter(|state| pid_alive(state.pid)),
         data_dir,
     })
 }

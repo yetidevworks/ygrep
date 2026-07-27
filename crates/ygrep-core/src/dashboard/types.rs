@@ -23,61 +23,6 @@ impl std::fmt::Display for WatchState {
     }
 }
 
-/// A single index entry displayed in the dashboard table
-#[derive(Debug, Clone)]
-pub struct IndexEntry {
-    /// Index hash
-    pub hash: String,
-    /// Workspace root path
-    pub workspace_path: PathBuf,
-    /// Display path (shortened with ~)
-    pub display_path: String,
-    /// Index size in bytes
-    pub size_bytes: u64,
-    /// Number of files indexed
-    pub files_indexed: u64,
-    /// When the index was last updated
-    pub indexed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether semantic indexing is enabled
-    pub semantic: bool,
-    /// Current watch state
-    pub watch_state: WatchState,
-    /// Persisted watch flag: the background service watches this index on login
-    pub watch: bool,
-    /// Changes per minute (rolling average)
-    pub changes_per_min: f64,
-    /// Whether the workspace still exists on disk
-    pub orphaned: bool,
-}
-
-/// Activity log event
-#[derive(Debug, Clone)]
-pub struct ActivityEvent {
-    /// Timestamp of the event
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Short workspace name (last path component)
-    pub workspace_name: String,
-    /// Description of what happened
-    pub message: String,
-    /// Event kind for coloring
-    pub kind: ActivityKind,
-}
-
-/// Kind of activity event (for display styling)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivityKind {
-    /// File indexed successfully
-    Indexed,
-    /// File deleted from index
-    Deleted,
-    /// Watch state changed
-    StateChange,
-    /// Error occurred
-    Error,
-    /// Re-index started/completed
-    Reindex,
-}
-
 /// A workspace handed to the WatchManager after it is already running
 #[derive(Debug, Clone)]
 pub struct WorkspaceRegistration {
@@ -125,6 +70,8 @@ pub enum ManagerEvent {
     ReindexStarted { hash: String },
     /// Re-index completed
     ReindexCompleted { hash: String, files_indexed: u64 },
+    /// Re-index finished without indexing anything
+    ReindexFailed { hash: String, message: String },
     /// Index was removed
     IndexRemoved { hash: String },
     /// Log message from a workspace operation

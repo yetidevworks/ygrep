@@ -134,10 +134,26 @@ fn refresh_if_needed(
 
     // A schema change needs a full rebuild; staleness only needs an incremental pass,
     // which skips every file whose mtime is unchanged.
-    super::index::run_quiet(workspace_path, schema_outdated, false, false)
-        .context("Refreshing the index failed")?;
+    if let Err(e) = super::index::run_quiet(workspace_path, schema_outdated, false, false) {
+        if !index_is_locked(&e) {
+            return Err(e).context("Refreshing the index failed");
+        }
+        // A watcher or the background service owns the writer, and it is keeping the
+        // index up to date anyway. Search what is on disk rather than failing outright.
+        eprintln!("Another ygrep process is writing this index; searching the current copy.");
+    }
 
     Workspace::open_readonly(workspace_path).context("Index refreshed but could not be reopened")
+}
+
+/// Whether a failure was another process holding the index writer.
+fn index_is_locked(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<YgrepError>(),
+            Some(YgrepError::IndexLocked)
+        )
+    })
 }
 
 /// Handle a search against a workspace with no index yet.
@@ -294,4 +310,21 @@ fn record_telemetry(workspace: &Workspace, query: &str, result: &SearchResult, m
         result.hits.len(),
         mode,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_writer_is_recognised_through_the_error_chain() {
+        let error = anyhow::Error::from(YgrepError::IndexLocked)
+            .context("Failed to index workspace")
+            .context("Refreshing the index failed");
+        assert!(index_is_locked(&error));
+
+        let other = anyhow::Error::from(YgrepError::Search("nope".to_string()))
+            .context("Failed to index workspace");
+        assert!(!index_is_locked(&other));
+    }
 }

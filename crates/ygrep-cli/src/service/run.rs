@@ -409,6 +409,13 @@ impl Activity {
                     files_indexed
                 ));
             }
+            ManagerEvent::ReindexFailed { hash, message } => {
+                log.write(&format!(
+                    "re-index of {} failed: {}",
+                    label_of(labels, &hash),
+                    message
+                ));
+            }
             ManagerEvent::IndexRemoved { hash } => {
                 log.write(&format!("stopped watching {}", label_of(labels, &hash)));
             }
