@@ -8,6 +8,8 @@ license: MIT
 
 Always try `ygrep "query"` via Bash **before** using built-in Grep, Glob, or Task explore agents for code searches. ygrep uses a pre-built full-text index and returns results in milliseconds vs seconds/minutes for built-in tools.
 
+Searching an unindexed workspace builds a text index automatically on the first search, so there is nothing to set up. That first call takes a few seconds; every later one is instant.
+
 If ygrep returns no results, fall back to built-in Grep or Glob — not every file may be indexed.
 
 ## When to Invoke This Skill
@@ -58,8 +60,11 @@ Default output shows: `path:line (score%) [indicator]`
 - Use `-r` for regex patterns
 - Use `-s` for case-sensitive search (default is case-insensitive)
 - Use `-A`/`-B`/`-K` to control context lines around matches
-- Run `ygrep index` if workspace is not yet indexed
+- An unindexed workspace indexes itself on the first search. Run `ygrep index` yourself only to refresh an existing index or to build a `--semantic` one
+- If a search reports the index is still building, wait a moment and retry rather than falling back
+- If ygrep returns results but they look out of date, run `ygrep index` to refresh
 - If ygrep returns no results, the file may not be indexed — fall back to Grep or Glob
+- `ygrep index --dry-run` reports what would be indexed without building anything
 
 ## Keywords
 

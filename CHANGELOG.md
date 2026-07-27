@@ -5,6 +5,22 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-07-27
+
+### Added
+- **Automatic indexing on first search** — searching a workspace with no index now builds a text-only index and runs the query, instead of failing with "Workspace not indexed". Disable with `--no-auto-index` or `search.auto_index = false`. Semantic indexes are never built implicitly, since that downloads a model and takes minutes. A read-only index directory still reports the old guidance rather than attempting a build, preserving the sandboxed setup from [#12](https://github.com/yetidevworks/ygrep/issues/12)
+- **Indexing-in-progress reporting** — a build writes a marker into the index directory, so a search that lands while the background session hook is still indexing reports how long the build has been running instead of claiming the workspace is unindexed. Abandoned markers older than an hour are ignored
+- **Index freshness note** — `search` and `status` mention when an index is more than a day old. This is a timestamp comparison, not a tree walk, so it costs nothing
+- **`ygrep index --dry-run`** — report the files, extensions, and largest entries that would be indexed, without building anything. Useful for tuning `ignore_patterns` and confirming generated assets are excluded
+
+### Fixed
+- **Workspaces under a directory named like a build output indexed nothing** — ignore patterns were matched against the absolute path, so a project at `~/build/myapp` or anywhere below a `tmp`, `cache`, `dist`, `var`, or `log` directory silently indexed zero files. Patterns now match relative to the workspace root
+- **Hidden workspace roots indexed nothing** — `ygrep index ~/.config/something` silently produced an empty index because the hidden-file check was applied to the workspace root itself
+- **Generated assets are no longer indexed** — bundled JS, minified CSS, and compact data blobs are skipped by average line length (`max_avg_line_length`, default 400 bytes, 0 disables). Measured against real projects this drops 16% of indexed bytes in grav-api, 23% in grav-helios, and 31% in riffle, while matching nothing in a plain Rust project
+- **Directory pruning follows the configured ignore patterns** — pruning used a hardcoded directory list that had drifted from `ignore_patterns`, so configured patterns never pruned subtrees and a `var/` directory was skipped more aggressively than configured
+- **Binary detection no longer reads whole files** — classifying an unknown-extension file read the entire file into memory to inspect its first 8 KB
+- **More build output excluded by default** — `DerivedData`, `Pods`, `Carthage`, `*.xcarchive`, `*.dSYM`, `*.framework`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.angular`, and compiled artifacts (`*.a`, `*.rlib`, `*.rmeta`, `*.d`, `*.bc`)
+
 ## [3.3.2] - 2026-07-27
 
 ### Fixed
@@ -328,6 +344,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed file watcher to follow symlinks correctly
 - Deduplicated watch events for same file
 
+[3.4.0]: https://github.com/yetidevworks/ygrep/compare/v3.3.2...v3.4.0
 [3.3.2]: https://github.com/yetidevworks/ygrep/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/yetidevworks/ygrep/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/yetidevworks/ygrep/compare/v3.2.4...v3.3.0

@@ -72,6 +72,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Don't build an index automatically when searching an unindexed workspace
+    #[arg(long, global = true)]
+    pub no_auto_index: bool,
+
     /// Treat query as regex pattern
     #[arg(short = 'r', long, global = true)]
     pub regex: bool,
@@ -137,6 +141,10 @@ pub enum Commands {
         /// Build text-only index (fast, default). Converts semantic to text-only.
         #[arg(long, conflicts_with = "semantic")]
         text: bool,
+
+        /// Report what would be indexed without building an index
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show index status for current workspace
@@ -288,6 +296,7 @@ fn main() -> Result<()> {
                 ctx_after,
                 format,
                 cli.verbose,
+                cli.no_auto_index,
             )?;
             commands::update::maybe_print_update_hint();
         }
@@ -296,9 +305,14 @@ fn main() -> Result<()> {
             rebuild,
             semantic,
             text,
+            dry_run,
         }) => {
             let target = path.unwrap_or(workspace);
-            commands::index::run(&target, rebuild, semantic, text)?;
+            if dry_run {
+                commands::index::dry_run(&target)?;
+            } else {
+                commands::index::run(&target, rebuild, semantic, text)?;
+            }
         }
         Some(Commands::Status { detailed }) => {
             commands::status::run(&workspace, detailed)?;
@@ -354,6 +368,7 @@ fn main() -> Result<()> {
                     ctx_after,
                     format,
                     cli.verbose,
+                    cli.no_auto_index,
                 )?;
                 commands::update::maybe_print_update_hint();
             } else {

@@ -2,6 +2,7 @@ pub mod dashboard;
 pub mod index;
 pub mod indexes;
 pub mod install;
+pub mod progress;
 pub mod search;
 pub mod status;
 pub mod update;

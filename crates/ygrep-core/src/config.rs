@@ -46,6 +46,10 @@ pub struct IndexerConfig {
     /// Additional ignore patterns (glob syntax)
     pub ignore_patterns: Vec<String>,
 
+    /// Skip files whose average line length exceeds this many bytes (0 disables).
+    /// Catches bundled JS, minified CSS, and compact data blobs that no one searches.
+    pub max_avg_line_length: usize,
+
     /// Follow symlinks
     pub follow_symlinks: bool,
 
@@ -88,6 +92,9 @@ pub struct SearchConfig {
 
     /// Fuzzy distance (1-2)
     pub fuzzy_distance: u8,
+
+    /// Build a text-only index automatically when searching an unindexed workspace
+    pub auto_index: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +143,7 @@ impl Default for IndexerConfig {
             data_dir: default_data_dir(),
             max_file_size: 10 * 1024 * 1024, // 10MB
             include_extensions: vec![],
+            max_avg_line_length: 400,
             ignore_patterns: vec![
                 // Package managers & dependencies
                 "**/node_modules/**".into(),
@@ -151,6 +159,26 @@ impl Default for IndexerConfig {
                 "**/_build/**".into(),
                 "**/bin/**".into(),
                 "**/obj/**".into(),
+                // Apple toolchain
+                "**/DerivedData/**".into(),
+                "**/Pods/**".into(),
+                "**/Carthage/**".into(),
+                "**/*.xcarchive/**".into(),
+                "**/*.dSYM/**".into(),
+                "**/*.framework/**".into(),
+                // JS framework build output
+                "**/.next/**".into(),
+                "**/.nuxt/**".into(),
+                "**/.svelte-kit/**".into(),
+                "**/.turbo/**".into(),
+                "**/.parcel-cache/**".into(),
+                "**/.angular/**".into(),
+                // Compiled artifacts
+                "**/*.a".into(),
+                "**/*.rlib".into(),
+                "**/*.rmeta".into(),
+                "**/*.d".into(),
+                "**/*.bc".into(),
                 // Cache directories
                 "**/cache/**".into(),
                 "**/.cache/**".into(),
@@ -274,6 +302,7 @@ impl Default for SearchConfig {
             min_score: 0.1,
             fuzzy_enabled: true,
             fuzzy_distance: 1,
+            auto_index: true,
         }
     }
 }

@@ -153,7 +153,16 @@ ygrep indexes remove <hash>        # Remove specific index by hash
 ygrep indexes remove /path/to/dir  # Remove index by workspace path
 ygrep indexes remove <hash> --dry-run  # Show what would be removed, delete nothing
 ygrep indexes remove <hash> --yes      # Skip the confirmation prompt
+ygrep index --dry-run              # Report what would be indexed, build nothing
 ```
+
+Searching a workspace with no index builds a text-only index automatically, then runs
+the query. Pass `--no-auto-index` (or set `search.auto_index = false`) to get the old
+behaviour of failing with instructions. Semantic indexes are never built implicitly.
+
+Generated assets are skipped by default: files whose average line length exceeds
+`indexer.max_avg_line_length` (400 bytes) are treated as bundled or minified output.
+Set it to `0` to index everything.
 
 `remove` and `clean` only ever delete inside ygrep's own index directory — the
 workspace you point them at is never touched. Both prompt for confirmation when run

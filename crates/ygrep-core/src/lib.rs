@@ -22,7 +22,7 @@ pub use error::{Result, YgrepError};
 pub use watcher::{FileWatcher, WatchEvent};
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tantivy::Index;
 
 #[cfg(feature = "embeddings")]
@@ -111,9 +111,12 @@ impl Workspace {
         Self::open_internal(root, config, OpenMode::Create)
     }
 
-    /// Open or create a workspace with custom config.
-    /// Unless the mode is `Create`, returns an error if the index doesn't exist.
-    fn open_internal(root: &Path, config: Config, mode: OpenMode) -> Result<Self> {
+    /// Resolve the index directory for a workspace root without opening or creating it.
+    ///
+    /// Uses the same resolution as `open_internal`, so callers that need the index
+    /// location before an index exists (progress reporting, auto-indexing) stay in step
+    /// with where the index will actually be written.
+    pub fn resolve_index_path(root: &Path, config: &Config) -> Result<PathBuf> {
         let root = std::fs::canonicalize(root)?;
 
         // Resolve data directory:
@@ -129,8 +132,14 @@ impl Workspace {
             config.indexer.data_dir.clone()
         };
 
-        let workspace_hash = hash_path(&root);
-        let index_path = data_dir.join("indexes").join(&workspace_hash);
+        Ok(data_dir.join("indexes").join(hash_path(&root)))
+    }
+
+    /// Open or create a workspace with custom config.
+    /// Unless the mode is `Create`, returns an error if the index doesn't exist.
+    fn open_internal(root: &Path, config: Config, mode: OpenMode) -> Result<Self> {
+        let index_path = Self::resolve_index_path(root, &config)?;
+        let root = std::fs::canonicalize(root)?;
 
         // Check if workspace has been properly indexed (workspace.json is written after indexing)
         let workspace_indexed = index_path.join("workspace.json").exists();
