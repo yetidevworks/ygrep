@@ -278,6 +278,7 @@ fn find_symlink_targets(root: &Path, config: &IndexerConfig) -> Vec<PathBuf> {
     use walkdir::WalkDir;
 
     let prune = crate::fs::walker::prune_suffixes(&config.ignore_patterns);
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut targets = HashSet::new();
 
     for entry in WalkDir::new(root)
@@ -309,7 +310,7 @@ fn find_symlink_targets(root: &Path, config: &IndexerConfig) -> Vec<PathBuf> {
 
                 // Canonicalize to resolve any .. or . components
                 if let Ok(canonical) = std::fs::canonicalize(&absolute_target) {
-                    if canonical.is_dir() && !is_ignored_dir(&canonical) {
+                    if canonical.is_dir() && !ignored_symlink_target(&canonical_root, &canonical) {
                         targets.insert(canonical);
                     }
                 }
@@ -321,6 +322,19 @@ fn find_symlink_targets(root: &Path, config: &IndexerConfig) -> Vec<PathBuf> {
 }
 
 /// Check if path is in an ignored directory
+/// A symlink target is judged the way the walk judges directories: by its path inside
+/// the workspace when it lives there, and by its own name when it does not — never by
+/// ancestors like /tmp or ~/build that merely contain the workspace.
+fn ignored_symlink_target(root: &Path, target: &Path) -> bool {
+    match target.strip_prefix(root) {
+        Ok(relative) => is_hidden(relative) || is_ignored_dir(relative),
+        Err(_) => target
+            .file_name()
+            .map(|name| is_hidden_name(name) || is_ignored_dir(Path::new(name)))
+            .unwrap_or(false),
+    }
+}
+
 fn is_ignored_dir(path: &Path) -> bool {
     const IGNORED_DIRS: &[&str] = &[
         "node_modules",
@@ -475,7 +489,11 @@ mod tests {
     #[test]
     fn symlink_discovery_skips_pruned_and_hidden_directories() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        // A workspace under an ignored-name ancestor (like /tmp on the Linux CI
+        // runners): the target check must judge paths inside the workspace, not the
+        // directories that merely contain it.
+        let root = &temp.path().join("tmp/project");
+        std::fs::create_dir_all(root).unwrap();
 
         // The target a real symlink points at
         let shared = root.join("shared");
