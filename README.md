@@ -2,10 +2,7 @@
 
 A fast, local, indexed code search tool optimized for AI coding assistants. Written in Rust using Tantivy for full-text indexing.
 
-![ygrep screenshot](ygrep-screenshot.png)
-
-*The management TUI, captured before 4.0.0 added the service panel and the new key
-bindings; the panel layout is otherwise current.*
+![The ygrep management TUI](ygrep-screenshot.png)
 
 ## Features
 
@@ -462,6 +459,8 @@ Press `t` for the query stats view: queries per second as a sparkline, total que
 average and slowest query time, how many returned nothing, the most-run queries and
 busiest workspaces as bars, and a live tail of recent searches with their timing and hit
 count. `/` filters the tail, `esc` goes back.
+
+![The query stats view](ygrep-stats.png)
 
 **Key bindings** (`?` shows the same list in the TUI):
 
