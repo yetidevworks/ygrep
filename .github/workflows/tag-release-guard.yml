@@ -1,0 +1,90 @@
+name: Tag/release guard
+
+# A pushed v* tag does not build anything on its own — release-binaries.yml
+# triggers on `release: published`. Tag and push without creating the release
+# and the tag just sits there: no binaries, no crates.io publish, no formula
+# bump, and `ygrep update` keeps reporting the previous version as latest.
+# That happened to v3.0.2 in February and to v4.0.1 in July, both unnoticed
+# for months. This job fails when a v* tag has no published release behind it.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Every tag has a release
+    runs-on: ubuntu-latest
+    env:
+      # A tag is allowed to exist without a release for this long, so tagging
+      # and then publishing a few minutes later is not reported as a failure.
+      GRACE_HOURS: "6"
+      # Tags deliberately left without a release. Whitespace separated.
+      # v3.0.2 was skipped during the 3.0.x run and superseded by v3.0.3.
+      IGNORE_TAGS: "v3.0.2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check tags against published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          now=$(date -u +%s)
+
+          # Draft releases are excluded on purpose: a draft builds nothing, so a
+          # tag holding only a draft is exactly the failure this job looks for.
+          published=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[] | select(.draft == false) | .tag_name')
+
+          missing=()
+          while IFS=$'\t' read -r tag created; do
+            [ -n "$tag" ] || continue
+
+            if printf '%s\n' "$published" | grep -qxF "$tag"; then
+              continue
+            fi
+
+            if printf '%s\n' ${IGNORE_TAGS} | grep -qxF "$tag"; then
+              echo "$tag has no release, ignored by IGNORE_TAGS"
+              continue
+            fi
+
+            age_h=$(( (now - created) / 3600 ))
+            if [ "$age_h" -lt "${GRACE_HOURS}" ]; then
+              echo "$tag is ${age_h}h old, inside the ${GRACE_HOURS}h grace period"
+              continue
+            fi
+
+            missing+=("${tag} (tagged ${age_h}h ago)")
+          done < <(git for-each-ref --format='%(refname:strip=2)%09%(creatordate:unix)' 'refs/tags/v*')
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            {
+              echo "### Tags with no published release"
+              echo
+              printf -- '- `%s`\n' "${missing[@]}"
+              echo
+              echo "Publish the release so \`release-binaries.yml\` runs:"
+              echo
+              echo '```'
+              echo "gh release create <tag> --title <tag> --notes-file <notes> --verify-tag"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::Tags with no published release: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Every v* tag has a published release." >> "$GITHUB_STEP_SUMMARY"
+          echo "Every v* tag has a published release."
