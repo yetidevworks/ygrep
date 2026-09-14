@@ -79,13 +79,20 @@ fn clamp_compression_level(level: i32) -> i32 {
 /// Name of our custom code tokenizer
 pub const CODE_TOKENIZER: &str = "code";
 
+/// Longest token the index keeps, in bytes.
+///
+/// Anything this long is a minified line or an encoded blob rather than an identifier.
+/// A query has to know the limit too: asking for a term the indexer threw away returns
+/// nothing at all, which reads as "no matches" rather than "never indexed".
+pub const MAX_TOKEN_BYTES: usize = 100;
+
 /// Register the code-aware tokenizer with an index
 pub fn register_tokenizers(tokenizer_manager: &TokenizerManager) {
     // Code tokenizer: keeps $, @, # as part of tokens
     // Uses SimpleTokenizer which splits on whitespace, then we just lowercase
     let code_tokenizer = TextAnalyzer::builder(CodeTokenizer)
         .filter(LowerCaser)
-        .filter(RemoveLongFilter::limit(100))
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
         .build();
 
     tokenizer_manager.register(CODE_TOKENIZER, code_tokenizer);
@@ -117,6 +124,26 @@ struct CodeTokenStream<'a> {
     subtoken_buffer: VecDeque<&'a str>,
     /// The position value to use for buffered subtokens
     subtoken_position: usize,
+}
+
+/// Whether a character belongs inside a token.
+///
+/// A query has to be split on the same class the index was built with. Splitting
+/// `$variable` on "not alphanumeric" leaves `variable`, which is not a term the index
+/// holds: the token it stored is `$variable`, sigil and all.
+pub fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$' || c == '@' || c == '#' || c == '-'
+}
+
+/// The subtokens a token contributes to the index, lowercased.
+///
+/// Empty when the token has no camelCase or snake_case boundary, in which case the token
+/// itself is the only term it carries.
+pub fn subtokens_of(token: &str) -> Vec<String> {
+    split_subtokens(token)
+        .into_iter()
+        .map(|part| part.to_lowercase())
+        .collect()
 }
 
 /// Whether a token has a snake_case or camelCase boundary in it at all.
@@ -220,7 +247,7 @@ impl<'a> tantivy::tokenizer::TokenStream for CodeTokenStream<'a> {
             let mut end = start;
             let mut punctuation_only = false;
             while let Some(&(pos, c)) = self.chars.peek() {
-                if c.is_alphanumeric() || c == '_' || c == '$' || c == '@' || c == '#' || c == '-' {
+                if is_token_char(c) {
                     end = pos + c.len_utf8();
                     self.chars.next();
                 } else if c.is_whitespace() {
@@ -388,7 +415,7 @@ mod tests {
     fn tokenize(text: &str) -> Vec<String> {
         let mut tokenizer = TextAnalyzer::builder(CodeTokenizer)
             .filter(LowerCaser)
-            .filter(RemoveLongFilter::limit(100))
+            .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
             .build();
         let mut stream = tokenizer.token_stream(text);
         let mut tokens = Vec::new();

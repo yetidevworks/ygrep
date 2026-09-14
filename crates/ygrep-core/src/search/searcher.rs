@@ -4,14 +4,16 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{Index, TantivyDocument, Term};
 
 use super::results::{MatchType, SearchHit, SearchResult};
 use crate::config::SearchConfig;
 use crate::error::Result;
-use crate::index::schema::{SchemaFields, CODE_TOKENIZER};
+use crate::index::schema::{
+    is_token_char, subtokens_of, SchemaFields, CODE_TOKENIZER, MAX_TOKEN_BYTES,
+};
 
 /// How many candidates to pull from Tantivy, as a multiple of the result limit.
 ///
@@ -25,6 +27,14 @@ const LITERAL_FETCH_MULTIPLIERS: [usize; 2] = [5, 50];
 
 /// Same idea for regex searches, which reject candidates more often.
 const REGEX_FETCH_MULTIPLIERS: [usize; 2] = [10, 100];
+
+/// Boost carried by the whole query word, on top of the subtokens the candidate query
+/// requires.
+///
+/// The subtokens are what makes a document a candidate; holding the word itself is what
+/// makes it a good one. Scoring the two apart keeps a file that spells `alphaBeta` that
+/// way ahead of one that only holds `alphaBetaGamma`.
+const WHOLE_WORD_BOOST: f32 = 4.0;
 
 /// Documents below this count are scanned on the calling thread.
 const MIN_PARALLEL_SCAN_DOCS: u64 = 4_096;
@@ -40,6 +50,30 @@ const QUOTA_CHECK_INTERVAL: usize = 64;
 
 /// File and line range a hit covers, used to drop duplicates
 type HitKey = (String, u64, u64);
+
+/// How the words of a query combine in the candidate query.
+#[derive(Clone, Copy)]
+enum WordMatch {
+    /// Every word has to be there, which is what a literal search's own filter requires.
+    All,
+    /// One word is enough. The words of a regex are not all required by it — `TODO|FIXME`
+    /// matches a file that holds either — so a regex pre-filter can only ask for one.
+    Any,
+}
+
+/// The runs of token characters in a query.
+///
+/// These are the fragments the tokenizer would have seen, so they are the fragments the
+/// index can be asked about. Runs with no letter or digit in them — a lone `->` or `$` —
+/// are dropped: they narrow nothing, and their boundaries are the ones most likely to
+/// differ between the query and the document containing it, because the character next
+/// to the run in the file may well be part of the token too.
+fn query_runs(query: &str) -> Vec<&str> {
+    query
+        .split(|c: char| !is_token_char(c))
+        .filter(|run| run.chars().any(|c| c.is_alphanumeric()))
+        .collect()
+}
 
 /// Search engine for querying the index
 pub struct Searcher {
@@ -101,12 +135,9 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Extract alphanumeric words for Tantivy query (it can't search special chars)
-        // Then we'll post-filter for exact literal match
-        let search_terms: Vec<&str> = query
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Words for the Tantivy query, which narrows the documents the exact literal
+        // filter below has to read.
+        let search_terms = query_runs(query);
 
         // Prepare query for matching. Snippet selection stays case-insensitive even
         // when the document filter isn't, so both forms are kept.
@@ -131,11 +162,11 @@ impl Searcher {
             lowered_terms: &lowered_terms,
         };
 
-        let hits = if search_terms.is_empty() {
+        let hits = match self.candidate_query(&search_terms, WordMatch::All) {
             // Punctuation-only literals such as "->", "{%", or "::" have no
             // useful index terms. Scan stored docs so literal search still
             // behaves like grep.
-            self.scan_documents(&searcher, limit, |doc, seen| {
+            None => self.scan_documents(&searcher, limit, |doc, seen| {
                 self.literal_hit_from_doc(
                     doc,
                     1.0,
@@ -146,56 +177,56 @@ impl Searcher {
                     seen,
                     filters,
                 )
-            })?
-        } else {
-            let tantivy_query_str = search_terms.join(" ");
-            let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
-            let tantivy_query = self.with_filters(parsed, filters);
+            })?,
+            Some(candidate_query) => {
+                let tantivy_query = self.with_filters(candidate_query, filters);
 
-            let mut hits = Vec::with_capacity(limit);
-            let mut seen: HashSet<HitKey> = HashSet::new();
-            let mut examined = 0usize;
-            let mut max_score = 1.0f32;
+                let mut hits = Vec::with_capacity(limit);
+                let mut seen: HashSet<HitKey> = HashSet::new();
+                let mut examined = 0usize;
+                let mut max_score = 1.0f32;
 
-            for multiplier in LITERAL_FETCH_MULTIPLIERS {
-                let fetch_limit = limit.saturating_mul(multiplier);
-                if fetch_limit <= examined {
-                    break;
-                }
-                let top_docs =
-                    searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
-                let candidates = top_docs.len();
-                if examined == 0 {
-                    max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
-                }
-
-                // TopDocs ranks by score and then by address, so a deeper fetch returns
-                // the previous one as its prefix: only the documents past it are new.
-                for (score, doc_address) in top_docs.into_iter().skip(examined) {
-                    if hits.len() >= limit {
+                for multiplier in LITERAL_FETCH_MULTIPLIERS {
+                    let fetch_limit = limit.saturating_mul(multiplier);
+                    if fetch_limit <= examined {
                         break;
                     }
-                    let doc = searcher.doc(doc_address)?;
-                    if let Some(hit) = self.literal_hit_from_doc(
-                        &doc,
-                        score,
-                        max_score,
-                        &matcher,
-                        context_before,
-                        context_after,
-                        &mut seen,
-                        filters,
-                    ) {
-                        hits.push(hit);
+                    let top_docs =
+                        searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+                    let candidates = top_docs.len();
+                    if examined == 0 {
+                        max_score = top_docs.first().map(|(score, _)| *score).unwrap_or(1.0);
                     }
-                }
 
-                if hits.len() >= limit || candidates < fetch_limit {
-                    break;
+                    // TopDocs ranks by score and then by address, so a deeper fetch
+                    // returns the previous one as its prefix: only the documents past it
+                    // are new.
+                    for (score, doc_address) in top_docs.into_iter().skip(examined) {
+                        if hits.len() >= limit {
+                            break;
+                        }
+                        let doc = searcher.doc(doc_address)?;
+                        if let Some(hit) = self.literal_hit_from_doc(
+                            &doc,
+                            score,
+                            max_score,
+                            &matcher,
+                            context_before,
+                            context_after,
+                            &mut seen,
+                            filters,
+                        ) {
+                            hits.push(hit);
+                        }
+                    }
+
+                    if hits.len() >= limit || candidates < fetch_limit {
+                        break;
+                    }
+                    examined = candidates;
                 }
-                examined = candidates;
+                hits
             }
-            hits
         };
 
         let query_time_ms = start.elapsed().as_millis() as u64;
@@ -337,18 +368,19 @@ impl Searcher {
         let reader = super::open_reader_with_retry(&self.index)?;
         let searcher = reader.searcher();
 
-        // Extract alphanumeric words from the regex pattern for Tantivy pre-filter
-        // This is a rough heuristic - we extract literal parts from the regex
-        let search_terms: Vec<&str> = pattern
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|s| !s.is_empty() && s.len() > 1) // Skip single chars (likely regex syntax)
+        // Literal fragments of the pattern, for the Tantivy pre-filter. Single characters
+        // are skipped: in a regex they are far likelier to be syntax — the `w` of `\w+` —
+        // than something a matching document has to contain.
+        let search_terms: Vec<&str> = query_runs(pattern)
+            .into_iter()
+            .filter(|run| run.len() > 1)
             .collect();
 
         // If we have searchable terms, use Tantivy to narrow down candidates.
         // Otherwise scan stored docs so regexes like "^#" or punctuation-only
         // expressions are exhaustive instead of capped by an arbitrary TopDocs size.
-        let hits = if search_terms.is_empty() {
-            self.scan_documents(&searcher, limit, |doc, seen| {
+        let hits = match self.candidate_query(&search_terms, WordMatch::Any) {
+            None => self.scan_documents(&searcher, limit, |doc, seen| {
                 self.regex_hit_from_doc(
                     doc,
                     &regex,
@@ -359,54 +391,53 @@ impl Searcher {
                     seen,
                     filters,
                 )
-            })?
-        } else {
-            let tantivy_query_str = search_terms.join(" ");
-            let (parsed, _errors) = self.query_parser().parse_query_lenient(&tantivy_query_str);
-            let tantivy_query = self.with_filters(parsed, filters);
+            })?,
+            Some(candidate_query) => {
+                let tantivy_query = self.with_filters(candidate_query, filters);
 
-            let mut hits = Vec::with_capacity(limit);
-            let mut seen: HashSet<HitKey> = HashSet::new();
-            let mut examined = 0usize;
-            let mut max_score = 1.0f32;
+                let mut hits = Vec::with_capacity(limit);
+                let mut seen: HashSet<HitKey> = HashSet::new();
+                let mut examined = 0usize;
+                let mut max_score = 1.0f32;
 
-            for multiplier in REGEX_FETCH_MULTIPLIERS {
-                let fetch_limit = limit.saturating_mul(multiplier);
-                if fetch_limit <= examined {
-                    break;
-                }
-                let candidates =
-                    searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
-                let candidate_count = candidates.len();
-                if examined == 0 {
-                    max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
-                }
-
-                for (score, doc_address) in candidates.into_iter().skip(examined) {
-                    if hits.len() >= limit {
+                for multiplier in REGEX_FETCH_MULTIPLIERS {
+                    let fetch_limit = limit.saturating_mul(multiplier);
+                    if fetch_limit <= examined {
                         break;
                     }
-                    let doc = searcher.doc(doc_address)?;
-                    if let Some(hit) = self.regex_hit_from_doc(
-                        &doc,
-                        &regex,
-                        score,
-                        max_score,
-                        context_before,
-                        context_after,
-                        &mut seen,
-                        filters,
-                    ) {
-                        hits.push(hit);
+                    let candidates =
+                        searcher.search(&tantivy_query, &TopDocs::with_limit(fetch_limit))?;
+                    let candidate_count = candidates.len();
+                    if examined == 0 {
+                        max_score = candidates.first().map(|(score, _)| *score).unwrap_or(1.0);
                     }
-                }
 
-                if hits.len() >= limit || candidate_count < fetch_limit {
-                    break;
+                    for (score, doc_address) in candidates.into_iter().skip(examined) {
+                        if hits.len() >= limit {
+                            break;
+                        }
+                        let doc = searcher.doc(doc_address)?;
+                        if let Some(hit) = self.regex_hit_from_doc(
+                            &doc,
+                            &regex,
+                            score,
+                            max_score,
+                            context_before,
+                            context_after,
+                            &mut seen,
+                            filters,
+                        ) {
+                            hits.push(hit);
+                        }
+                    }
+
+                    if hits.len() >= limit || candidate_count < fetch_limit {
+                        break;
+                    }
+                    examined = candidate_count;
                 }
-                examined = candidate_count;
+                hits
             }
-            hits
         };
 
         let query_time_ms = start.elapsed().as_millis() as u64;
@@ -421,13 +452,92 @@ impl Searcher {
         })
     }
 
-    /// Query parser covering the content and file path fields
-    fn query_parser(&self) -> QueryParser {
-        let mut query_fields = vec![self.fields.content];
-        if let Some(fp) = self.fields.filepath {
-            query_fields.push(fp);
+    /// Narrow the documents a search has to read down to the ones that could match.
+    ///
+    /// The candidate query only has to return a superset: the literal or regex filter
+    /// that follows decides what is really a hit. What it must never do is leave out a
+    /// document that matches, and asking the index for the query word as a whole term
+    /// does exactly that. The code tokenizer emits a token and its camelCase/snake_case
+    /// subtokens at the same position, so a file holding `alphaBetaGamma` carries
+    /// `alphabetagamma`, `alpha`, `beta` and `gamma` — and nothing for `alphaBeta` to
+    /// match, even though grep finds it there. Requiring the subtokens instead keeps
+    /// every such file in the running, and the whole word rides along as a scoring
+    /// clause so the files that do spell it that way still come back first.
+    ///
+    /// Returns `None` when no word contributes a term, leaving the caller to scan.
+    fn candidate_query(&self, words: &[&str], combine: WordMatch) -> Option<Box<dyn Query>> {
+        let mut per_word: Vec<Box<dyn Query>> = Vec::new();
+        let mut boosts: Vec<Box<dyn Query>> = Vec::new();
+
+        for word in words {
+            let lowered = word.to_lowercase();
+            let subtokens = subtokens_of(word);
+            let required = if subtokens.is_empty() {
+                vec![lowered.clone()]
+            } else {
+                subtokens
+            };
+
+            // A term the indexer dropped for being too long can never match, so requiring
+            // it would turn "never indexed" into "no matches". Let the word narrow
+            // nothing instead and leave the decision to the filter over stored text.
+            let required: Vec<String> = required
+                .into_iter()
+                .filter(|term| term.len() < MAX_TOKEN_BYTES)
+                .collect();
+            if required.is_empty() {
+                continue;
+            }
+
+            if lowered.len() < MAX_TOKEN_BYTES && required != [lowered.clone()] {
+                boosts.push(self.term_query(&lowered));
+            }
+            per_word.push(Box::new(BooleanQuery::new(
+                required
+                    .iter()
+                    .map(|term| (Occur::Must, self.term_query(term)))
+                    .collect(),
+            )));
         }
-        QueryParser::for_index(&self.index, query_fields)
+
+        if per_word.is_empty() {
+            return None;
+        }
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = match combine {
+            WordMatch::All => per_word
+                .into_iter()
+                .map(|word| (Occur::Must, word))
+                .collect(),
+            WordMatch::Any => vec![(Occur::Must, any_of(per_word)?)],
+        };
+        for boost in boosts {
+            clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(boost, WHOLE_WORD_BOOST)),
+            ));
+        }
+
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    /// Look a term up in either field a search matches on: file content and file path.
+    ///
+    /// Matching the path is what makes a filename search work, and the filter that
+    /// follows tests both, so the candidate query has to admit a document that carries
+    /// the term in either one.
+    fn term_query(&self, term: &str) -> Box<dyn Query> {
+        let mut alternatives: Vec<Box<dyn Query>> = vec![Box::new(TermQuery::new(
+            Term::from_field_text(self.fields.content, term),
+            IndexRecordOption::Basic,
+        ))];
+        if let Some(filepath) = self.fields.filepath {
+            alternatives.push(Box::new(TermQuery::new(
+                Term::from_field_text(filepath, term),
+                IndexRecordOption::Basic,
+            )));
+        }
+        any_of(alternatives).expect("the content alternative is always there")
     }
 
     /// Combine the parsed query with the index-side part of the filters.
@@ -2261,6 +2371,194 @@ mod tests {
 
         assert_eq!(result.total, 0);
         assert_eq!(result.text_hits, 0);
+
+        Ok(())
+    }
+
+    /// Documents for the subtoken-boundary cases: one file spells the identifier on its
+    /// own, the other only ever as part of a longer one.
+    fn subtoken_index(dir: &std::path::Path) -> Index {
+        let (index, fields) = create_test_index(dir);
+        add_docs(
+            &index,
+            &fields,
+            &[
+                (
+                    "whole".into(),
+                    "src/whole.ts".into(),
+                    "this.registerChangeset(uri);\nconst y = alphaBeta(2);\nconst s = alpha_beta;"
+                        .into(),
+                    "ts".into(),
+                ),
+                (
+                    "longer".into(),
+                    "src/longer.ts".into(),
+                    "function registerChangesetOperationHandler(id) {}\nconst x = alphaBetaGamma(1);\nconst s = alpha_beta_gamma_delta;"
+                        .into(),
+                    "ts".into(),
+                ),
+            ],
+        );
+        index
+    }
+
+    fn paths_of(result: &SearchResult) -> Vec<&str> {
+        let mut paths: Vec<&str> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    #[test]
+    fn a_camel_case_literal_finds_the_longer_identifier_containing_it() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let index = subtoken_index(temp_dir.path());
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        // grep finds "registerChangeset" inside "registerChangesetOperationHandler", and
+        // so must we: the query straddles a subtoken boundary, so the index holds no
+        // single term for it.
+        let result = searcher.search("registerChangeset", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts", "src/whole.ts"]);
+
+        // The same shape one subtoken further in, where the query also starts at a
+        // boundary rather than at the start of the identifier.
+        let result = searcher.search("betaGamma", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_snake_case_literal_finds_the_longer_identifier_containing_it() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let index = subtoken_index(temp_dir.path());
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        let result = searcher.search("alpha_beta", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts", "src/whole.ts"]);
+
+        let result = searcher.search("beta_gamma", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_file_spelling_the_word_outranks_the_one_that_only_contains_it() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let index = subtoken_index(temp_dir.path());
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        let result = searcher.search("alphaBeta", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts", "src/whole.ts"]);
+        assert_eq!(
+            result.hits[0].path, "src/whole.ts",
+            "the document carrying the whole word should score above the one that only \
+             carries its subtokens"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_regex_finds_the_longer_identifier_containing_its_literal() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let index = subtoken_index(temp_dir.path());
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        // The pre-filter narrows a regex search the same way, so it needs the same fix.
+        let result = searcher.search_regex("registerChangeset", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/longer.ts", "src/whole.ts"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_sigil_literal_matches_the_term_the_index_actually_stored() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_doc(
+            &index,
+            &fields,
+            "php",
+            "src/config.php",
+            "<?php\n$variable = 1;\n",
+            "php",
+        );
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        // The tokenizer keeps `$` inside the token, so the query has to keep it too:
+        // splitting it off leaves `variable`, which the index never stored.
+        let result = searcher.search("$variable", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/config.php"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_multi_word_literal_still_requires_every_word() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_docs(
+            &index,
+            &fields,
+            &[
+                (
+                    "both".into(),
+                    "src/both.rs".into(),
+                    "fn load() {}\nstruct Config;".into(),
+                    "rs".into(),
+                ),
+                (
+                    "one".into(),
+                    "src/one.rs".into(),
+                    "struct Config;".into(),
+                    "rs".into(),
+                ),
+            ],
+        );
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        let result = searcher.search("config load", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/both.rs"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_regex_alternation_still_matches_either_branch() -> Result<()> {
+        let temp_dir = tempdir().unwrap();
+        let (index, fields) = create_test_index(temp_dir.path());
+        add_docs(
+            &index,
+            &fields,
+            &[
+                (
+                    "todo".into(),
+                    "src/todo.rs".into(),
+                    "// TODO: write this".into(),
+                    "rs".into(),
+                ),
+                (
+                    "fixme".into(),
+                    "src/fixme.rs".into(),
+                    "// FIXME: broken".into(),
+                    "rs".into(),
+                ),
+                (
+                    "neither".into(),
+                    "src/neither.rs".into(),
+                    "// all good here".into(),
+                    "rs".into(),
+                ),
+            ],
+        );
+        let searcher = Searcher::new(SearchConfig::default(), index);
+
+        // The words of a regex are alternatives, not requirements: demanding both would
+        // return neither file.
+        let result = searcher.search_regex("TODO|FIXME", None, false, None, None)?;
+        assert_eq!(paths_of(&result), ["src/fixme.rs", "src/todo.rs"]);
 
         Ok(())
     }

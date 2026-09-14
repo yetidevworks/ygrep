@@ -5,6 +5,16 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.2] - 2026-09-13
+
+### Fixed
+- **Literal search missed identifiers that contained the query** — a search for `registerChangeset` found the files spelling it that way and silently skipped the ones holding `registerChangesetOperationHandler`, which grep matches. The tokenizer emits a token and its camelCase/snake_case subtokens at the same position, so a file carrying `alphaBetaGamma` carries `alphabetagamma`, `alpha`, `beta` and `gamma` — and nothing for `alphaBeta` to match — but the candidate query asked the index for the query word as one whole term anyway, so those files were never even read by the exact filter that would have accepted them. It asks for the subtokens now and keeps the whole word as a scoring clause, so the files that do spell it out still rank first. Measured against ripgrep over 26 identifier searches of the VS Code tree, file recall goes from 90.5% to 99.6%, with the remainder being files ygrep never indexed rather than matches it failed to find. The same pre-filter narrows a regex search, so `-r` had the same blind spot and is fixed with it
+- **Searching for a `$`, `@` or `#` name found nothing** — the tokenizer keeps those sigils inside a token, so the index stores `$variable`, but the query was split on "not alphanumeric" and asked for `variable`, a term no document has. `ygrep '$variable'` returned no results in a PHP tree. Queries are now split on the same character class the index was built with
+- **Multi-word literal searches read far more of the index than they needed** — the candidate query is now an explicit AND of the words rather than whatever the query parser made of them, which on a three-word search of the VS Code tree cuts the time from 216 ms to 76 ms for the same 80 files
+
+### Changed
+- **The tokenizer's 100-byte token limit is one named constant, and queries respect it** — a query word at or over the limit was asking for a term the indexer had thrown away, which reads as "no matches" rather than "never indexed". Such a word now narrows nothing and leaves the decision to the filter over stored text
+
 ## [4.0.1] - 2026-07-28
 
 ### Fixed
