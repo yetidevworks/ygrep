@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
+use notify_debouncer_full::{
+    new_debouncer_opt,
+    notify::{RecommendedWatcher, RecursiveMode},
+    DebounceEventResult, NoCache,
+};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
@@ -26,10 +30,23 @@ pub enum WatchEvent {
     Error(String),
 }
 
-type PlatformDebouncer = notify_debouncer_full::Debouncer<
-    notify_debouncer_full::notify::RecommendedWatcher,
-    notify_debouncer_full::RecommendedCache,
->;
+/// The debouncer's file-ID cache is deliberately [`NoCache`].
+///
+/// The default `RecommendedCache` is `FileIdMap` on macOS (Linux already gets `NoCache`),
+/// and `FileIdMap::add_path` runs an unbounded `WalkDir` with `follow_links(true)` that
+/// stats every entry and honours no ignore rules at all. It fires on every create event
+/// and re-walks *every* watch root whenever FSEvents reports dropped events — which is
+/// precisely when the tree is busy, so the walk feeds the overflow that triggers it.
+/// A workspace whose `user/plugins/*` symlink out to real repos reaches ~144k entries,
+/// so each pass cost that many stats and pegged a core for days.
+///
+/// The map exists only to pair rename From/To events by inode. macOS FSEvents supplies
+/// no rename tracker, so on this platform that pairing is the map's *only* contribution
+/// — and [`process_notify_event`] judges every path independently, never reading a
+/// merged pair. Unpaired renames arrive as separate From/To events and reduce to the
+/// same `Changed(to)` the paired form produced, so dropping the cache changes no
+/// observable behaviour and makes both `add_path` and `rescan` no-ops.
+type PlatformDebouncer = notify_debouncer_full::Debouncer<RecommendedWatcher, NoCache>;
 
 /// File system watcher with debouncing
 pub struct FileWatcher {
@@ -63,8 +80,9 @@ impl FileWatcher {
         // Clone for the closure
         let config_clone = config.clone();
 
-        // Create debouncer with 500ms delay
-        let debouncer = new_debouncer(
+        // Create debouncer with 500ms delay. See `PlatformDebouncer` for why the file-ID
+        // cache is disabled rather than left at the platform default.
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             Duration::from_millis(500),
             None,
             move |result: DebounceEventResult| {
@@ -109,6 +127,8 @@ impl FileWatcher {
                     }
                 }
             },
+            NoCache::new(),
+            notify_debouncer_full::notify::Config::default(),
         )
         .map_err(|e| YgrepError::WatchError(e.to_string()))?;
 

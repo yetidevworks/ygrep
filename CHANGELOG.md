@@ -5,6 +5,11 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.3] - 2026-09-14
+
+### Fixed
+- **The watch service burned a whole core doing nothing but walking directories** — `notify-debouncer-full` keeps a file-ID cache to pair rename events by inode, and its `RecommendedCache` is `FileIdMap` on macOS where Linux already gets `NoCache`. `FileIdMap::add_path` runs an unbounded `WalkDir` with `follow_links(true)`, stats every entry it finds, and honours no ignore rules at all — not `.gitignore`, not `node_modules`, nothing the indexer itself prunes. It runs on every create event and re-walks *every* watch root whenever FSEvents reports it dropped events, which is precisely when the tree is busy, so the walk kept feeding the overflow that triggered it. Following symlinks is what made it expensive: a Grav workspace whose `user/plugins/*` are symlinks out to 27 real plugin repos reaches 143,750 reachable entries, and one `add_path` over that tree measured 2.48 s against 0 ns for `NoCache`. A service watching `~/Projects` and six other roots sat at 155% CPU for 13 days and had accumulated 27.3 hours of processor time, all of it in `open`, `stat` and `getdirentries64` inside the FSEvents callback. The cache is now explicitly `NoCache` on every platform, which makes both `add_path` and `rescan` no-ops. Nothing observable changes: macOS FSEvents supplies no rename tracker, so that cache was the only thing pairing From/To events there, and the watcher judges every path independently and never reads a merged pair — an unpaired rename arrives as separate From and To events and reduces to the same `Changed(to)` the paired form produced. Measured end to end on one create event whose target was a populated tree, the kind `composer install` or a `git checkout` produces, CPU per event drops from a consistent 1.2 s to 0.02 s, and watcher startup no longer pays an initial walk per root
+
 ## [4.0.2] - 2026-09-13
 
 ### Fixed
