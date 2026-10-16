@@ -69,7 +69,7 @@ jobs:
       matrix:
         include:
           # Platforms with full ONNX support (semantic search enabled)
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             target_name: macos-arm64
             use_cross: false
