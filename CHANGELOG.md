@@ -5,6 +5,15 @@ All notable changes to ygrep will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.4] - 2026-10-20
+
+### Added
+- **`indexer.blocked_workspaces` stops ygrep indexing folders that hold everything else** — the editor session hook runs `ygrep index` in whatever directory a session starts in, and a search auto-indexes an unindexed workspace, so a session or search started in `~` quietly built an index of the entire home directory: 899k files and 15.4 GB, alongside a 1.8 GB index of `~/workspace` that duplicated the project indexes already inside it. Listed folders are now refused by both `ygrep index` and auto-indexing, which say why and point at `--force`. Only the folder itself is blocked, so the projects inside it index as before. The default list is `~` and `/`; add folders like `~/Projects` that only hold other projects. Blocking is not an error for `ygrep index`, so the session hook exits cleanly in a blocked folder
+- **`ygrep index --force`** indexes a blocked folder anyway
+
+### Fixed
+- **`~/.config/ygrep/config.toml` was ignored on macOS** — the README lists it, but the loader only checked the platform config directory, which on macOS is `~/Library/Application Support`. Both are read now, `~/.config` first
+
 ## [4.0.3] - 2026-09-14
 
 ### Fixed

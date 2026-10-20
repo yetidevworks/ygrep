@@ -148,6 +148,10 @@ pub enum Commands {
         /// Report what would be indexed without building an index
         #[arg(long)]
         dry_run: bool,
+
+        /// Index a directory even if it is listed in `blocked_workspaces`
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show index status for current workspace
@@ -389,10 +393,14 @@ fn main() -> Result<()> {
             semantic,
             text,
             dry_run,
+            force,
         }) => {
             let target = path.unwrap_or(workspace);
             if dry_run {
                 commands::index::dry_run(&target)?;
+            } else if !force && commands::index::refuse_if_blocked(&target) {
+                // Not an error: the editor session hook runs `ygrep index` wherever a
+                // session starts, and a blocked directory is a reason to do nothing.
             } else {
                 commands::index::run(&target, rebuild, semantic, text)?;
             }

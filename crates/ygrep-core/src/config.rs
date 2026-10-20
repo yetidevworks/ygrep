@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Global ygrep configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +43,12 @@ pub struct IndexerConfig {
 
     /// Additional ignore patterns (glob syntax)
     pub ignore_patterns: Vec<String>,
+
+    /// Directories that are never indexed as a workspace of their own, such as `~` or
+    /// a folder that only holds other projects. Only the directory itself is blocked:
+    /// the projects inside it still index. `~` expands to the home directory, and
+    /// `ygrep index --force` builds one anyway.
+    pub blocked_workspaces: Vec<String>,
 
     /// Skip files whose average line length exceeds this many bytes (0 disables).
     /// Catches bundled JS, minified CSS, and compact data blobs that no one searches.
@@ -161,6 +167,9 @@ impl Default for IndexerConfig {
             max_avg_line_length: 400,
             docstore_compression_level: crate::index::schema::DEFAULT_DOCSTORE_COMPRESSION_LEVEL,
             auto_compact_segments: 16,
+            // Indexing either one walks everything you own: a session or search started
+            // in `~` once built a 15GB index of the whole home directory.
+            blocked_workspaces: vec!["~".into(), "/".into()],
             ignore_patterns: vec![
                 // Package managers & dependencies
                 "**/node_modules/**".into(),
@@ -310,6 +319,33 @@ impl Default for IndexerConfig {
     }
 }
 
+impl IndexerConfig {
+    /// Whether `path` is one of `blocked_workspaces`.
+    ///
+    /// Both sides are canonicalized, so a trailing slash, a relative path or a symlink
+    /// to a blocked directory still matches. An entry that doesn't exist matches nothing.
+    pub fn is_blocked_workspace(&self, path: &Path) -> bool {
+        let Ok(path) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        self.blocked_workspaces.iter().any(|entry| {
+            std::fs::canonicalize(expand_home(entry))
+                .map(|blocked| blocked == path)
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// Expand a leading `~` to the home directory.
+fn expand_home(path: &str) -> PathBuf {
+    let home = dirs::home_dir();
+    match (path, home) {
+        ("~", Some(home)) => home,
+        (p, Some(home)) if p.starts_with("~/") => home.join(&p[2..]),
+        (p, _) => PathBuf::from(p),
+    }
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
@@ -362,7 +398,8 @@ impl Config {
     /// 1. $PWD/.ygrep.toml
     /// 2. $XDG_CONFIG_HOME/ygrep/config.toml
     /// 3. ~/.config/ygrep/config.toml
-    /// 4. Built-in defaults
+    /// 4. The platform config dir (`~/Library/Application Support/ygrep/config.toml` on macOS)
+    /// 5. Built-in defaults
     pub fn load() -> Self {
         // Try project-level config
         if let Ok(content) = std::fs::read_to_string(".ygrep.toml") {
@@ -379,6 +416,17 @@ impl Config {
                     if let Ok(config) = toml::from_str(&content) {
                         return config;
                     }
+                }
+            }
+        }
+
+        // ~/.config is where the README points, and on macOS it is not the platform
+        // config dir, so it has to be checked by name.
+        if let Some(home) = dirs::home_dir() {
+            let config_path = home.join(".config").join("ygrep").join("config.toml");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(config) = toml::from_str(&content) {
+                    return config;
                 }
             }
         }
@@ -481,6 +529,34 @@ mod tests {
     fn test_telemetry_can_be_switched_off() {
         let config: Config = toml::from_str("[output]\ntelemetry = false\n").unwrap();
         assert!(!config.output.telemetry);
+    }
+
+    #[test]
+    fn test_blocked_workspaces_match_the_directory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("projects");
+        let child = parent.join("bosun");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let config = IndexerConfig {
+            blocked_workspaces: vec![parent.display().to_string()],
+            ..IndexerConfig::default()
+        };
+
+        assert!(config.is_blocked_workspace(&parent));
+        assert!(config.is_blocked_workspace(&child.join("..")));
+        assert!(!config.is_blocked_workspace(&child));
+        assert!(!config.is_blocked_workspace(dir.path()));
+    }
+
+    #[test]
+    fn test_blocked_workspaces_default_to_home_and_root() {
+        let config = IndexerConfig::default();
+        let home = dirs::home_dir().unwrap();
+
+        assert!(config.is_blocked_workspace(&home));
+        assert!(config.is_blocked_workspace(Path::new("/")));
+        assert_eq!(expand_home("~/workspace"), home.join("workspace"));
     }
 
     #[test]

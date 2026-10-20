@@ -723,8 +723,9 @@ Index data stored in:
 - Linux: `~/.local/share/ygrep/indexes/`
 
 Configuration is read from the first of these that exists: `./.ygrep.toml`,
-`$XDG_CONFIG_HOME/ygrep/config.toml`, `~/.config/ygrep/config.toml`. Every key has a
-default, so a config file only needs the ones you want to change.
+`$XDG_CONFIG_HOME/ygrep/config.toml`, `~/.config/ygrep/config.toml`, then the platform
+config directory (`~/Library/Application Support/ygrep/config.toml` on macOS). Every key
+has a default, so a config file only needs the ones you want to change.
 
 ```toml
 [indexer]
@@ -736,6 +737,7 @@ docstore_compression_level = 6  # zstd level, or 0 for LZ4
 auto_compact_segments = 16      # compact past this many segments, 0 disables
 respect_gitignore = false       # honour .gitignore, nested files included
 follow_symlinks = true
+blocked_workspaces = ["~", "/"]  # never index these folders themselves (see below)
 
 [search]
 auto_index = true               # build a text index when searching an unindexed workspace
@@ -755,6 +757,13 @@ threads already saturate, `threads = 1` builds a slightly smaller index in sligh
 time — see [Performance](#performance). `writer_heap_mb` is the heap a full build gives
 the writer; watchers and single-file indexers always use Tantivy's 15 MB minimum, so
 raising it costs nothing while idle.
+
+`indexer.blocked_workspaces` lists folders that should never become a workspace of their own, because indexing them means indexing everything inside: your home directory, or a folder like `~/Projects` that only holds other projects. Only the folder itself is blocked, so `~/Projects/myapp` still indexes normally. Neither `ygrep index` nor the automatic index behind a search will build one there (the editor session hook runs `ygrep index` wherever a session starts, so this also covers a session opened in `~`). `ygrep index --force` builds one anyway. Setting the key replaces the default list, so keep `"~"` and `"/"` in it:
+
+```toml
+[indexer]
+blocked_workspaces = ["~", "/", "~/workspace", "~/Projects"]
+```
 
 ## Upgrading
 

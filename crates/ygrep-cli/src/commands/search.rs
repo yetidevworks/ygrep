@@ -185,6 +185,19 @@ fn open_after_auto_index(workspace_path: &Path, no_auto_index: bool) -> Result<W
         .map(progress::index_dir_writable)
         .unwrap_or(false);
 
+    let blocked = config.indexer.is_blocked_workspace(workspace_path);
+
+    if blocked {
+        eprintln!("Workspace not indexed: {}", workspace_path.display());
+        eprintln!(
+            "(it is listed in indexer.blocked_workspaces, so it isn't indexed automatically)"
+        );
+        eprintln!();
+        eprintln!("Search from a project inside it, pass -C <project>, or index it anyway with:");
+        eprintln!("  ygrep index --force");
+        std::process::exit(1);
+    }
+
     if no_auto_index || !config.search.auto_index || !writable {
         eprintln!("Workspace not indexed: {}", workspace_path.display());
         if !writable {

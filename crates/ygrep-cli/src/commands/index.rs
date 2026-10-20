@@ -85,6 +85,21 @@ pub fn dry_run(workspace_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Say so and return true when `workspace_path` is in `indexer.blocked_workspaces`.
+pub fn refuse_if_blocked(workspace_path: &Path) -> bool {
+    if !Config::load().indexer.is_blocked_workspace(workspace_path) {
+        return false;
+    }
+    eprintln!(
+        "Not indexing {}: it is listed in indexer.blocked_workspaces.",
+        workspace_path.display()
+    );
+    eprintln!(
+        "Index a project inside it instead, or run `ygrep index --force` to index it anyway."
+    );
+    true
+}
+
 pub fn run(
     workspace_path: &Path,
     rebuild: bool,
